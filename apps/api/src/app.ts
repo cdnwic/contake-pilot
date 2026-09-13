@@ -436,6 +436,11 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const body = (req.body ?? {}) as { task?: Partial<TaskNode> };
     const t = body.task;
     if (!t?.name || t.durationMin === undefined || !t.siteId) fail(400, 'BAD_REQUEST', 'חסרים שדות משימה: name, durationMin, siteId');
+    // same envelope class as QA C4: a floating client-supplied start would 500
+    // inside computeDomino - validate at the envelope with the pinned 400
+    if (t.start !== undefined && t.start !== null) {
+      try { parseInstant(t.start); } catch { fail(400, 'BAD_REQUEST', 'start חייב לכלול אזור זמן (למשל 2026-09-14T10:00:00+03:00)'); }
+    }
     const change: ProposedChange = {
       type: 'task.create',
       task: {
@@ -462,7 +467,8 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (body.version !== task.version) fail(409, 'VERSION_CONFLICT', 'הגרף השתנה במקביל — רענן ונסה שוב');
     let change: ProposedChange;
     if (body.move) {
-      parseInstant(body.move.newStart); // 400 on floating local time (QA C4)
+      // QA C4 / contracts §11: floating local time -> the pinned 400, never a 500
+      try { parseInstant(body.move.newStart); } catch { fail(400, 'BAD_REQUEST', 'newStart חייב לכלול אזור זמן (למשל 2026-09-14T10:00:00+03:00)'); }
       // QA-M1-1 (Sev-1): locked-trigger move rejected for EVERY role; unlock first.
       if (task.locked) fail(409, 'LOCK_VIOLATION', 'המשימה נעולה — שחרר נעילה לפני הזזה');
       change = { type: 'task.move', taskId: id, newStart: body.move.newStart };
