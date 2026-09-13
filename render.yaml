@@ -1,0 +1,34 @@
+# Render blueprint for the Contake API pilot (deploy-prep; nothing deployed yet).
+# Pick: Render over Fly — pilot needs zero-ops: managed Postgres with one-click
+# provisioning, blueprint-driven env wiring, and a health-check path; Fly wins on
+# edge placement and machine control, which the pilot does not need.
+services:
+  - type: web
+    name: contake-api
+    runtime: node
+    plan: starter
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @contake/api build
+    startCommand: node apps/api/dist/server.js
+    healthCheckPath: /v1/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: contake-pg
+          property: connectionString
+      - key: CONTAKE_SEED
+        value: camp-demo
+      - key: CONTAKE_DEV_OTP
+        value: "false"        # mandatory in pilot: never return devCode
+      - key: VAPID_PUBLIC_KEY
+        sync: false           # real keypair lives outside the repo (TL ruling):
+      - key: VAPID_PRIVATE_KEY
+        sync: false           # private in the operator vault (contake-pilot-vapid),
+                              # public set in Render env config at deploy time.
+      - key: VAPID_SUBJECT
+        value: mailto:ops@contake.app
+      - key: CORS_ORIGIN
+        sync: false           # pilot frontend origin, set at publish time
+      # WhatsApp Cloud / Twilio env: optional; providers fall back to log-sandbox.
+databases:
+  - name: contake-pg
+    plan: starter

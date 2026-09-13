@@ -1,0 +1,34 @@
+{
+  "name": "@contake/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "seed": "tsx src/seed.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "seed:camp-demo": "tsx src/demo/load-camp-demo.ts"
+  },
+  "dependencies": {
+    "@contake/core": "workspace:*",
+    "@fastify/cors": "^11.3.0",
+    "fastify": "^5.2.0",
+    "pg": "^8.23.0",
+    "socket.io": "^4.8.3",
+    "web-push": "^3.6.7",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.23.1",
+    "socket.io-client": "^4.8.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "@types/web-push": "^3.6.4"
+  }
+}

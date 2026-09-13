@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.turbo/
+
+# M3 (QA-M3-4): secrets are env-only; env files never enter the repo
+.env
+.env.*
+!.env.example

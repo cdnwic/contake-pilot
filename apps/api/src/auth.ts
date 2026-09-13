@@ -1,0 +1,181 @@
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import type { ID, Principal, Role, Scope } from '@contake/core';
+import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
+
+/**
+ * Alpha auth (architecture §2: JWT access 15' + OTP for field workers).
+ * HMAC-signed bearer tokens; identity only — role/scopes are ALWAYS re-read from
+ * the repository per request, so role changes and revocations take effect
+ * immediately (QA AC-ISO-3), well inside the token TTL.
+ */
+
+const TOKEN_TTL_SEC = 15 * 60;
+const OTP_TTL_SEC = 10 * 60;
+const OTP_MAX_PER_WINDOW = 5;
+const OTP_WINDOW_SEC = 10 * 60;
+/** Pilot-prep #2: verify-attempt throttling. After this many consecutive wrong
+ *  presentations against a LIVE code, the code is burned and verify locks. */
+const OTP_VERIFY_MAX_ATTEMPTS = 5;
+const OTP_LOCKOUT_SEC = 10 * 60;
+
+const b64u = (buf: Buffer | string): string => Buffer.from(buf).toString('base64url');
+
+export function hashPasswordPure(password: string): string {
+  const salt = randomBytes(8).toString('hex');
+  return `${salt}:${scryptSync(password, salt, 32).toString('hex')}`;
+}
+
+export interface OtpCodeEntry { code: string; exp: number }
+export interface OtpVerifyState { attempts: number; lockedUntil?: number }
+/** Pre-auth audit row (pilot-prep #2). Kept OUTSIDE the contracts AuditLogEntry:
+ *  that shape requires orgId/eventId/actorUserId and its Action union is pinned
+ *  (v1.9) — a pre-auth OTP event has neither an org context nor a pinned action. */
+export interface AuthAuditEntry { phone: string; kind: string; detail?: unknown; createdAt?: string }
+
+/** Pilot-prep #4: shared OTP state (multi-instance ready). Same adapter pattern
+ *  as PR-1 DispatchStateStore: in-memory default for test/dev, Postgres adapter
+ *  (createPgOtpState in repo/postgres.ts) when DATABASE_URL is set. */
+export interface OtpStateStore {
+  getCode(phone: string): Promise<OtpCodeEntry | undefined>;
+  setCode(phone: string, entry: OtpCodeEntry): Promise<void>;
+  deleteCode(phone: string): Promise<void>;
+  /** Request-side rate-limit log: timestamps within the window (impl prunes on read). */
+  recentRequests(phone: string, sinceMs: number): Promise<number[]>;
+  recordRequest(phone: string, tsMs: number): Promise<void>;
+  getVerifyState(phone: string): Promise<OtpVerifyState | undefined>;
+  /** Atomic increment (multi-instance safe on the Postgres adapter). */
+  incrementVerifyAttempts(phone: string): Promise<number>;
+  /** Sets the lockout window and resets the attempt counter for the next window. */
+  setLockout(phone: string, untilMs: number): Promise<void>;
+  resetVerifyState(phone: string): Promise<void>;
+  appendAuthAudit(entry: AuthAuditEntry): Promise<void>;
+  listAuthAudit(phone?: string): Promise<AuthAuditEntry[]>;
+}
+
+export function memoryOtpState(): OtpStateStore {
+  const codes = new Map<string, OtpCodeEntry>();
+  const requests = new Map<string, number[]>();
+  const verify = new Map<string, OtpVerifyState>();
+  const auditLog: AuthAuditEntry[] = [];
+  return {
+    getCode: async p => codes.get(p),
+    setCode: async (p, e) => { codes.set(p, e); },
+    deleteCode: async p => { codes.delete(p); },
+    recentRequests: async (p, since) => (requests.get(p) ?? []).filter(t => t > since),
+    recordRequest: async (p, ts) => { requests.set(p, [...(requests.get(p) ?? []), ts]); },
+    getVerifyState: async p => verify.get(p),
+    incrementVerifyAttempts: async p => {
+      const cur = verify.get(p) ?? { attempts: 0 };
+      const next = { ...cur, attempts: cur.attempts + 1 };
+      verify.set(p, next);
+      return next.attempts;
+    },
+    setLockout: async (p, until) => { verify.set(p, { attempts: 0, lockedUntil: until }); },
+    resetVerifyState: async p => { verify.delete(p); },
+    appendAuthAudit: async e => { auditLog.push({ ...e, createdAt: e.createdAt ?? new Date().toISOString() }); },
+    listAuthAudit: async p => (p ? auditLog.filter(a => a.phone === p) : [...auditLog]),
+  };
+}
+
+export class AuthService {
+  constructor(
+    private readonly repo: GraphRepository,
+    private readonly secret: string = process.env['CONTAKE_AUTH_SECRET'] ?? 'contake-dev-secret',
+    private readonly now: () => number = () => Date.now(),
+    private readonly otpStore: OtpStateStore = memoryOtpState(),
+  ) {}
+
+  hashPassword(password: string): string {
+    const salt = randomBytes(8).toString('hex');
+    return `${salt}:${scryptSync(password, salt, 32).toString('hex')}`;
+  }
+
+  verifyPassword(password: string, stored: string): boolean {
+    const [salt, hash] = stored.split(':');
+    if (!salt || !hash) return false;
+    const candidate = scryptSync(password, salt, 32);
+    return timingSafeEqual(Buffer.from(hash, 'hex'), candidate);
+  }
+
+  issueToken(userId: ID): string {
+    const payload = b64u(JSON.stringify({ sub: userId, exp: Math.floor(this.now() / 1000) + TOKEN_TTL_SEC }));
+    const sig = createHmac('sha256', this.secret).update(payload).digest('base64url');
+    return `${payload}.${sig}`;
+  }
+
+  /** Authenticates identity, then resolves the CURRENT record (role/scopes/active). */
+  async authenticate(token: string | undefined): Promise<UserRecord | null> {
+    if (!token) return null;
+    const [payload, sig] = token.split('.');
+    if (!payload || !sig) return null;
+    const expected = createHmac('sha256', this.secret).update(payload).digest('base64url');
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+    let parsed: { sub?: ID; exp?: number };
+    try {
+      parsed = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    } catch {
+      return null;
+    }
+    if (!parsed.sub || !parsed.exp || parsed.exp * 1000 < this.now()) return null;
+    const user = await this.repo.getUser(parsed.sub);
+    if (!user || !user.active) return null; // revocation takes effect immediately
+    return user;
+  }
+
+  async login(email: string, password: string): Promise<{ token: string; principal: Principal } | null> {
+    const user = await this.repo.findUserByEmail(email);
+    if (!user?.passwordHash || !this.verifyPassword(password, user.passwordHash)) return null;
+    return { token: this.issueToken(user.userId), principal: toPrincipal(user) };
+  }
+
+  /** Returns the code in dev mode so tests and the demo can log in without an SMS provider. */
+  async requestOtp(phone: string): Promise<{ sent: boolean; devCode?: string; rateLimited: boolean }> {
+    const windowStart = this.now() - OTP_WINDOW_SEC * 1000;
+    const recent = await this.otpStore.recentRequests(phone, windowStart);
+    if (recent.length >= OTP_MAX_PER_WINDOW) return { sent: false, rateLimited: true };
+    await this.otpStore.recordRequest(phone, this.now());
+    const code = String(Math.abs(scryptSync(phone + this.now(), 'otp', 8).readInt32BE(0)) % 1000000).padStart(6, '0');
+    await this.otpStore.setCode(phone, { code, exp: this.now() + OTP_TTL_SEC * 1000 });
+    return { sent: true, rateLimited: false, devCode: code };
+  }
+
+  /** Pilot-prep #2 semantics: every wrong presentation against a LIVE code
+   *  increments a per-phone counter; at OTP_VERIFY_MAX_ATTEMPTS the code is
+   *  burned, verify locks for OTP_LOCKOUT_SEC, and an otp.verify.lockout
+   *  auth-audit row is written. Lockout, burn, expiry, wrong code and unknown
+   *  phone all return null, so the 401 shape stays anti-enumeration identical. */
+  async verifyOtp(phone: string, code: string): Promise<{ token: string; principal: Principal } | null> {
+    const state = await this.otpStore.getVerifyState(phone);
+    if (state?.lockedUntil !== undefined && state.lockedUntil > this.now()) return null;
+    const entry = await this.otpStore.getCode(phone);
+    if (entry && entry.exp >= this.now() && entry.code !== code) {
+      const attempts = await this.otpStore.incrementVerifyAttempts(phone);
+      if (attempts >= OTP_VERIFY_MAX_ATTEMPTS) {
+        const lockedUntil = this.now() + OTP_LOCKOUT_SEC * 1000;
+        await this.otpStore.deleteCode(phone); // code burned at the threshold
+        await this.otpStore.setLockout(phone, lockedUntil);
+        await this.otpStore.appendAuthAudit({
+          phone,
+          kind: 'otp.verify.lockout',
+          detail: { attempts, maxAttempts: OTP_VERIFY_MAX_ATTEMPTS, lockedUntil, lockoutSec: OTP_LOCKOUT_SEC },
+        });
+      }
+      return null;
+    }
+    if (!entry || entry.exp < this.now() || entry.code !== code) return null;
+    await this.otpStore.deleteCode(phone);
+    await this.otpStore.resetVerifyState(phone);
+    const user = await this.repo.findUserByPhone(phone);
+    if (!user || !user.active) return null;
+    return { token: this.issueToken(user.userId), principal: toPrincipal(user) };
+  }
+}
+
+export const toPrincipal = (u: UserRecord): Principal => ({
+  userId: u.userId,
+  role: u.role as Role,
+  scopes: u.scopes as Scope[],
+  ...(u.linkedResourceId ? { linkedResourceId: u.linkedResourceId } : {}),
+});
