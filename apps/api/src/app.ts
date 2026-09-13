@@ -762,12 +762,8 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { id } = req.params as { id: ID };
     const base = rawDecision('report.resolve', user.role);
     if (base !== 'allow' && base !== 'scope') {
-      // v1.12 SHIM (flagged to TL): the pinned v1.12 Action union omits
-      // 'report.resolve' (matrix row + audit prose + 'report' AuditEntityType
-      // are all present). Cast compiles against the pinned bytes; TL to add it
-      // to the union in the next contracts rev.
       fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
-        reason: 'matrix_deny', action: 'report.resolve' as Action, entityType: 'report', entityId: id, eventId: 'pending',
+        reason: 'matrix_deny', action: 'report.resolve', entityType: 'report', entityId: id, eventId: 'pending',
       });
     }
     const report = await repo.getReport(id);
@@ -778,7 +774,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (!snapshot || snapshot.event.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא'); // cross-org 404
     if (base === 'scope' && !inScope(user.scopes, task.eventId, task.siteId)) {
       fail(403, 'FORBIDDEN', 'לא ניתן לטפל בדיווח מחוץ לתחום האחריות שלך', {
-        reason: 'scope_violation', action: 'report.resolve' as Action, entityType: 'report', entityId: id, eventId: task.eventId,
+        reason: 'scope_violation', action: 'report.resolve', entityType: 'report', entityId: id, eventId: task.eventId,
       });
     }
     if (report.resolvedBy !== undefined) return { report }; // already handled: return existing state
@@ -789,7 +785,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       if (r?.applied) {
         await audit(repo, {
           orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
-          action: 'report.resolve' as Action, entityType: 'report', entityId: id,
+          action: 'report.resolve', entityType: 'report', entityId: id,
           after: { resolvedBy: user.userId, resolvedAt, ...(resolutionNoteHe ? { resolutionNoteHe } : {}) },
           deviceClass: deviceClassOf(ua(req)),
         });

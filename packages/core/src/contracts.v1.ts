@@ -212,7 +212,7 @@ export type Role = 'admin' | 'field_manager' | 'focus_worker';
 /** Impact classes: approval requirement derives from impact, not role alone. */
 export type ImpactClass = 'S0' | 'S1' | 'S2' | 'S3';
 
-/** The 22 actions (see matrix JSON for allow/scope/propose/deny per role). */
+/** The 23 actions (see matrix JSON for allow/scope/propose/deny per role). [count fixed v1.13.1] */
 export type Action =
   | 'event.create' | 'event.update' | 'event.delete' | 'event.publish'
   | 'task.create' | 'task.update' | 'task.move' | 'task.delete' | 'task.assign'
@@ -221,7 +221,7 @@ export type Action =
   | 'constraint.lock' | 'constraint.unlock'
   | 'domino.compute' | 'domino.apply'
   | 'change.approve' | 'change.reject'
-  | 'report.status.create'
+  | 'report.status.create' | 'report.resolve'  // v1.13.1: union member matches matrix v1.3 row
   | 'notify.send.targeted'
   | 'notify.ack'               // v1.8 — audit completeness for the ack endpoint
   | 'push.subscribe' | 'push.unsubscribe'; // v1.10 — push self-service audit (no matrix rows, v1.8 precedent)
