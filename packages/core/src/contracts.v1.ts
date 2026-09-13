@@ -475,8 +475,8 @@ export type RealtimeFrame =
  *   DELETE /v1/events/:id                          event.delete        [QA C5]
  *   POST   /v1/events/:id/publish                  event.publish       [QA C5]
  *   POST   /v1/events/:id/tasks                    task.create
- *   PATCH  /v1/tasks/:id                           task.update/move/assign -> { applied } | { changeRequest }
- *   DELETE /v1/tasks/:id                           task.delete
+ *   PATCH  /v1/tasks/:id                           task.update/move/assign -> { applied } | { changeRequest }  (envelopes pinned in section 11) [v1.13]
+ *   DELETE /v1/tasks/:id                           task.delete  (no body, no version check - section 11) [v1.13]
  *   POST   /v1/events/:id/resources                resource.create
  *   PATCH  /v1/resources/:id                       resource.update     [QA C5]
  *   DELETE /v1/resources/:id                       resource.delete     [QA C5]
@@ -636,3 +636,36 @@ export interface UserDirectoryEntry {
  *  Focus workers MUST NOT receive it; their UI keeps role-label fallbacks.
  *  Contains no credentials, no phone numbers (contact data lives on
  *  ResourceNode.contactPhone for kind 'person'). */
+
+// ============================================================
+// 11. TASK PATCH/DELETE ENVELOPES [v1.13]
+// ============================================================
+
+/** v1.13: pins the PATCH /v1/tasks/:id and DELETE /v1/tasks/:id wire shapes,
+ *  confirmed against the production server (2026-09-14). All mutations go
+ *  through proposeMutation: RBAC propose/allow applies, domino is computed,
+ *  and roles that require approval receive { changeRequest } instead of
+ *  { applied }. */
+
+export interface TaskPatchRequest {
+  /** MANDATORY. Compared against the TASK-level version (TaskNode.version),
+   *  NOT the event graph version. Omitting it always 409s VERSION_CONFLICT. */
+  version: number;
+  /** Exactly ONE change selector per request; precedence if several are sent:
+   *  move > assign > patch. No selector -> 400. */
+  move?: { newStart: ISODateTime };   // floating local time -> 400; locked task -> 409 LOCK_VIOLATION (every role)
+  assign?: { assigneeResourceIds: ID[] };
+  patch?: Partial<Pick<TaskNode, 'name' | 'durationMin' | 'status'>>;
+}
+/** KNOWN SOFT SPOT (documented behavior, v1.13): unknown keys inside patch are
+ *  NOT runtime-validated - they pass through silently. Clients MUST send only
+ *  name / durationMin / status. Server-side key validation is future hardening;
+ *  tightening it is a behavior change and needs its own rev. */
+
+/** DELETE /v1/tasks/:id reads NO request body and performs NO version check;
+ *  anything sent is ignored (pinning current behavior - adding a version
+ *  envelope now would break existing clients; optimistic-concurrency hardening
+ *  on delete is future scope). 404 unknown id. 409 TASK_HAS_SUBSCRIBERS when the
+ *  event is published AND an assignee carries subscriberChannelIds - such tasks
+ *  are cancelled via task.update { status: 'cancelled' } ONLY, never deleted.
+ *  Otherwise -> proposeMutation('task.delete'). */
