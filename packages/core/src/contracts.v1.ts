@@ -669,3 +669,36 @@ export interface TaskPatchRequest {
  *  event is published AND an assignee carries subscriberChannelIds - such tasks
  *  are cancelled via task.update { status: 'cancelled' } ONLY, never deleted.
  *  Otherwise -> proposeMutation('task.delete'). */
+
+// ============================================================
+// 12. REALTIME EMISSION MATRIX — change.resolved targeting [v1.14]
+// ============================================================
+
+/** v1.14: pins the room targeting for the 'change.resolved' frame (both
+ *  outcomes, approve and reject - reject included so the proposer receives
+ *  their rejectionReasonHe per the v1.2 visibility guarantee).
+ *
+ *  Recipients, ALWAYS:
+ *    - user:{proposer}           (the CR's proposedBy, any role)
+ *    - org admins room
+ *
+ *  PLUS, site rooms (field_manager relevance boundary - consistent with the
+ *  matrix's field_manager 'scope' semantics):
+ *    - task-bound changes (task.move / task.update / task.delete / task.assign
+ *      / task.create / constraint.lock / constraint.unlock): the site room of
+ *      the affected task's siteId (task.create: its create-siteId).
+ *    - dependency.create / dependency.delete: the site room of the FROM task
+ *      (successor - the task whose schedule the dependency constrains).
+ *    - event-level changes (event.create / event.update / event.publish,
+ *      resource.create / resource.update / resource.delete): NO site room
+ *      (event.create CRs live at eventId='pending' - no event, no sites;
+ *      resources and event edits are org-level).
+ *
+ *  Edge case (pinned from implementation): for task.delete CRs the task row may
+ *  be gone by emit time - the server resolves the siteId at handler time from
+ *  the CR's STORED change/proposal data; if it is unresolvable, the frame goes
+ *  to the always-recipients only (no site room). Deleted-task UI state is
+ *  already covered by 'graph.remove' tombstones.
+ *
+ *  Other frames keep their existing implemented targeting; this section pins
+ *  change.resolved only. */

@@ -115,6 +115,29 @@ export function createRealtime(
     return { type: 'graph.patch', eventId: snapshot.event.id, version: snapshot.event.version, tasks, dependencies: [], resources: [] };
   };
 
+  /** contracts v1.14 §12: site room for change.resolved, resolved at handler time
+   *  from the CR's stored change. Task-bound -> affected task's site (task.create:
+   *  its create-siteId); dependency -> the FROM task's site; event-level /
+   *  event.create / domino.apply -> none. Unresolvable (e.g. an approved
+   *  task.delete whose row is already gone) -> no site room (always-recipients
+   *  only); deleted-task UI state rides graph.remove tombstones. */
+  const resolvedChangeSite = async (cr: ChangeRequest): Promise<ID | undefined> => {
+    const ch = cr.change;
+    switch (ch.type) {
+      case 'task.create': return ch.task.siteId;
+      case 'task.move': case 'task.update': case 'task.assign': case 'task.delete':
+      case 'constraint.lock': case 'constraint.unlock':
+        return (await repo.getTask(ch.taskId))?.siteId;
+      case 'dependency.create':
+        return (await repo.getTask(ch.edge.fromTaskId))?.siteId;
+      case 'dependency.delete': {
+        const edge = await repo.getDependency(ch.dependencyId);
+        return edge ? (await repo.getTask(edge.fromTaskId))?.siteId : undefined;
+      }
+      default: return undefined;
+    }
+  };
+
   const unsubscribe = appEvents.subscribe(async (e) => {
     if (e.type === 'graph.removed') {
       // RT-PIN-4: tombstones to the rooms that previously held the task — NEVER adminsRoom.
@@ -148,9 +171,14 @@ export function createRealtime(
     }
     if (e.type === 'change.resolved') {
       const cr: ChangeRequest = e.changeRequest;
-      io.to(userRoom(cr.proposedBy)).emit('change.resolved', { changeRequest: cr });
       const orgId = (await repo.getUser(cr.proposedBy))?.orgId ?? (cr.eventId === 'pending' ? undefined : (await repo.getEvent(cr.eventId))?.orgId);
-      if (orgId) io.to(adminsRoom(orgId)).emit('change.resolved', { changeRequest: cr });
+      // v1.14 §12: one chained emit (socket.io room-union dedupes) - a proposer
+      // who is also an admin or site member receives exactly ONE copy.
+      let op = io.to(userRoom(cr.proposedBy));
+      if (orgId) op = op.to(adminsRoom(orgId));
+      const siteId = await resolvedChangeSite(cr);
+      if (siteId && cr.eventId !== 'pending') op = op.to(siteRoom(cr.eventId, siteId));
+      op.emit('change.resolved', { changeRequest: cr });
       return;
     }
     if (e.type === 'report.new') {
