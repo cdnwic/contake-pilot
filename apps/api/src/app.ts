@@ -295,6 +295,85 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     return { applied: { event } };
   });
 
+  // Builder WP (additive, contracts v1.11 candidate): duplicate an event's full
+  // day graph (tasks + dependencies + resources) onto a new date. Event-per-day
+  // model: powers "same schedule tomorrow". Task starts keep their wall time;
+  // only the date prefix is swapped (event-local rendering does the rest).
+  // RBAC: same gate as event.create; 'propose' roles get 403 for now (no CR
+  // path in v1 of this route — flagged to TL).
+  app.post('/v1/events/:id/duplicate', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: string };
+    const src = await loadEvent(req, id);
+    const body = (req.body ?? {}) as { date?: string; name?: string };
+    if (!body.date || !/^\d{4}-\d{2}-\d{2}$/.test(body.date)) fail(400, 'BAD_REQUEST', 'חסר שדה חובה: date (YYYY-MM-DD)');
+    const decision = rawDecision('event.create', user.role);
+    if (decision !== 'allow') {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'event.create', entityType: 'event', entityId: 'pending', eventId: id,
+      });
+    }
+    const [tasks, resources, deps] = await Promise.all([
+      repo.listTasks(id), repo.listResources(id), repo.listDependencies(id),
+    ]);
+    const event: EventNode = {
+      kind: 'event', id: newId('evt'), orgId: src.orgId, domainProfileId: src.domainProfileId,
+      name: body.name ?? src.name, date: body.date, timezone: src.timezone,
+      siteIds: [...src.siteIds], status: 'draft', version: 1,
+    };
+    const resIdMap = new Map<ID, ID>();
+    const taskIdMap = new Map<ID, ID>();
+    const shiftStart = (start: string | null): string | null =>
+      start === null ? null : body.date + start.slice(10);
+    await withAuditSafety(repo, async () => {
+      await repo.createEvent(event);
+      for (const r of resources) {
+        const nid = newId('res');
+        resIdMap.set(r.id, nid);
+        await repo.createResource({
+          kind: 'resource', id: nid, eventId: event.id, resourceKind: r.resourceKind, name: r.name,
+          exclusive: r.exclusive, ...(r.capacity !== undefined ? { capacity: r.capacity } : {}),
+          ...(r.memberIds ? { memberIds: r.memberIds.map(m => resIdMap.get(m) ?? m) } : {}),
+          ...(r.subscriberChannelIds ? { subscriberChannelIds: [...r.subscriberChannelIds] } : {}),
+          version: 1,
+        });
+      }
+      // second pass fixes memberIds that pointed at not-yet-copied resources
+      for (const r of resources) {
+        if (!r.memberIds) continue;
+        const mapped = r.memberIds.map(m => resIdMap.get(m) ?? m);
+        if (mapped.some((m, i) => m !== r.memberIds![i])) {
+          await repo.updateResource(resIdMap.get(r.id)!, { memberIds: mapped });
+        }
+      }
+      for (const t of tasks) {
+        const nid = newId('tsk');
+        taskIdMap.set(t.id, nid);
+        await repo.createTask({
+          kind: 'task', id: nid, eventId: event.id, siteId: t.siteId, name: t.name,
+          start: shiftStart(t.start), durationMin: t.durationMin, status: 'planned',
+          locked: t.locked, assigneeResourceIds: t.assigneeResourceIds.map(a => resIdMap.get(a) ?? a),
+          version: 1,
+        });
+      }
+      for (const d of deps) {
+        await repo.createDependency({
+          kind: 'depends_on', id: newId('dep'),
+          fromTaskId: taskIdMap.get(d.fromTaskId) ?? d.fromTaskId,
+          toTaskId: taskIdMap.get(d.toTaskId) ?? d.toTaskId,
+          lagMin: d.lagMin, hard: d.hard,
+        });
+      }
+      await audit(repo, {
+        orgId: user.orgId, eventId: event.id, actorUserId: user.userId, role: user.role,
+        action: 'event.create', entityType: 'event', entityId: event.id,
+        after: { ...event, duplicatedFrom: id, counts: { tasks: tasks.length, resources: resources.length, dependencies: deps.length } },
+        deviceClass: deviceClassOf(ua(req)),
+      });
+    });
+    return { applied: { event, duplicatedFrom: id, copied: { tasks: tasks.length, resources: resources.length, dependencies: deps.length } } };
+  });
+
   const loadEvent = async (req: FastifyRequest, id: string) => {
     const event = await repo.getEvent(id);
     if (!event || event.orgId !== await me(req).orgId) fail(404, 'NOT_FOUND', 'האירוע לא נמצא');

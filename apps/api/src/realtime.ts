@@ -36,7 +36,16 @@ export function createRealtime(
   auth: AuthService,
   opts: RealtimeOptions = {},
 ): Realtime {
-  const io = new IOServer(server, { path: '/socket.io' });
+  // CORS (live-bug fix, Design audit): socket.io does its own CORS, separate from
+  // @fastify/cors — without this the browser polling/websocket handshake from the
+  // FE origin is blocked even when REST works. Same env source as app.ts.
+  const corsOrigin = process.env['CORS_ORIGIN']?.split(',').map(o => o.trim()).filter(Boolean);
+  const io = new IOServer(server, {
+    path: '/socket.io',
+    ...(corsOrigin && corsOrigin.length > 0
+      ? { cors: { origin: corsOrigin, methods: ['GET', 'POST'] } }
+      : {}),
+  });
   const revalidateMs = opts.revalidateMs ?? 30_000;
 
   io.use(async (socket, next) => {
