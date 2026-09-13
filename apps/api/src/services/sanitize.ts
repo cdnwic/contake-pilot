@@ -10,3 +10,14 @@ export function stripSubscriberFields(resources: ResourceNode[]): ResourceNode[]
     return rest;
   });
 }
+
+/** contracts v1.12: ResourceNode.contactPhone is manager-roles visibility only
+ *  (admin, field_manager) - NEVER emitted to focus_worker payloads. Applied at
+ *  the focus_worker branch of filteredGraph; manager surfaces keep the field. */
+export function stripContactPhone(resources: ResourceNode[]): ResourceNode[] {
+  return resources.map(r => {
+    if (r.contactPhone === undefined) return r;
+    const { contactPhone: _stripped, ...rest } = r;
+    return rest;
+  });
+}

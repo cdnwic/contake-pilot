@@ -154,6 +154,10 @@ export interface ResourceNode {
   memberIds?: ID[];
   /** External stakeholder channel attached to this node (e.g. parents of a group). */
   subscriberChannelIds?: ID[];
+  /** v1.12: operational contact for kind 'person' (e.g. driver phone, E.164).
+   *  Manager-roles visibility only (admin, field_manager); NEVER emitted to
+   *  focus_worker payloads. Powers tel: quick actions (e.g. "התקשר לנהג"). */
+  contactPhone?: string;
   version: number;
 }
 
@@ -333,6 +337,12 @@ export interface StatusReport {
   noteHe?: string;
   clientTimestamp: ISODateTime; // original field time, preserved through offline sync
   createdAt: ISODateTime;       // server receipt time
+  /** v1.12: handled-state, set via POST /v1/reports/:id/resolve. Mirrors ChangeRequest
+   *  resolution fields. Pure bookkeeping - NO graph effect, NO effect on CRs the
+   *  report spawned. */
+  resolvedBy?: ID;
+  resolvedAt?: ISODateTime;
+  resolutionNoteHe?: string;
 }
 /** Apply authority for delay reports (QA C2, matrix reportApplyRule):
  *  own-task delay, computed impact S0, task unlocked => auto-apply.
@@ -355,6 +365,7 @@ export interface NotificationTarget {
 export interface NotificationJob {
   id: ID;
   eventId: ID;
+  createdAt: ISODateTime;       // v1.12: server creation time (notification-center when-line)
   kind: NotificationKind | 'digest_multi_change';
   targets: NotificationTarget[];
   templateKey: string;
@@ -392,7 +403,8 @@ export interface PushSubscription {
 // ============================================================
 
 export type AuditEntityType = NodeKind | 'user' | 'change_request' | 'notification' | 'dependency'
-  | 'push_subscription';       // v1.10
+  | 'push_subscription'        // v1.10
+  | 'report';                  // v1.12 (report.resolve audits under its precise entity)
 
 export interface AuditLogEntry {
   id: ID;
@@ -439,13 +451,15 @@ export interface GraphRemoveFrame {
 export interface ChangePendingFrame { type: 'change.pending'; changeRequest: ChangeRequest; }
 export interface ChangeResolvedFrame { type: 'change.resolved'; changeRequest: ChangeRequest; }
 export interface ReportNewFrame { type: 'report.new'; report: StatusReport; siteId: ID; }
+export interface ReportResolvedFrame { type: 'report.resolved'; report: StatusReport; siteId: ID; } // v1.12
 export interface NotifyFailedFrame { type: 'notify.failed'; jobId: ID; address: string; error: string; }
 export interface NotifyAckedFrame { type: 'notify.acked'; jobId: ID; acknowledgedBy: ID; acknowledgedAt: ISODateTime; }
 
 export type RealtimeFrame =
   | GraphPatchFrame | GraphRemoveFrame
   | ChangePendingFrame | ChangeResolvedFrame
-  | ReportNewFrame | NotifyFailedFrame | NotifyAckedFrame;
+  | ReportNewFrame | ReportResolvedFrame  // v1.12
+  | NotifyFailedFrame | NotifyAckedFrame;
 
 // ============================================================
 // 8. API CONTRACT (REST, prefix /v1) + realtime events
@@ -455,6 +469,7 @@ export type RealtimeFrame =
  * REST endpoints (all scoped by Principal; mutations return ChangeRequest when approval required):
  *   GET    /v1/events
  *   POST   /v1/events                              event.create
+ *   POST   /v1/events/:id/duplicate               duplicate-day: copies tasks+dependencies+resources to a new date as draft [v1.11, PROPOSED]
  *   GET    /v1/events/:id/graph                    GraphSnapshot (role-filtered: focus_worker gets own tasks only)
  *   PATCH  /v1/events/:id                          event.update        [QA C5]
  *   DELETE /v1/events/:id                          event.delete        [QA C5]
@@ -468,10 +483,12 @@ export type RealtimeFrame =
  *   POST   /v1/events/:id/dependencies             dependency.create (400 on cycle, Hebrew error names members)
  *   DELETE /v1/dependencies/:id                    dependency.delete   [QA C5]
  *   POST   /v1/domino/compute                      dry-run; scope-checked (field_manager: own sites only) [QA C6]
- *   POST   /v1/changes/:id/approve                 change.approve (admin; 409 on stale baseGraphVersion)
+ *   POST   /v1/changes/:id/approve                 change.approve (admin; 409 on stale baseGraphVersion; server checks the CR's STORED base - any client-supplied baseGraphVersion is IGNORED) [clarified v1.12]
  *   POST   /v1/changes/:id/reject                  change.reject (admin)
  *   GET    /v1/changes?eventId=&state=             pending approvals queue
  *   POST   /v1/reports                             report.status.create; dedupe on clientReportId
+ *   POST   /v1/reports/:id/resolve                report.resolve (admin / field_manager own-site) [v1.12]
+ *   GET    /v1/users                               org users directory (admin / field_manager) [v1.12]
  *   POST   /v1/tasks/:id/lock                      constraint.lock       [v1.2]
  *   POST   /v1/tasks/:id/unlock                    constraint.unlock     [v1.2]
  *   GET    /v1/audit?eventId=                      audit read (admin full; field_manager site-scoped) [v1.2, QA AC-AUD-3]
@@ -494,3 +511,128 @@ export type RealtimeFrame =
  *
  * Errors: { error: { code: string, messageHe: string } }, HTTP 4xx/5xx.
  */
+
+// ============================================================
+// 9. BUILDER WRITE PAYLOADS + ROLE ROUTING + EVENT-PER-DAY [v1.11]
+// ============================================================
+
+/** v1.11: additive request-payload pinning. No existing definition changed.
+ *  Shapes confirmed by backend against the gated tree app.ts (2026-09-13):
+ *  write payloads are NESTED under a single root key. */
+
+export interface TaskCreateRequest {
+  task: {
+    name: string;               // required
+    durationMin: number;        // required, > 0
+    siteId: ID;                 // required, MUST belong to the parent event's siteIds
+    start?: ISODateTime | null; // default null = unscheduled
+    locked?: boolean;           // default false
+    assigneeResourceIds?: ID[]; // default []
+  };
+}
+/** Server behavior (confirmed): forces kind='task', eventId from the path,
+ *  status='planned'. Missing required fields -> 400
+ *  "חסרים שדות משימה: name, durationMin, siteId".
+ *  task.create goes through proposeMutation: RBAC propose/allow applies,
+ *  domino is computed, and roles that require approval get a ChangeRequest
+ *  instead of a direct apply — creating a task is NOT a silent write.
+ *  Dependencies are NOT part of task.create: create them via
+ *  POST /v1/events/:id/dependencies (400 on cycle, Hebrew error names members). */
+
+export interface ResourceCreateRequest {
+  resource: {
+    resourceKind: ResourceKind; // required
+    name: string;               // required
+    exclusive: boolean;         // required
+    memberIds?: ID[];           // for resourceKind 'group' — the membership edge
+    subscriberChannelIds?: ID[];
+    capacity?: number;          // RESERVED (QA D2), not enforced by Alpha domino
+  };
+}
+/** Groups ARE resources: a group (חוג/קבוצה) is created with resourceKind: 'group'
+ *  (confirmed accepted by the resources route). There is no separate /v1/groups
+ *  route (verified 404 on pilot, 2026-09-13). */
+
+export interface EventCreateRequest {
+  name: string;               // required (server validation-verified on pilot)
+  date: string;               // required, ISO date 'YYYY-MM-DD', event-local wall time
+  timezone: string;           // required, IANA
+  domainProfileId: ID;        // required, e.g. 'camp'
+  siteIds: ID[];              // required, non-empty
+}
+
+export interface EventDuplicateRequest {
+  date: string;               // required, ISO date 'YYYY-MM-DD' of the NEW day
+  name?: string;              // default: source name with the new date
+}
+export interface EventDuplicateResponse {
+  applied: {
+    event: EventNode;         // the new event: new id, status 'draft', version 1
+    duplicatedFrom: ID;       // source event id
+    copied: { tasks: number; resources: number; dependencies: number };
+  };
+}
+/** POST /v1/events/:id/duplicate — built by backend (additive, app.ts only,
+ *  smoke-tested locally, pending deploy). Semantics (confirmed): same org /
+ *  domainProfileId / timezone / siteIds; deep-copies resources, tasks and
+ *  dependencies with remapped ids; task start date-prefix swapped while keeping
+ *  wall time + offset; locked flags preserved; group memberIds remapped;
+ *  one audit row 'event.create'; atomic via a single DB transaction.
+ *  Reports, change requests, notifications and prior audit are NOT copied.
+ *  RBAC: gated on rawDecision('event.create'). TL DECISION (v1.11): roles whose
+ *  rawDecision is 'propose' get 403 — duplication has NO ChangeRequest path in
+ *  v1. Rationale: duplication is a manager builder action; a propose-shaped
+ *  "approve this whole copied day" flow is post-v1 scope. If a field_manager
+ *  day-building-with-approval need ever surfaces, add the CR path then. */
+
+// --- Role routing (product contract; UX-level, enforced client-side only) ---
+
+/** Landing view derives from the AUTHENTICATED principal's role, always:
+ *    admin | field_manager -> Control Tower
+ *    focus_worker          -> Focus Mode (their own tasks, report buttons)
+ *  No manual role/view switcher: the mock-era תפקיד combobox is REMOVED (v1.11).
+ *  FE capability gating (nav items, badges, actions) MUST mirror what the server
+ *  authorizes for the principal's role — gating is cosmetic only; the server's
+ *  403 remains the single source of truth. If a "view as" tool is ever needed
+ *  for demos, it is an explicit admin-only feature, never a general switcher. */
+
+// --- Event-per-day decision record ---
+
+/** One operational day = ONE event with its own versioned graph (EventNode.date).
+ *  Rationale: domino compute, dependency DAG, graphVersion, ChangeRequest
+ *  baseGraphVersion staleness, approvals and principal scoping are all
+ *  per-event-graph, and a camp day is operationally closed (buses in, activities,
+ *  buses out — no dependency legitimately crosses midnight).
+ *  TRADEOFF (flagged, 2026-09-13, ratified by owner): cross-day dependencies are
+ *  not representable. A multi-day object (e.g. a 3-day trip) is a FUTURE separate
+ *  "trip" concept, not a day and not an event with multiple dates.
+ *  "Same schedule tomorrow" is served by POST /v1/events/:id/duplicate. */
+
+// ============================================================
+// 10. REPORT RESOLUTION + USERS DIRECTORY [v1.12]
+// ============================================================
+
+export interface ReportResolveRequest {
+  resolutionNoteHe?: string;  // optional free-text, stored on the report
+}
+/** POST /v1/reports/:id/resolve — marks a field report handled.
+ *  IDEMPOTENCY (ack-style, matching notify.ack v1.6): re-resolving returns 200
+ *  with the EXISTING resolvedBy/resolvedAt - no overwrite, no second audit row.
+ *  SCOPE GUARD (ratified 2026-09-14): resolve is pure handled-state. It has NO
+ *  graph effect and NO implicit effect on change requests the report spawned;
+ *  a spawned CR keeps its own lifecycle.
+ *  RBAC: matrix row 'report.resolve' - admin allow, field_manager scope (own
+ *  sites), focus_worker deny. Audit: one row, entityType 'report', via
+ *  withAuditSafety. Cross-org id -> 404 (existing pattern).
+ *  Realtime: 'report.resolved' { report, siteId } so open reports clear live. */
+
+export interface UserDirectoryEntry {
+  id: ID;
+  displayName: string;        // Hebrew display name for CR/audit attribution
+  role: Role;
+}
+/** GET /v1/users — org-scoped users directory, admin + field_manager only.
+ *  Powers display names for proposedBy/resolvedBy in the approval center.
+ *  Focus workers MUST NOT receive it; their UI keeps role-label fallbacks.
+ *  Contains no credentials, no phone numbers (contact data lives on
+ *  ResourceNode.contactPhone for kind 'person'). */

@@ -11,6 +11,8 @@ export type AppEvent =
   | { type: 'change.pending'; changeRequest: ChangeRequest }
   | { type: 'change.resolved'; changeRequest: ChangeRequest }
   | { type: 'report.new'; report: StatusReport; eventId: ID; siteId: ID }
+  /** v1.12: shared handled-state for field reports -> adminsRoom + site room (mirrors report.new). */
+  | { type: 'report.resolved'; report: StatusReport; eventId: ID; siteId: ID }
   | { type: 'notify.failed'; eventId: ID; jobId: ID; address: string; error: string }
   /** PR-3 (contracts v1.6/v1.7): shared FYI handled-state -> adminsRoom(orgId). */
   | { type: 'notify.acked'; eventId: ID; orgId: ID; jobId: ID; acknowledgedBy: ID; acknowledgedAt: string };

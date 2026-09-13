@@ -161,6 +161,14 @@ export function createRealtime(
       io.to(siteRoom(e.eventId, e.siteId)).emit('report.new', payload);
       return;
     }
+    if (e.type === 'report.resolved') {
+      const event = await repo.getEvent(e.eventId);
+      if (!event) return;
+      const payload = { report: e.report, siteId: e.siteId };
+      io.to(adminsRoom(event.orgId)).emit('report.resolved', payload);
+      io.to(siteRoom(e.eventId, e.siteId)).emit('report.resolved', payload);
+      return;
+    }
     if (e.type === 'notify.acked') {
       io.to(adminsRoom(e.orgId)).emit('notify.acked', { jobId: e.jobId, acknowledgedBy: e.acknowledgedBy, acknowledgedAt: e.acknowledgedAt });
       return;

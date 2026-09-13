@@ -186,6 +186,16 @@ export class MemoryGraphRepository implements GraphRepository {
     const taskIds = new Set((await this.listTasks(eventId)).map(t => t.id));
     return [...this.reports.values()].filter(r => taskIds.has(r.taskId));
   }
+  async getReport(id: ID): Promise<StatusReport | undefined> { return this.reports.get(id); }
+  async resolveReport(id: ID, by: ID, at: string, noteHe?: string): Promise<{ report: StatusReport; applied: boolean } | undefined> {
+    // No awaits inside: check-and-set is atomic on the JS runloop (ack pattern).
+    const cur = this.reports.get(id);
+    if (!cur) return undefined;
+    if (cur.resolvedBy !== undefined) return { report: cur, applied: false };
+    const next = { ...cur, resolvedBy: by, resolvedAt: at, ...(noteHe ? { resolutionNoteHe: noteHe } : {}) };
+    this.reports.set(id, next);
+    return { report: next, applied: true };
+  }
 
   async createNotificationJob(j: NotificationJob): Promise<NotificationJob> { this.notificationJobs.set(j.id, j); return j; }
   async getNotificationJob(id: ID): Promise<NotificationJob | undefined> { return this.notificationJobs.get(id); }

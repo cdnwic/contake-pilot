@@ -90,6 +90,10 @@ export interface GraphRepository {
   createReport(r: StatusReport): Promise<StatusReport>;
   getReportByClientId(clientReportId: string): Promise<StatusReport | undefined>;
   listReports(eventId: ID): Promise<StatusReport[]>;
+  getReport(id: ID): Promise<StatusReport | undefined>;
+  /** v1.12: write-once handled-state (ack-style idempotency): applied=false when
+   *  already resolved - a re-resolve never overwrites and never re-audits. */
+  resolveReport(id: ID, by: ID, at: string, noteHe?: string): Promise<{ report: StatusReport; applied: boolean } | undefined>;
 
   // notification jobs (recorder; sandbox dispatch lands at M3)
   createNotificationJob(j: NotificationJob): Promise<NotificationJob>;

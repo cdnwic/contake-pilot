@@ -1,3 +1,4 @@
+import { RBAC_MATRIX_VERSION } from '@contake/core';
 import { buildApp } from './app.js';
 import { AuthService, type OtpStateStore } from './auth.js';
 import { MemoryGraphRepository } from './repo/memory.js';
@@ -10,6 +11,15 @@ import { createTwilioProvider, twilioConfigFromEnv } from './services/twilio.js'
 import { createWhatsAppCloudProvider, whatsAppCloudConfigFromEnv } from './services/whatsapp-cloud.js';
 import { createLogPushProvider, createVapidPushProvider, vapidConfigFromEnv } from './services/webpush.js';
 import { campDemoSeed } from './demo/camp-demo.js';
+
+// Deploy pin check (contracts v1.12 / matrix v1.3): refuse boot on a wrong
+// pinned matrix drop-in. File-hash pinning happens at review/build time (the
+// pinned sha256 is checked against TL-published hashes before deploy); the
+// compiled runtime asserts the version marker of the actually-loaded matrix.
+const PINNED_MATRIX_VERSION = '1.3';
+if (RBAC_MATRIX_VERSION !== PINNED_MATRIX_VERSION) {
+  throw new Error(`RBAC matrix pin mismatch: expected v${PINNED_MATRIX_VERSION}, loaded v${RBAC_MATRIX_VERSION} - refusing to boot`);
+}
 
 // PR-1: env-selected storage adapter. DATABASE_URL set -> Postgres (real
 // transactions, durable dispatch state); unset -> in-memory (test/dev default).

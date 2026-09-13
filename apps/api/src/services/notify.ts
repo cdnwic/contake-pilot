@@ -149,6 +149,7 @@ export async function buildApprovalNeededJob(input: {
     params: { summaryHe: input.summaryHe },
     idempotencyKey: `${event.id}+${changeRequestId}+change_needs_approval`,
     batchWindowSec: 60,
+    createdAt: new Date().toISOString(), // v1.12
   };
   return job;
 }
@@ -175,6 +176,7 @@ function toJob(
     // suffix so recordJobs dedupe never collapses the two (QA-M2-2 recipient split).
     idempotencyKey: `${event.id}+${changeRequestId}+${b.kind}${b.external ? '+external' : ''}`,
     batchWindowSec: 60,
+    createdAt: new Date().toISOString(), // v1.12
   };
   const quiet = profile.rules.quietHours ?? { startHHMM: '22:00', endHHMM: '07:00' };
   // QA-M2-2: quiet hours hold ONLY external (group-subscriber) delivery — staff never held.
@@ -240,6 +242,7 @@ export async function buildReassignmentJobs(input: {
       params,
       idempotencyKey: `${snapshot.event.id}+${changeRequestId}+${kind}`,
       batchWindowSec: 60,
+      createdAt: new Date().toISOString(), // v1.12
     });
   };
   build('task_assigned', input.addedPersonIds, { taskName: task.name, newStart: task.start ?? '' });

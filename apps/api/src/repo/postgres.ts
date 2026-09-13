@@ -396,6 +396,22 @@ export class PostgresGraphRepository implements GraphRepository {
     const r = await this.q(`SELECT data FROM reports WHERE task_id IN (SELECT id FROM tasks WHERE event_id=$1)`, [eventId]);
     return r.rows.map(row => row['data'] as StatusReport);
   }
+  async getReport(id: ID): Promise<StatusReport | undefined> {
+    const r = await this.q(`SELECT data FROM reports WHERE id=$1`, [id]);
+    return r.rows[0]?.['data'] as StatusReport | undefined;
+  }
+  async resolveReport(id: ID, by: ID, at: string, noteHe?: string): Promise<{ report: StatusReport; applied: boolean } | undefined> {
+    return this.inTx(async c => {
+      // FOR UPDATE serializes racers; only the winner returns applied=true (ack pattern).
+      const r = await c.query(`SELECT data FROM reports WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as StatusReport | undefined;
+      if (!cur) return undefined;
+      if (cur.resolvedBy !== undefined) return { report: cur, applied: false };
+      const next = { ...cur, resolvedBy: by, resolvedAt: at, ...(noteHe ? { resolutionNoteHe: noteHe } : {}) };
+      await c.query(`UPDATE reports SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+      return { report: next, applied: true };
+    });
+  }
 
   // ---- notification jobs --------------------------------------------------------
   async createNotificationJob(j: NotificationJob): Promise<NotificationJob> {

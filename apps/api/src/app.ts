@@ -1,14 +1,14 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import type {
-  AuditLogEntry, ChangeRequest, DominoResult, EventNode, GraphSnapshot, ID, ProposedChange, PushSubscription, StatusReport, TaskNode,
+  Action, AuditLogEntry, ChangeRequest, DominoResult, EventNode, GraphSnapshot, ID, ProposedChange, PushSubscription, StatusReport, TaskNode,
 } from '@contake/core';
 import {
   assertAcyclic, dependencyPath, getProfile, inScope, listProfiles, parseInstant,
   rawDecision, renderInstant, computeDomino, wouldCreateCycle,
 } from '@contake/core';
 import { appEvents } from './services/events.js';
-import { stripSubscriberFields } from './services/sanitize.js';
+import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
 import { AuthService } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
@@ -53,7 +53,8 @@ export function filteredGraph(snapshot: GraphSnapshot, user: UserRecord): GraphS
   return {
     event: snapshot.event,
     tasks: own,
-    resources: resources.filter(r => used.has(r.id)),
+    // v1.12: focus_worker never receives contactPhone (manager-roles visibility only)
+    resources: stripContactPhone(resources.filter(r => used.has(r.id))),
     dependencies: [],
   };
 }
@@ -514,9 +515,11 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const user = await me(req);
     const { id } = req.params as { id: string };
     await loadEvent(req, id);
-    const body = (req.body ?? {}) as { resource?: { resourceKind?: never; name?: string; exclusive?: boolean; memberIds?: ID[]; subscriberChannelIds?: ID[]; capacity?: number } };
+    const body = (req.body ?? {}) as { resource?: { resourceKind?: never; name?: string; exclusive?: boolean; memberIds?: ID[]; subscriberChannelIds?: ID[]; capacity?: number; contactPhone?: string } };
     const r = body.resource;
     if (!r?.resourceKind || !r.name || r.exclusive === undefined) fail(400, 'BAD_REQUEST', 'חסרים שדות משאב: resourceKind, name, exclusive');
+    // v1.12: contactPhone is an operational contact for kind 'person' only
+    if (r.contactPhone !== undefined && r.resourceKind !== 'person') fail(400, 'BAD_REQUEST', 'contactPhone זמין רק למשאב מסוג person');
     const change: ProposedChange = {
       type: 'resource.create',
       resource: {
@@ -524,6 +527,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
         exclusive: r.exclusive, ...(r.memberIds ? { memberIds: r.memberIds } : {}),
         ...(r.subscriberChannelIds ? { subscriberChannelIds: r.subscriberChannelIds } : {}),
         ...(r.capacity !== undefined ? { capacity: r.capacity } : {}),
+        ...(r.contactPhone ? { contactPhone: r.contactPhone } : {}),
       },
     };
     return proposeMutation(repo, withOrg(user), 'resource.create', change, id, ua(req));
@@ -535,7 +539,9 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const res = await repo.getResource(id);
     if (!res) fail(404, 'NOT_FOUND', 'המשאב לא נמצא');
     await loadEvent(req, res.eventId);
-    const body = (req.body ?? {}) as { patch?: { name?: string; exclusive?: boolean; memberIds?: ID[]; subscriberChannelIds?: ID[] } };
+    const body = (req.body ?? {}) as { patch?: { name?: string; exclusive?: boolean; memberIds?: ID[]; subscriberChannelIds?: ID[]; contactPhone?: string } };
+    // v1.12: contactPhone stays a person-only field on update too
+    if (body.patch?.contactPhone !== undefined && res.resourceKind !== 'person') fail(400, 'BAD_REQUEST', 'contactPhone זמין רק למשאב מסוג person');
     const change: ProposedChange = { type: 'resource.update', resourceId: id, patch: body.patch ?? {} };
     return proposeMutation(repo, withOrg(user), 'resource.update', change, res.eventId, ua(req));
   });
@@ -745,6 +751,64 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       await recordJobs(repo, [await buildApprovalNeededJob({ repo, event: snapshot.event, profile: getProfile(snapshot.event.domainProfileId), changeRequestId: cr.id, summaryHe: cr.dominoResult.summaryHe })]);
     }
     return outcome;
+  });
+
+  // ---------- report resolution (contracts v1.12) ----------
+  // Pure handled-state on the report: NO graph effect, NO effect on CRs the
+  // report spawned. Ack-style idempotent: a re-resolve 200s with the EXISTING
+  // resolvedBy/resolvedAt - no overwrite, no second audit row, no second frame.
+  app.post('/v1/reports/:id/resolve', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    const base = rawDecision('report.resolve', user.role);
+    if (base !== 'allow' && base !== 'scope') {
+      // v1.12 SHIM (flagged to TL): the pinned v1.12 Action union omits
+      // 'report.resolve' (matrix row + audit prose + 'report' AuditEntityType
+      // are all present). Cast compiles against the pinned bytes; TL to add it
+      // to the union in the next contracts rev.
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'report.resolve' as Action, entityType: 'report', entityId: id, eventId: 'pending',
+      });
+    }
+    const report = await repo.getReport(id);
+    if (!report) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+    const task = await repo.getTask(report.taskId);
+    if (!task) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+    const snapshot = await repo.snapshot(task.eventId);
+    if (!snapshot || snapshot.event.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא'); // cross-org 404
+    if (base === 'scope' && !inScope(user.scopes, task.eventId, task.siteId)) {
+      fail(403, 'FORBIDDEN', 'לא ניתן לטפל בדיווח מחוץ לתחום האחריות שלך', {
+        reason: 'scope_violation', action: 'report.resolve' as Action, entityType: 'report', entityId: id, eventId: task.eventId,
+      });
+    }
+    if (report.resolvedBy !== undefined) return { report }; // already handled: return existing state
+    const { resolutionNoteHe } = (req.body ?? {}) as { resolutionNoteHe?: string };
+    const resolvedAt = new Date().toISOString();
+    const resolved = await withAuditSafety(repo, async () => {
+      const r = await repo.resolveReport(id, user.userId, resolvedAt, resolutionNoteHe);
+      if (r?.applied) {
+        await audit(repo, {
+          orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
+          action: 'report.resolve' as Action, entityType: 'report', entityId: id,
+          after: { resolvedBy: user.userId, resolvedAt, ...(resolutionNoteHe ? { resolutionNoteHe } : {}) },
+          deviceClass: deviceClassOf(ua(req)),
+        });
+        appEvents.emit({ type: 'report.resolved', report: r.report, eventId: task.eventId, siteId: task.siteId });
+      }
+      return r;
+    });
+    return { report: resolved?.report ?? report };
+  });
+
+  // ---------- users directory (contracts v1.12) ----------
+  // Org-scoped, admin + field_manager only (hard role check - no matrix row,
+  // notify.ack precedent; READ endpoint so no denied-audit row per v1.9).
+  // Powers display names for proposedBy/resolvedBy. No credentials, no phones.
+  app.get('/v1/users', async (req) => {
+    const user = await me(req);
+    if (user.role !== 'admin' && user.role !== 'field_manager') fail(403, 'FORBIDDEN', 'אין גישה לרשימת המשתמשים');
+    const users = await repo.listUsers(user.orgId);
+    return { users: users.map(u => ({ id: u.userId, displayName: u.name, role: u.role })) };
   });
 
   // ---------- audit & notification evidence (admin; ISO-4) ----------
