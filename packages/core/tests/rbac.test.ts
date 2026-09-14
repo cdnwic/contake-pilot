@@ -6,9 +6,9 @@ import matrixJson from '../src/rbac/matrix.v1.json' with { type: 'json' };
 
 const matrix = matrixJson as unknown as { matrix: Record<string, Record<string, string>> };
 
-describe('RBAC matrix v1.1 (machine-readable, QA AC-RBAC-1/2)', () => {
-  it('covers all 22 actions x 3 roles with explicit cells', () => {
-    expect(ALL_ACTIONS.length).toBe(22);
+describe('RBAC matrix v1.3 (machine-readable, QA AC-RBAC-1/2)', () => {
+  it('covers all 23 actions x 3 roles with explicit cells', () => {
+    expect(ALL_ACTIONS.length).toBe(23);
     expect(ALL_ROLES).toEqual(['admin', 'field_manager', 'focus_worker']);
     for (const action of ALL_ACTIONS) {
       for (const role of ALL_ROLES) {
