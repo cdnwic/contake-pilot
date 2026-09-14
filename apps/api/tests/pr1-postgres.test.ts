@@ -3,7 +3,8 @@
  *  REPO_IMPL=postgres; the carried suites (which run in both modes) cover parity. */
 import { describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
-import { PostgresGraphRepository, pgDispatchState, pgliteConnectable } from '../src/repo/postgres.js';
+import { PostgresGraphRepository, createPgOtpState, pgDispatchState, pgliteConnectable } from '../src/repo/postgres.js';
+import { AuthService } from '../src/auth.js';
 import { createDispatcher, type MessageProvider } from '../src/services/dispatch.js';
 import { applySeed, seedDemo } from '../src/seed.js';
 import { REPO_IMPL } from './helpers/repo.js';
@@ -88,5 +89,26 @@ run('PR-1 Postgres adapter (PGlite, real transactions)', () => {
     expect(await d3.handleInboundStop('+97252100999')).toBe(1);
     const state2 = pgDispatchState(db);
     expect(await state2.isSuppressed('+97252100999')).toBe(true);
+  });
+
+  it('(d) whitelist auth_audit + entries persist on the real adapter (QA integrity gate)', async () => {
+    const { db, repo } = await make();
+    // whitelist store on PG: upsert/get/list
+    await repo.upsertWhitelistEntry({ phone: '+972500100001', status: 'approved', orgId: 'org-1', assignedRole: 'admin', createdAt: new Date().toISOString() });
+    await repo.upsertWhitelistEntry({ phone: '+972500100002', status: 'pending_approval', orgId: 'org-1', displayName: 'x', createdAt: new Date().toISOString() });
+    expect((await repo.getWhitelistEntry('+972500100001'))!.status).toBe('approved');
+    expect((await repo.listWhitelist('org-1', 'pending_approval')).map(e => e.phone)).toEqual(['+972500100002']);
+    // upsert on phone is idempotent reset (re-invite)
+    await repo.upsertWhitelistEntry({ phone: '+972500100002', status: 'invited', orgId: 'org-1', createdAt: new Date().toISOString() });
+    expect((await repo.getWhitelistEntry('+972500100002'))!.status).toBe('invited');
+    // auth_audit channel: appendWhitelistAudit lands durable rows with all fields
+    const otp = await createPgOtpState(db);
+    const auth = new AuthService(repo, undefined, undefined, otp);
+    await auth.appendWhitelistAudit('+972500100002', 'whitelist.register', { outcome: 'success', reasonCode: 'pending_approval', deviceClass: 'desktop', requestId: '42' });
+    const rows = await otp.listAuthAudit('+972500100002');
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.kind).toBe('whitelist.register');
+    expect((rows[0]!.detail as { reasonCode?: string }).reasonCode).toBe('pending_approval');
+    expect(rows[0]!.createdAt).toBeTruthy();
   });
 });

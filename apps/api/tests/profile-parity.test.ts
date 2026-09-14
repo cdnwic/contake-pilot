@@ -89,7 +89,7 @@ const runProfileFlow = async (pid: string): Promise<{ eventId: string; admin: st
   return { eventId, admin };
 };
 
-describe('M3-QA-1: all-six-profile API parity', () => {
+describe('M3-QA-1: all-seven-profile API parity', () => {
   beforeEach(() => {
     // Determinism: the flow's job build reads the wall clock for quiet hours; pin a
     // daytime Date so sections (b)/(c) behave identically at any run time. Section

@@ -226,7 +226,7 @@ describe('ND — notify.dispatch worker (G2)', () => {
     expect(TEMPLATE_PARAMS['digest_multi_change']).toEqual(['changeCount', 'eventName', 'summaryHe']);
   });
 
-  it('ND-8: content + per-profile template completeness (7 keys x 6 profiles)', () => {
+  it('ND-8: content + per-profile template completeness (7 keys x 7 profiles)', () => {
     const body = renderTemplate(
       getProfile('camp').notificationTemplates['task_moved'] ?? '',
       { taskName: 'איסוף באוטובוס', newStart: '2026-09-14T08:15:00+03:00' },
@@ -235,7 +235,7 @@ describe('ND — notify.dispatch worker (G2)', () => {
     expect(body).toContain('איסוף באוטובוס');
     expect(body).toContain('2026-09-14T08:15:00+03:00');
     const keys = ['task_moved', 'task_delayed', 'task_cancelled', 'task_assigned', 'task_unassigned', 'change_needs_approval', 'digest_multi_change'];
-    for (const pid of ['camp', 'event-production', 'film-shoot', 'conference', 'logistics', 'after-school']) {
+    for (const pid of ['camp', 'event-production', 'film-shoot', 'conference', 'logistics', 'after-school', 'education']) {
       const p = getProfile(pid);
       for (const k of keys) expect(p.notificationTemplates[k as keyof typeof p.notificationTemplates], `${pid}/${k}`).toBeDefined();
     }

@@ -6,7 +6,7 @@ import type {
 } from '@contake/core';
 import {
   assertAcyclic, dependencyPath, getProfile, hasProfile, inScope, listProfiles, parseInstant,
-  rawDecision, renderInstant, computeDomino, wouldCreateCycle,
+  rawDecision, renderInstant, computeDomino, wouldCreateCycle, PROFILES_VERSION,
 } from '@contake/core';
 import { appEvents } from './services/events.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
@@ -92,7 +92,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
   });
 
   app.addHook('onRequest', async (req, reply) => {
-    if (req.url.startsWith('/v1/auth/') || req.url === '/v1/health') return;
+    if (req.url.startsWith('/v1/auth/') || req.url === '/v1/health' || req.url === '/v1/profiles') return; // /v1/profiles: public registry metadata (QA wire contract)
     const header = req.headers.authorization;
     const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
     const user = await auth.authenticate(token);
@@ -113,9 +113,17 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     // with NO OTP challenge; every other state 403s with the status in the code
     // so the FE renders the matching screen.
     if (body.phone) {
-      if (wlThrottled(body.phone)) fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
-      const res = await auth.loginWithPhone(body.phone);
-      if ('token' in res) return res;
+      const phone = normalizePhone(body.phone);
+      if (wlThrottled(phone)) {
+        await wlAudit(req, phone, 'whitelist.login', 'rate_limited', 'throttle_429');
+        fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
+      }
+      const res = await auth.loginWithPhone(phone);
+      if ('token' in res) {
+        await wlAudit(req, phone, 'whitelist.login', 'session', 'approved');
+        return res;
+      }
+      await wlAudit(req, phone, 'whitelist.login', 'denied', 'not_approved', { status: res.status });
       const codeBy = { invited: 'WHITELIST_INVITED', pending_approval: 'WHITELIST_PENDING_APPROVAL', rejected: 'WHITELIST_REJECTED', unknown: 'WHITELIST_UNKNOWN' } as const;
       const msg = res.status === 'pending_approval' ? 'ממתין לאישור ההנהלה' : 'צור קשר עם המנהל';
       fail(403, codeBy[res.status as keyof typeof codeBy] ?? 'WHITELIST_UNKNOWN', msg);
@@ -151,6 +159,17 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     ts.push(nowMs);
     wlRate.set(key, ts);
     return ts.length > 10;
+  };
+  // QA integrity acceptance: auth_audit rows carry normalized phone (or the
+  // 'unknown' key when absent), stable kind, outcome + reasonCode, request
+  // correlation id, UA-derived deviceClass - never IP, OTP, devCode, or token.
+  // Appends are awaited: an auth_audit failure fails the request LOUD (500),
+  // never a silent drop.
+  const normalizePhone = (p: string): string => p.replace(/[\s()-]/g, '');
+  const wlAudit = async (req: FastifyRequest, phone: string, kind: string, outcome: string, reasonCode: string, extra: Record<string, unknown> = {}): Promise<void> => {
+    await auth.appendWhitelistAudit(phone, kind, {
+      outcome, reasonCode, deviceClass: deviceClassOf(ua(req)), requestId: String(req.id), ...extra,
+    });
   };
   const wlDeny = (user: UserRecord, action: Action, phone: string): void => {
     if (rawDecision(action, user.role) !== 'deny') return;
@@ -249,29 +268,62 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
 
   // Public (unauthenticated) auth endpoints.
   app.post('/v1/auth/whitelist-check', async (req) => {
-    const { phone } = (req.body ?? {}) as { phone?: string };
-    if (!phone) fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
-    if (wlThrottled(phone)) fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
+    const rawPhone = ((req.body ?? {}) as { phone?: string }).phone;
+    if (!rawPhone) {
+      await wlAudit(req, 'unknown', 'whitelist.check', 'validation_failed', 'missing_phone');
+      fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
+    }
+    const phone = normalizePhone(rawPhone);
+    if (wlThrottled(phone)) {
+      await wlAudit(req, phone, 'whitelist.check', 'rate_limited', 'throttle_429');
+      fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
+    }
     const entry = await repo.getWhitelistEntry(phone);
+    await wlAudit(req, phone, 'whitelist.check', entry ? 'found' : 'not_found', entry ? 'entry_exists' : 'no_entry', { status: entry?.status ?? 'unknown' });
     return { status: entry?.status ?? 'unknown' };
   });
 
   app.post('/v1/auth/whitelist-register', async (req) => {
     const body = (req.body ?? {}) as { phone?: string; displayName?: string; requestedRole?: UserRecord['role'] };
-    if (!body.phone || !body.displayName || !body.requestedRole) fail(400, 'BAD_REQUEST', 'חסרים שדות: phone, displayName, requestedRole');
-    if (wlThrottled(body.phone)) fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
-    if (!['admin', 'field_manager', 'focus_worker'].includes(body.requestedRole)) fail(400, 'BAD_REQUEST', 'תפקיד לא תקין');
-    const entry = await repo.getWhitelistEntry(body.phone);
-    if (!entry) fail(409, 'WHITELIST_UNKNOWN', 'צור קשר עם המנהל');
+    if (!body.phone) {
+      await wlAudit(req, 'unknown', 'whitelist.register', 'validation_failed', 'missing_phone');
+      fail(400, 'BAD_REQUEST', 'חסרים שדות: phone, displayName, requestedRole');
+    }
+    const phone = normalizePhone(body.phone);
+    if (!body.displayName || !body.requestedRole) {
+      await wlAudit(req, phone, 'whitelist.register', 'validation_failed', 'missing_fields');
+      fail(400, 'BAD_REQUEST', 'חסרים שדות: phone, displayName, requestedRole');
+    }
+    if (wlThrottled(phone)) {
+      await wlAudit(req, phone, 'whitelist.register', 'rate_limited', 'throttle_429');
+      fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
+    }
+    if (!['admin', 'field_manager', 'focus_worker'].includes(body.requestedRole)) {
+      await wlAudit(req, phone, 'whitelist.register', 'validation_failed', 'bad_role');
+      fail(400, 'BAD_REQUEST', 'תפקיד לא תקין');
+    }
+    const entry = await repo.getWhitelistEntry(phone);
+    if (!entry) {
+      await wlAudit(req, phone, 'whitelist.register', 'rejected', 'unknown_phone');
+      fail(409, 'WHITELIST_UNKNOWN', 'צור קשר עם המנהל');
+    }
     // Idempotent re-submit of the SAME details returns 200 with the unchanged entry.
-    if (entry.status === 'pending_approval' && entry.displayName === body.displayName && entry.requestedRole === body.requestedRole) return entry;
-    if (entry.status !== 'invited') fail(409, 'WHITELIST_NOT_INVITED', 'הבקשה אינה פתוחה לרישום');
+    if (entry.status === 'pending_approval' && entry.displayName === body.displayName && entry.requestedRole === body.requestedRole) {
+      await wlAudit(req, phone, 'whitelist.register', 'duplicate', 'already_pending');
+      return entry;
+    }
+    if (entry.status !== 'invited') {
+      await wlAudit(req, phone, 'whitelist.register', 'rejected', 'not_invited', { status: entry.status });
+      fail(409, 'WHITELIST_NOT_INVITED', 'הבקשה אינה פתוחה לרישום');
+    }
     const next: WhitelistEntry = { ...entry, status: 'pending_approval', displayName: body.displayName, requestedRole: body.requestedRole };
     await repo.upsertWhitelistEntry(next);
+    await wlAudit(req, phone, 'whitelist.register', 'success', 'pending_approval');
     // NOTE: no audit_log row for this unauthenticated transition (AuditLogEntry.role
     // is the strict Role union and a fabricated role would corrupt QA's AC-AUD
-    // trail). The transition is captured by the whitelist.updated frame and by the
-    // beforeJson of the eventual admin approve/reject row. Flagged for QA sign-off.
+    // trail). The immutable record lives in auth_audit (appended above, QA
+    // integrity gate); the transition also emits whitelist.updated and appears as
+    // beforeJson of the eventual admin approve/reject row.
     appEvents.emit({ type: 'whitelist.updated', orgId: entry.orgId, entry: next });
     // In-app notify to org admins (§15); outbound channels stay OFF (demo posture).
     const admins = (await repo.listUsers(entry.orgId)).filter(u => u.role === 'admin');
@@ -376,7 +428,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
   });
 
   // ---------- profiles ----------
-  app.get('/v1/profiles', () => ({ profiles: listProfiles() }));
+  app.get('/v1/profiles', () => ({ version: PROFILES_VERSION, profiles: listProfiles() }));
 
   // ---------- events ----------
   app.get('/v1/events', async (req) => {

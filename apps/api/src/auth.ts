@@ -172,6 +172,15 @@ export class AuthService {
     return { token: this.issueToken(user.userId), principal: toPrincipal(user) };
   }
 
+  /** v1.18 §15 + QA integrity gate: the public whitelist surface (check /
+   *  register / phone-login) appends EVERY outcome, including throttle hits, to
+   *  the same append-only auth_audit channel as OTP (memory + PG). This is the
+   *  independent immutable record for unauthenticated attempts; audit_log stays
+   *  admin-mutations only (its role field is the strict Role union). */
+  async appendWhitelistAudit(phone: string, kind: string, detail: Record<string, unknown>): Promise<void> {
+    await this.otpStore.appendAuthAudit({ phone, kind, detail });
+  }
+
   /** v1.18 §15: whitelist-gated phone login. Approved entries log in with NO
    *  OTP challenge - the admin approval IS the credential. Any other state
    *  returns the status so the route can 403 with it (FE renders per-status). */

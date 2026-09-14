@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
-import { AuthService, hashPasswordPure } from '../src/auth.js';
+import { AuthService, hashPasswordPure, memoryOtpState, type OtpStateStore } from '../src/auth.js';
 import type { GraphRepository } from '../src/repo/graph-repository.js';
 import { makeTestRepoFrom } from './helpers/repo.js';
 
 let app: FastifyInstance;
 let repo: GraphRepository;
+let otp: OtpStateStore;
 
 const H = (t: string) => ({ authorization: `Bearer ${t}` });
 const adminLogin = async (): Promise<string> => {
@@ -23,7 +24,8 @@ beforeEach(async () => {
     ],
     channels: [], events: [], resources: [], tasks: [], dependencies: [],
   });
-  app = buildApp(repo, new AuthService(repo));
+  otp = memoryOtpState();
+  app = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
 });
 afterEach(async () => { await app.close(); });
 
@@ -106,5 +108,55 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone: '+972500999004' } });
     const res = await app.inject({ method: 'POST', url: '/v1/whitelist/+972500999004/approve', headers: H(admin), payload: { role: 'admin' } });
     expect(res.statusCode).toBe(409);
+  });
+
+  it('auth_audit integrity: every outcome recorded with kind/outcome/reasonCode/requestId (QA gate)', async () => {
+    const admin = await adminLogin();
+    const phone = '+972500999010';
+    // success path: invite -> register -> duplicate register -> approve -> phone login
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'חדש', requestedRole: 'field_manager' } });
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'חדש', requestedRole: 'field_manager' } });
+    await app.inject({ method: 'POST', url: `/v1/whitelist/${phone}/approve`, headers: H(admin), payload: { role: 'field_manager' } });
+    await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { phone } });
+    // status rejection: denied login before approval (fresh invited phone)
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone: '+972500999011' } });
+    await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { phone: '+972500999011' } });
+    // 409 paths: unknown-phone register + check
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone: '+972500000000', displayName: 'x', requestedRole: 'admin' } });
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-check', payload: { phone: '+972500000000' } });
+    // malformed: missing fields (phone known), missing phone entirely
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone } });
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-check', payload: {} });
+    // 429 path: 11 checks inside the minute window
+    let last = 0;
+    for (let i = 0; i < 11; i += 1) {
+      const r = await app.inject({ method: 'POST', url: '/v1/auth/whitelist-check', payload: { phone: '+972500000001' } });
+      last = r.statusCode;
+    }
+    expect(last).toBe(429);
+
+    const rows = await otp.listAuthAudit();
+    const codes = (ph: string, kind: string) => rows.filter(r => r.phone === ph && r.kind === kind).map(r => (r.detail as { reasonCode?: string }).reasonCode);
+    expect(codes(phone, 'whitelist.register')).toContain('pending_approval');
+    expect(codes(phone, 'whitelist.register')).toContain('already_pending');
+    expect(codes(phone, 'whitelist.register')).toContain('missing_fields');
+    expect(codes(phone, 'whitelist.login')).toContain('approved');
+    expect(codes('+972500999011', 'whitelist.login')).toContain('not_approved');
+    expect(codes('+972500000000', 'whitelist.register')).toContain('unknown_phone');
+    expect(codes('+972500000000', 'whitelist.check')).toContain('no_entry');
+    expect(codes('unknown', 'whitelist.check')).toContain('missing_phone');
+    expect(codes('+972500000001', 'whitelist.check')).toContain('throttle_429');
+    // every row: createdAt + requestId + deviceClass; never IP / OTP / devCode / token
+    for (const r of rows) {
+      expect(r.createdAt).toBeTruthy();
+      const d = r.detail as Record<string, unknown>;
+      expect(d['requestId']).toBeTruthy();
+      expect(d['deviceClass']).toBeDefined();
+      const blob = JSON.stringify(r).toLowerCase();
+      expect(blob).not.toContain('devcode');
+      expect(blob).not.toContain('"ip"');
+      expect(blob).not.toContain('token');
+    }
   });
 });
