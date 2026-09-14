@@ -1,7 +1,8 @@
 /** TL ruling 2026-09-14: counselor bindings survive event duplication (same
  *  userIds, scope preserved, eventId repointed, siteIds remapped positionally);
  *  site-room joins then work for scoped field_managers on the duplicated event.
- *  Adjacent ruling: event-wide ('all') managers get NO site-room joins in v2. */
+ *  v1.15 section 13: event-wide (scope='all') managers join ALL site rooms of the
+ *  events they cover - the expansion mirrors inScope exactly. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { io as ioc, type Socket as ClientSocket } from 'socket.io-client';
 import type { FastifyInstance } from 'fastify';
@@ -85,8 +86,8 @@ describe('counselor bindings survive event duplication', () => {
   });
 });
 
-describe("event-wide ('all') managers: no site-room joins in v2", () => {
-  it('an FM scoped to the event without a site receives NO site-room frame', async () => {
+describe("event-wide ('all') managers: expansion mirrors inScope (contracts v1.15 s13)", () => {
+  it('an FM scoped to the event without a site RECEIVES the site-room frame', async () => {
     await repo.createUser({ userId: 'u-fm-wide', orgId: 'org-1', name: 'רכז כללי', role: 'field_manager', scopes: [{ eventId: 'e1' }], email: 'fmwide@camp.local', passwordHash: hashPasswordPure('wide12345'), active: true });
     const admin = await login('admin@camp.local', 'admin123');
     const wide = await login('fmwide@camp.local', 'wide12345');
@@ -95,6 +96,6 @@ describe("event-wide ('all') managers: no site-room joins in v2", () => {
     const mv = await app.inject({ method: 'PATCH', url: '/v1/tasks/t7', headers: H(admin), payload: { version: t7!.version, move: { newStart: '2026-09-14T16:00:00+03:00' } } });
     expect(mv.statusCode).toBe(200);
     await sleep(200);
-    expect(frames.length).toBe(0);
+    expect(frames.some(f => f.name === 'graph.patch' && JSON.stringify(f.payload).includes('t7'))).toBe(true);
   });
 });

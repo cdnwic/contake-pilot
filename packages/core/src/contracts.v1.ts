@@ -702,3 +702,31 @@ export interface TaskPatchRequest {
  *
  *  Other frames keep their existing implemented targeting; this section pins
  *  change.resolved only. */
+
+// ============================================================
+// 13. REALTIME JOIN MATRIX [v1.15] - which rooms each socket joins
+// ============================================================
+
+/** v1.15: pins the JOIN side of the realtime topology (v1.14 pinned the emit
+ *  side). Joins are resolved by the server at socket-connect time from the
+ *  user's counselor_bindings for the org's EXISTING events (no event-status
+ *  filtering - draft events are first-class for probing and pre-publish work):
+ *
+ *    - org admin: the org room (in_app broadcast per matrix).
+ *    - field_manager, scope='site': site:{siteId} for every siteId in their
+ *      bindings.
+ *    - field_manager, scope='all' (event-scoped or org-scoped): ALL site rooms
+ *      of the events they cover - the scope='all' expansion mirrors inScope
+ *      exactly: whatever data the RBAC read path would return for them, the
+ *      realtime path must be able to deliver. (v1.15 restores this expansion;
+ *      briefly removed in the 6e71b1a deploy per a literal reading of the
+ *      v1.14 ruling's parenthetical.)
+ *    - focus_worker: no site or org rooms (their frames are user-scoped:
+ *      user:{proposer} per section 12, plus graph frames via event rooms).
+ *
+ *  Implicit duplication semantics (server-side, pinned with the 6e71b1a fix):
+ *  EventDuplicate clones counselor_bindings atomically - same userIds, scope
+ *  preserved, eventId repointed, duplicated siteIds remapped positionally.
+ *  Without this, a duplicated event has zero qualified listeners in its site
+ *  rooms and zero scoped-manager event access (the matrix's eventId rows key
+ *  on bindings). */

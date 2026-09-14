@@ -61,9 +61,14 @@ export function createRealtime(
     const rooms = [userRoom(user.userId)];
     if (user.role === 'admin') rooms.push(adminsRoom(user.orgId));
     if (user.role === 'field_manager') {
-      // TL ruling 2026-09-14: site-bound managers join their site rooms; event-wide
-      // ('all') managers get NO site-room joins in v2 (admin joins stay adminsRoom-only).
-      for (const s of user.scopes) if (s.siteId) rooms.push(siteRoom(s.eventId, s.siteId));
+      // Contracts v1.15 section 13: site-bound managers join their site rooms;
+      // event-wide (scope='all') managers join ALL site rooms of the events they
+      // cover - the expansion mirrors inScope exactly (restored per TL 2026-09-14).
+      // Joins resolve from bindings for EXISTING events - no event-status filtering.
+      for (const s of user.scopes) {
+        if (s.siteId) { rooms.push(siteRoom(s.eventId, s.siteId)); continue; }
+        for (const siteId of (await repo.getEvent(s.eventId))?.siteIds ?? []) rooms.push(siteRoom(s.eventId, siteId));
+      }
     }
     return rooms;
   };
