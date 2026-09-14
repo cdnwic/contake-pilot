@@ -92,7 +92,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
   });
 
   app.addHook('onRequest', async (req, reply) => {
-    if (req.url.startsWith('/v1/auth/') || req.url === '/v1/health' || req.url === '/v1/profiles') return; // /v1/profiles: public registry metadata (QA wire contract)
+    if (req.url.startsWith('/v1/auth/') || req.url === '/v1/health') return;
     const header = req.headers.authorization;
     const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
     const user = await auth.authenticate(token);

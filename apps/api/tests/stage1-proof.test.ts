@@ -27,8 +27,11 @@ const adminLogin = async (): Promise<string> => {
 };
 
 describe('Stage 1 proof: GET /v1/profiles wire contract (QA gate)', () => {
+  // Authenticated boundary preserved: registry metadata rides the session.
   it('returns {version, profiles} with registry v1.3 and all 7 profiles', async () => {
-    const res = await app.inject({ method: 'GET', url: '/v1/profiles' });
+    const anon = await app.inject({ method: 'GET', url: '/v1/profiles' });
+    expect(anon.statusCode).toBe(401); // unauthenticated stays out
+    const res = await app.inject({ method: 'GET', url: '/v1/profiles', headers: H(await adminLogin()) });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.version).toBe('1.3');
@@ -38,7 +41,7 @@ describe('Stage 1 proof: GET /v1/profiles wire contract (QA gate)', () => {
   });
 
   it('every profile carries all plural label fields', async () => {
-    const { profiles } = (await app.inject({ method: 'GET', url: '/v1/profiles' })).json();
+    const { profiles } = (await app.inject({ method: 'GET', url: '/v1/profiles', headers: H(await adminLogin()) })).json();
     for (const p of profiles) {
       expect(p.labels.eventPlural, `${p.id}.eventPlural`).toBeTruthy();
       expect(p.labels.taskPlural, `${p.id}.taskPlural`).toBeTruthy();
@@ -52,7 +55,7 @@ describe('Stage 1 proof: GET /v1/profiles wire contract (QA gate)', () => {
   });
 
   it('chrome is camp-only', async () => {
-    const { profiles } = (await app.inject({ method: 'GET', url: '/v1/profiles' })).json();
+    const { profiles } = (await app.inject({ method: 'GET', url: '/v1/profiles', headers: H(await adminLogin()) })).json();
     for (const p of profiles) {
       if (p.id === 'camp') expect(p.labels.chrome).toEqual({ tower: 'מגדל', focus: 'ריכוז', approvals: 'אישורים', builder: 'בונה' });
       else expect(p.labels.chrome, `${p.id} must not carry camp chrome`).toBeUndefined();
