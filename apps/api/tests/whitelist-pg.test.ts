@@ -43,6 +43,9 @@ run('whitelist route-level PG audit (real HTTP, PGlite)', () => {
     let last = 0;
     for (let i = 0; i < 11; i += 1) last = (await app.inject({ method: 'POST', url: '/v1/auth/whitelist-check', payload: { phone: '+972500000001' } })).statusCode;
     expect(last).toBe(429);
+    // 429: whitelist-register route throttles too (round-3 explicit coverage)
+    for (let i = 0; i < 11; i += 1) last = (await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone: '+972500000002', displayName: 'x', requestedRole: 'admin' } })).statusCode;
+    expect(last).toBe(429);
 
     const rows = await otp.listAuthAudit();
     const codes = (ph: string, kind: string) => rows.filter(r => r.phone === ph && r.kind === kind).map(r => (r.detail as { reasonCode?: string }).reasonCode);
@@ -51,6 +54,11 @@ run('whitelist route-level PG audit (real HTTP, PGlite)', () => {
     expect(codes('+972500000000', 'whitelist.register')).toContain('unknown_phone');
     expect(codes('+972500000000', 'whitelist.login')).toContain('not_approved');
     expect(codes('+972500000001', 'whitelist.check')).toContain('throttle_429');
+    expect(codes('+972500000002', 'whitelist.register')).toContain('throttle_429');
+    // round-3 audit semantics persist in PG: accepted + committed success pair
+    expect(codes(phone, 'whitelist.register')).toContain('committed');
+    const regRows = rows.filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(regRows.map(r => (r.detail as { outcome?: string }).outcome)).toContain('accepted');
     for (const r of rows) {
       expect(r.createdAt).toBeTruthy();
       expect((r.detail as Record<string, unknown>)['requestId']).toBeTruthy();

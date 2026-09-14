@@ -140,6 +140,13 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     const rows = await otp.listAuthAudit();
     const codes = (ph: string, kind: string) => rows.filter(r => r.phone === ph && r.kind === kind).map(r => (r.detail as { reasonCode?: string }).reasonCode);
     expect(codes(phone, 'whitelist.register')).toContain('pending_approval');
+    // round-3 audit semantics: pre-write ACCEPTED row + post-upsert committed
+    // SUCCESS row - never a bare success for an uncommitted write
+    const outcomes = (ph: string, kind: string) => rows.filter(r => r.phone === ph && r.kind === kind).map(r => (r.detail as { outcome?: string }).outcome);
+    expect(outcomes(phone, 'whitelist.register')).toContain('accepted');
+    expect(codes(phone, 'whitelist.register')).toContain('committed');
+    const successRow = rows.find(r => r.phone === phone && r.kind === 'whitelist.register' && (r.detail as { outcome?: string }).outcome === 'success');
+    expect((successRow!.detail as { reasonCode?: string }).reasonCode).toBe('committed');
     expect(codes(phone, 'whitelist.register')).toContain('already_pending');
     expect(codes(phone, 'whitelist.register')).toContain('missing_fields');
     expect(codes(phone, 'whitelist.login')).toContain('approved');
@@ -186,6 +193,20 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     expect((await app.inject({ method: 'POST', url: '/v1/whitelist/+972500999022/approve', headers: H(fm), payload: { role: 'admin' } })).statusCode).toBe(403);
     expect((await app.inject({ method: 'POST', url: '/v1/whitelist/+972500999022/reject', headers: H(fm), payload: {} })).statusCode).toBe(403);
     expect((await repo.getWhitelistEntry('+972500999022'))!.status).toBe('pending_approval');
+  });
+
+  it('route-level 429: whitelist-register throttles inside the window with a rate_limited audit row', async () => {
+    const phone = '+972500999031';
+    let last = 0;
+    for (let i = 0; i < 11; i += 1) {
+      last = (await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'x', requestedRole: 'admin' } })).statusCode;
+    }
+    expect(last).toBe(429);
+    const reg = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(reg.some(r => {
+      const d = r.detail as { outcome?: string; reasonCode?: string };
+      return d.outcome === 'rate_limited' && d.reasonCode === 'throttle_429';
+    })).toBe(true);
   });
 
   it('injected appendWhitelistAudit failure fails LOUD (500) and aborts the mutation - no silent drop', async () => {
