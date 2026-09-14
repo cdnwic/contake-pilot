@@ -10,7 +10,7 @@ import { createDispatcher, type DispatchStateStore, type MessageProvider } from 
 import { createTwilioProvider, twilioConfigFromEnv } from './services/twilio.js';
 import { createWhatsAppCloudProvider, whatsAppCloudConfigFromEnv } from './services/whatsapp-cloud.js';
 import { createLogPushProvider, createVapidPushProvider, vapidConfigFromEnv } from './services/webpush.js';
-import { campDemoSeed } from './demo/camp-demo.js';
+import { campDemoSeed, ensureCampDemoStaging } from './demo/camp-demo.js';
 
 // Deploy pin check (contracts v1.12 / matrix v1.3): refuse boot on a wrong
 // pinned matrix drop-in. File-hash pinning happens at review/build time (the
@@ -37,6 +37,11 @@ if (process.env['DATABASE_URL']) {
   if ((await repo.listEvents(seed.orgId)).length === 0) {
     await applySeed(repo, seed);
     console.log('Postgres: empty database, demo seed applied');
+  } else if (process.env['CONTAKE_SEED'] === 'camp-demo') {
+    // TL 2026-09-14: QA staging slice is additive-if-absent - the prod DB already
+    // holds cd-ev1 (Chaim's live event), which this never touches.
+    await ensureCampDemoStaging(repo);
+    console.log('Postgres: camp-demo QA staging slice ensured (additive-if-absent)');
   }
   dispatchState = pgDispatchState(pool);
   otpState = await createPgOtpState(pool); // pilot-prep #4: shared OTP state

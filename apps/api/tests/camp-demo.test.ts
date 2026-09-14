@@ -27,7 +27,7 @@ describe('camp demo seed (plan 3ח)', () => {
     const ev = await repo.getEvent(CAMP_DEMO_EVENT_ID);
     expect(ev?.status).toBe('published');
     expect(ev?.name).toContain('קייטנת אורנים');
-    expect((await repo.listUsers(CAMP_DEMO_ORG_ID)).length).toBe(9);
+    expect((await repo.listUsers(CAMP_DEMO_ORG_ID)).length).toBe(9 + 2); // + QA staging accounts (TL 2026-09-14)
     expect((await repo.listTasks(CAMP_DEMO_EVENT_ID)).length).toBe(18);
     expect((await repo.listResources(CAMP_DEMO_EVENT_ID)).length).toBe(17);
     expect((await repo.listDependencies(CAMP_DEMO_EVENT_ID)).length).toBe(19);
