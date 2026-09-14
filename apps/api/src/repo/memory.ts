@@ -1,6 +1,7 @@
 import type {
   AuditLogEntry, ChangeRequest, DependencyEdge, EventNode, GraphSnapshot, ID,
   NotificationJob, PushSubscription, ResourceNode, StatusReport, TaskNode,
+  WhitelistEntry, WhitelistStatus,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
 
@@ -17,6 +18,7 @@ export class MemoryGraphRepository implements GraphRepository {
   private reports = new Map<ID, StatusReport>();
   private notificationJobs = new Map<ID, NotificationJob>();
   private pushSubscriptions = new Map<string, PushSubscription>(); // keyed by endpoint (v1.10)
+  private whitelist = new Map<string, WhitelistEntry>(); // keyed by phone (v1.18)
   private auditLog: AuditLogEntry[] = [];
 
   static seeded(data: SeedData): MemoryGraphRepository {
@@ -27,6 +29,7 @@ export class MemoryGraphRepository implements GraphRepository {
     for (const r of data.resources) repo.createResource(r);
     for (const t of data.tasks) repo.createTask(t);
     for (const d of data.dependencies) repo.createDependency(d);
+    for (const w of data.whitelist ?? []) repo.upsertWhitelistEntry(w);
     return repo;
   }
 
@@ -46,6 +49,13 @@ export class MemoryGraphRepository implements GraphRepository {
     return next;
   }
   async listUsers(orgId: ID): Promise<UserRecord[]> { return [...this.users.values()].filter(u => u.orgId === orgId); }
+
+  // whitelist onboarding (v1.18 §15)
+  async upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry> { this.whitelist.set(e.phone, e); return e; }
+  async getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined> { return this.whitelist.get(phone); }
+  async listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]> {
+    return [...this.whitelist.values()].filter(e => e.orgId === orgId && (!status || e.status === status));
+  }
 
   async createChannel(c: ChannelRecord): Promise<ChannelRecord> { this.channels.set(c.id, c); return c; }
   async getChannel(id: ID): Promise<ChannelRecord | undefined> { return this.channels.get(id); }

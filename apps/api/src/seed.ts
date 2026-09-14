@@ -67,4 +67,5 @@ export async function applySeed(repo: GraphRepository, data: SeedData): Promise<
   for (const r of data.resources) await repo.createResource(r);
   for (const t of data.tasks) await repo.createTask(t);
   for (const d of data.dependencies) await repo.createDependency(d);
+  for (const w of data.whitelist ?? []) await repo.upsertWhitelistEntry(w);
 }

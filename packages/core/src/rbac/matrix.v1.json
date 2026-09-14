@@ -1,5 +1,5 @@
 {
-  "version": "1.3",
+  "version": "1.4",
   "date": "2026-09-14",
   "normativeSource": "contake_rbac_spec.md (delivered to product owner 2026-09-11)",
   "roles": [
@@ -129,6 +129,26 @@
       "admin": "allow",
       "field_manager": "scope",
       "focus_worker": "deny"
+    },
+    "whitelist.invite": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.list": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.approve": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.reject": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
     }
   },
   "autoEscalation": "field_manager: any computed impact >= S1 on an APPLYING mutation routes through ChangeRequest. admin: always allow including S3 (מנהל-על שליטה מלאה) — R1 resolved: no role above admin, so admin S3 cannot deadlock. EXEMPTION: domino.compute is a dry-run preview — it never mutates and NEVER creates a ChangeRequest, whatever impact class it computes; it stays allow + scope-checked (field_manager: own sites only). focus_worker never receives the full graph (data minimization).",
@@ -143,5 +163,5 @@
     "rule": "report.status.create auto-applies the reporter's OWN task delay when computed impact is S0 and the task is unlocked. Anything above S0, or a locked task, becomes ChangeRequest pending_review.",
     "never": "A report is never a back-door task.move on another user's task or above S0 impact. (QA C2)"
   },
-  "migrationNote": "v1.2 -> v1.3 (2026-09-14): additive row 'report.resolve' (POST /v1/reports/:id/resolve). Pure handled-state on StatusReport: no graph effect, no effect on spawned CRs. admin=allow; field_manager=scope (own sites); focus_worker=deny. No existing cell changed."
+  "migrationNote": "v1.2 -> v1.3 (2026-09-14): additive row 'report.resolve' (POST /v1/reports/:id/resolve). Pure handled-state on StatusReport: no graph effect, no effect on spawned CRs. admin=allow; field_manager=scope (own sites); focus_worker=deny. No existing cell changed. v1.3 -> v1.4 (2026-09-15): additive rows whitelist.invite/list/approve/reject (contracts v1.18 §15). admin=allow; field_manager/focus_worker=deny. No existing cell changed."
 }

@@ -8,7 +8,7 @@ import { hashPasswordPure } from '../src/auth.js';
 import { createDispatcher, renderTemplate, TEMPLATE_PARAMS, type MessageProvider } from '../src/services/dispatch.js';
 import { getProfile } from '@contake/core';
 
-const PROFILES = ['camp', 'event-production', 'film-shoot', 'conference', 'logistics', 'after-school'];
+const PROFILES = ['camp', 'event-production', 'film-shoot', 'conference', 'logistics', 'after-school', 'education'];
 const D = '2026-09-14';
 const at = (hhmm: string): string => `${D}T${hhmm}:00+03:00`;
 

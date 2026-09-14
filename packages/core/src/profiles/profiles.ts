@@ -24,6 +24,26 @@ const profileSchema = z.object({
       field_manager: z.string().min(1),
       focus_worker: z.string().min(1),
     }).strict(),
+    // v1.17 optional plural + chrome labels (stage-0 multi-vertical)
+    eventPlural: z.string().min(1).optional(),
+    taskPlural: z.string().min(1).optional(),
+    resourcePlural: z.object({
+      person: z.string().min(1),
+      equipment: z.string().min(1),
+      location: z.string().min(1),
+      group: z.string().min(1),
+    }).strict().optional(),
+    rolePlural: z.object({
+      admin: z.string().min(1),
+      field_manager: z.string().min(1),
+      focus_worker: z.string().min(1),
+    }).strict().optional(),
+    chrome: z.object({
+      tower: z.string().min(1).optional(),
+      focus: z.string().min(1).optional(),
+      approvals: z.string().min(1).optional(),
+      builder: z.string().min(1).optional(),
+    }).strict().optional(),
   }),
   catalog: z.array(z.object({
     resourceKind: z.enum(['person', 'equipment', 'location', 'group']),

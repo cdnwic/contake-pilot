@@ -2,9 +2,10 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import cors from '@fastify/cors';
 import type {
   Action, AuditLogEntry, ChangeRequest, DominoResult, EventNode, GraphSnapshot, ID, ProposedChange, PushSubscription, StatusReport, TaskNode,
+  WhitelistEntry,
 } from '@contake/core';
 import {
-  assertAcyclic, dependencyPath, getProfile, inScope, listProfiles, parseInstant,
+  assertAcyclic, dependencyPath, getProfile, hasProfile, inScope, listProfiles, parseInstant,
   rawDecision, renderInstant, computeDomino, wouldCreateCycle,
 } from '@contake/core';
 import { appEvents } from './services/events.js';
@@ -107,9 +108,20 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
 
   // ---------- auth ----------
   app.post('/v1/auth/login', async (req) => {
-    const { email, password } = (req.body ?? {}) as { email?: string; password?: string };
-    if (!email || !password) fail(400, 'BAD_REQUEST', 'חסר אימייל או סיסמה');
-    const res = await auth.login(email as string, password as string);
+    const body = (req.body ?? {}) as { email?: string; password?: string; phone?: string };
+    // v1.18 §15: phone login is whitelist-gated - approved entries get a session
+    // with NO OTP challenge; every other state 403s with the status in the code
+    // so the FE renders the matching screen.
+    if (body.phone) {
+      if (wlThrottled(body.phone)) fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
+      const res = await auth.loginWithPhone(body.phone);
+      if ('token' in res) return res;
+      const codeBy = { invited: 'WHITELIST_INVITED', pending_approval: 'WHITELIST_PENDING_APPROVAL', rejected: 'WHITELIST_REJECTED', unknown: 'WHITELIST_UNKNOWN' } as const;
+      const msg = res.status === 'pending_approval' ? 'ממתין לאישור ההנהלה' : 'צור קשר עם המנהל';
+      fail(403, codeBy[res.status as keyof typeof codeBy] ?? 'WHITELIST_UNKNOWN', msg);
+    }
+    if (!body.email || !body.password) fail(400, 'BAD_REQUEST', 'חסר אימייל או סיסמה');
+    const res = await auth.login(body.email as string, body.password as string);
     if (!res) fail(401, 'BAD_CREDENTIALS', 'פרטי התחברות שגויים');
     return res;
   });
@@ -128,6 +140,154 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (!res) fail(401, 'BAD_OTP', 'קוד שגוי או פג תוקף');
     return res;
   });
+  // ---------- whitelist onboarding (contracts v1.18 §15) ----------
+  // Matrix v1.4: whitelist.* = admin allow, every other role deny. Public auth
+  // endpoints are per-phone rate-limited; whitelist-check is a phone-registered
+  // oracle by design (demo posture, revisited at real pilot with OTP re-arm).
+  const wlRate = new Map<string, number[]>();
+  const wlThrottled = (key: string): boolean => {
+    const nowMs = Date.now();
+    const ts = (wlRate.get(key) ?? []).filter(t => nowMs - t < 60_000);
+    ts.push(nowMs);
+    wlRate.set(key, ts);
+    return ts.length > 10;
+  };
+  const wlDeny = (user: UserRecord, action: Action, phone: string): void => {
+    if (rawDecision(action, user.role) !== 'deny') return;
+    fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+      reason: 'matrix_deny', action, entityType: 'whitelist_entry', entityId: phone, eventId: 'pending',
+    });
+  };
+
+  app.post('/v1/whitelist', async (req) => {
+    const user = await me(req);
+    const { phone } = (req.body ?? {}) as { phone?: string };
+    if (!phone) fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
+    wlDeny(user, 'whitelist.invite', phone);
+    const now = new Date().toISOString();
+    const before = await repo.getWhitelistEntry(phone);
+    // Upsert: re-invite resets to invited and clears decision fields (§15).
+    const entry: WhitelistEntry = { phone, status: 'invited', orgId: user.orgId, createdAt: before?.createdAt ?? now };
+    await withAuditSafety(repo, async () => {
+      await repo.upsertWhitelistEntry(entry);
+      await audit(repo, {
+        orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'whitelist.invite', entityType: 'whitelist_entry', entityId: phone,
+        before, after: entry, deviceClass: deviceClassOf(ua(req)),
+      });
+    });
+    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
+    return entry;
+  });
+
+  app.get('/v1/whitelist', async (req) => {
+    const user = await me(req);
+    // Read endpoint: a non-admin is 403 without a denied-audit row (v1.9 mutating-only).
+    if (rawDecision('whitelist.list', user.role) === 'deny') fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו');
+    const { status } = (req.query ?? {}) as { status?: WhitelistEntry['status'] };
+    return { entries: await repo.listWhitelist(user.orgId, status) };
+  });
+
+  app.post('/v1/whitelist/:phone/approve', async (req) => {
+    const user = await me(req);
+    const { phone } = req.params as { phone: string };
+    const body = (req.body ?? {}) as { role?: UserRecord['role']; linkedResourceId?: ID };
+    wlDeny(user, 'whitelist.approve', phone);
+    const before = await repo.getWhitelistEntry(phone);
+    if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
+    if (!body.role || !['admin', 'field_manager', 'focus_worker'].includes(body.role)) fail(400, 'BAD_REQUEST', 'חסר תפקיד לאישור');
+    if (body.role === 'focus_worker' && !body.linkedResourceId) fail(400, 'BAD_REQUEST', 'עובד מיקוד דורש קישור למשאב');
+    // Create or bind the user account: role is ADMIN-assigned (requestedRole advisory).
+    const existing = await repo.findUserByPhone(phone);
+    const account = existing
+      ? await repo.updateUser(existing.userId, { role: body.role, ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}), active: true })
+      : await repo.createUser({
+          userId: newId('u'), orgId: user.orgId, name: before.displayName ?? phone,
+          role: body.role, scopes: [], phone,
+          ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}), active: true,
+        });
+    const now = new Date().toISOString();
+    const entry: WhitelistEntry = {
+      ...before, status: 'approved', assignedRole: body.role,
+      ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}),
+      decidedBy: user.userId, decidedAt: now,
+    };
+    await withAuditSafety(repo, async () => {
+      await repo.upsertWhitelistEntry(entry);
+      await audit(repo, {
+        orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'whitelist.approve', entityType: 'whitelist_entry', entityId: phone,
+        before, after: entry, deviceClass: deviceClassOf(ua(req)),
+      });
+    });
+    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
+    return { entry, user: account };
+  });
+
+  app.post('/v1/whitelist/:phone/reject', async (req) => {
+    const user = await me(req);
+    const { phone } = req.params as { phone: string };
+    const { reasonHe } = (req.body ?? {}) as { reasonHe?: string };
+    wlDeny(user, 'whitelist.reject', phone);
+    const before = await repo.getWhitelistEntry(phone);
+    if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
+    const entry: WhitelistEntry = {
+      ...before, status: 'rejected', decidedBy: user.userId, decidedAt: new Date().toISOString(),
+      ...(reasonHe ? { rejectedReasonHe: reasonHe } : {}),
+    };
+    await withAuditSafety(repo, async () => {
+      await repo.upsertWhitelistEntry(entry);
+      await audit(repo, {
+        orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'whitelist.reject', entityType: 'whitelist_entry', entityId: phone,
+        before, after: entry, deviceClass: deviceClassOf(ua(req)),
+      });
+    });
+    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
+    return entry;
+  });
+
+  // Public (unauthenticated) auth endpoints.
+  app.post('/v1/auth/whitelist-check', async (req) => {
+    const { phone } = (req.body ?? {}) as { phone?: string };
+    if (!phone) fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
+    if (wlThrottled(phone)) fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
+    const entry = await repo.getWhitelistEntry(phone);
+    return { status: entry?.status ?? 'unknown' };
+  });
+
+  app.post('/v1/auth/whitelist-register', async (req) => {
+    const body = (req.body ?? {}) as { phone?: string; displayName?: string; requestedRole?: UserRecord['role'] };
+    if (!body.phone || !body.displayName || !body.requestedRole) fail(400, 'BAD_REQUEST', 'חסרים שדות: phone, displayName, requestedRole');
+    if (wlThrottled(body.phone)) fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
+    if (!['admin', 'field_manager', 'focus_worker'].includes(body.requestedRole)) fail(400, 'BAD_REQUEST', 'תפקיד לא תקין');
+    const entry = await repo.getWhitelistEntry(body.phone);
+    if (!entry) fail(409, 'WHITELIST_UNKNOWN', 'צור קשר עם המנהל');
+    // Idempotent re-submit of the SAME details returns 200 with the unchanged entry.
+    if (entry.status === 'pending_approval' && entry.displayName === body.displayName && entry.requestedRole === body.requestedRole) return entry;
+    if (entry.status !== 'invited') fail(409, 'WHITELIST_NOT_INVITED', 'הבקשה אינה פתוחה לרישום');
+    const next: WhitelistEntry = { ...entry, status: 'pending_approval', displayName: body.displayName, requestedRole: body.requestedRole };
+    await repo.upsertWhitelistEntry(next);
+    // NOTE: no audit_log row for this unauthenticated transition (AuditLogEntry.role
+    // is the strict Role union and a fabricated role would corrupt QA's AC-AUD
+    // trail). The transition is captured by the whitelist.updated frame and by the
+    // beforeJson of the eventual admin approve/reject row. Flagged for QA sign-off.
+    appEvents.emit({ type: 'whitelist.updated', orgId: entry.orgId, entry: next });
+    // In-app notify to org admins (§15); outbound channels stay OFF (demo posture).
+    const admins = (await repo.listUsers(entry.orgId)).filter(u => u.role === 'admin');
+    if (admins.length > 0) {
+      await recordJobs(repo, [{
+        id: newId('job'), eventId: 'pending', kind: 'change_needs_approval',
+        targets: admins.map(u => ({ channel: 'in_app' as const, address: u.userId, recipientLabel: u.name })).sort((a, b) => a.address.localeCompare(b.address)),
+        templateKey: 'change_needs_approval',
+        params: { summaryHe: `משתמש חדש ממתין לאישור: ${body.displayName} (${body.phone})` },
+        idempotencyKey: `${entry.orgId}+whitelist+${body.phone}+pending_approval`,
+        batchWindowSec: 60, createdAt: new Date().toISOString(),
+      }]);
+    }
+    return next;
+  });
+
   app.get('/v1/health', () => ({ ok: true }));
 
 
@@ -241,6 +401,8 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (!body.name || !body.date || !body.timezone || !body.domainProfileId || !body.siteIds?.length) {
       fail(400, 'BAD_REQUEST', 'חסרים שדות חובה: name, date, timezone, domainProfileId, siteIds');
     }
+    // Stage 1 hardening: unknown domain profiles are a client error, not a silent fallback.
+    if (!hasProfile(body.domainProfileId as string)) fail(400, 'UNKNOWN_PROFILE', 'פרופיל תחום לא מוכר');
     const change: ProposedChange = {
       type: 'event.create',
       event: {

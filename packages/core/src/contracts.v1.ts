@@ -4,6 +4,21 @@
  * Pure TypeScript + Zod. No IO, no framework imports.
  * Versioning: tech lead owns this file; consumers pin a version, never edit locally.
  *
+ * v1.18 changelog (whitelist onboarding, ADDITIVE - product owner ruling relayed via main, 2026-09-14):
+ *    Phone login is REPLACED by admin-whitelist approval (no OTP code at this stage;
+ *    SMS/WhatsApp infrastructure stays built but OFF - it lights up at real pilot).
+ *    CONTAKE_DEV_OTP devCode remains for QA/dev only, under the flag, never in prod UX.
+ *  + WhitelistEntry + WhitelistStatus + section 15 (endpoints and lifecycle).
+ *  + Action gains 'whitelist.invite' | 'whitelist.list' | 'whitelist.approve' |
+ *    'whitelist.reject' - admin-only matrix rows (matrix bump v1.3 -> v1.4, additive).
+ *  + AuditEntityType gains 'whitelist_entry'.
+ *  + Realtime frame 'whitelist.updated' to adminsRoom(orgId) so open admin tables
+ *    refresh live on invite/register/approve/reject.
+ *  ~ POST /v1/auth/login {phone}: an APPROVED whitelist phone receives a session
+ *    with NO OTP challenge. Existing pilot phones are pre-seeded approved on deploy,
+ *    so the camp pilot sees zero behavior change. Phone-only login is a demo posture
+ *    (any holder of an approved number can authenticate); OTP re-arms at real pilot.
+ *
  * v1.10 changelog (web push workstream, ADDITIVE ONLY — zero breaking changes):
  *    Web push approved by the product owner (relayed via main, 2026-09-12) as a
  *    complementary in-app channel. Push is a DELIVERY PATH derived from existing
@@ -190,6 +205,14 @@ export interface DomainProfile {
     event: string; task: string;
     resource: Record<ResourceKind, string>;
     role: Record<Role, string>;
+    /** [v1.17] Plural forms for FE terminology (replaces the hardcoded Hebrew plural
+     *  map; single source = /v1/profiles). Optional until all consumers migrate. */
+    eventPlural?: string; taskPlural?: string;
+    resourcePlural?: Record<ResourceKind, string>;
+    rolePlural?: Record<Role, string>;
+    /** [v1.17] Optional per-profile UI-chrome tab labels for live vertical shells.
+     *  Absent => FE defaults (camp values). Owned by the design direction once chosen. */
+    chrome?: { tower?: string; focus?: string; approvals?: string; builder?: string };
   };
   catalog: Array<{ resourceKind: ResourceKind; name: string; exclusive: boolean }>;
   taskTemplates: Array<{ name: string; durationMin: number; defaultAssigneeKinds: ResourceKind[] }>;
@@ -212,7 +235,7 @@ export type Role = 'admin' | 'field_manager' | 'focus_worker';
 /** Impact classes: approval requirement derives from impact, not role alone. */
 export type ImpactClass = 'S0' | 'S1' | 'S2' | 'S3';
 
-/** The 23 actions (see matrix JSON for allow/scope/propose/deny per role). [count fixed v1.13.1] */
+/** The 30 actions (see matrix JSON for allow/scope/propose/deny per role). [count corrected v1.18: 26 pre-whitelist incl. notify.ack + push pair] */
 export type Action =
   | 'event.create' | 'event.update' | 'event.delete' | 'event.publish'
   | 'task.create' | 'task.update' | 'task.move' | 'task.delete' | 'task.assign'
@@ -224,7 +247,8 @@ export type Action =
   | 'report.status.create' | 'report.resolve'  // v1.13.1: union member matches matrix v1.3 row
   | 'notify.send.targeted'
   | 'notify.ack'               // v1.8 — audit completeness for the ack endpoint
-  | 'push.subscribe' | 'push.unsubscribe'; // v1.10 — push self-service audit (no matrix rows, v1.8 precedent)
+  | 'push.subscribe' | 'push.unsubscribe' // v1.10 — push self-service audit (no matrix rows, v1.8 precedent)
+  | 'whitelist.invite' | 'whitelist.list' | 'whitelist.approve' | 'whitelist.reject'; // v1.18 - matrix v1.4 rows, admin-only
 
 export interface Scope { eventId: ID; siteId?: ID; }
 
@@ -286,8 +310,17 @@ export interface DominoResult {
   conflicts: Conflict[];
   maxImpactClass: ImpactClass;
   /** PINNED (QA golden corpus): N counts DEPENDENT tasks only, never the trigger task.
-   *  e.g. "אפקט דומינו: 1 משימות תלויות יזוזו (בריכה)" — 1 dependent, trigger excluded. */
+   *  e.g. "אפקט דומינו: 1 משימות תלויות יזוזו (בריכה)" — 1 dependent, trigger excluded.
+   *  [v1.16] When ok===false (blocking conflict), summaryHe MUST name the blocking
+   *  conflict - "אין אפקט דומינו" is valid only when ok===true with zero movement. */
   summaryHe: string;
+  /** [v1.16, R2] Advisory violations of the EXISTING graph, reported on
+   *  constraint-class actions (dependency.create/delete, constraint.lock/unlock):
+   *  creating a rule does not retro-fix current times (S0-by-design stands), but the
+   *  engine must NOT stay silent - violations the new/removed constraint exposes are
+   *  reported here (e.g. "הקשר החדש כבר מופר ב-2 משימות"). Advisory only: never
+   *  affects ok, never auto-fixes. Omitted on scheduling actions. */
+  advisoryViolations?: Conflict[];
 }
 
 /** THE engine signature. Deterministic, pure, synchronous. Server-side compute is
@@ -402,7 +435,7 @@ export interface PushSubscription {
 // 7.5 AUDIT LOG — append-only, every mutation (QA §9)
 // ============================================================
 
-export type AuditEntityType = NodeKind | 'user' | 'change_request' | 'notification' | 'dependency'
+export type AuditEntityType = NodeKind | 'user' | 'change_request' | 'notification' | 'dependency' | 'whitelist_entry' /* v1.18 */
   | 'push_subscription'        // v1.10
   | 'report';                  // v1.12 (report.resolve audits under its precise entity)
 
@@ -454,12 +487,14 @@ export interface ReportNewFrame { type: 'report.new'; report: StatusReport; site
 export interface ReportResolvedFrame { type: 'report.resolved'; report: StatusReport; siteId: ID; } // v1.12
 export interface NotifyFailedFrame { type: 'notify.failed'; jobId: ID; address: string; error: string; }
 export interface NotifyAckedFrame { type: 'notify.acked'; jobId: ID; acknowledgedBy: ID; acknowledgedAt: ISODateTime; }
+export interface WhitelistUpdatedFrame { type: 'whitelist.updated'; entry: WhitelistEntry; } // v1.18 -> adminsRoom(orgId) only
 
 export type RealtimeFrame =
   | GraphPatchFrame | GraphRemoveFrame
   | ChangePendingFrame | ChangeResolvedFrame
   | ReportNewFrame | ReportResolvedFrame  // v1.12
-  | NotifyFailedFrame | NotifyAckedFrame;
+  | NotifyFailedFrame | NotifyAckedFrame
+  | WhitelistUpdatedFrame;      // v1.18 -> adminsRoom(orgId) only
 
 // ============================================================
 // 8. API CONTRACT (REST, prefix /v1) + realtime events
@@ -730,3 +765,113 @@ export interface TaskPatchRequest {
  *  Without this, a duplicated event has zero qualified listeners in its site
  *  rooms and zero scoped-manager event access (the matrix's eventId rows key
  *  on bindings). */
+
+// ============================================================
+// 14. WRITE-PATH INTEGRITY [v1.16] - independent review R3/R4
+// ============================================================
+
+/** [v1.16, R3] Scope enforcement on EVERY write path, not only previews: a
+ *  field_manager's direct writes (PATCH move/assign/patch, DELETE) are scope-checked
+ *  exactly as domino.compute previews are - targets outside the manager's bound sites
+ *  return 403 OUT_OF_SCOPE. A scoped manager can never trigger, and is never exposed
+ *  to, a cross-site cascade; server-side compute for their permitted proposals still
+ *  runs with full visibility, but results are role-filtered per the matrix.
+ *
+ *  [v1.16, R4] Loud input errors: a malformed change shape (e.g. 'action' vs 'type')
+ *  or an unsupported patch field (e.g. 'locked' via PATCH - lock changes go through
+ *  constraint.lock/unlock only) returns 400 with a Hebrew message. Unknown patch keys
+ *  are REJECTED (this upgrades the earlier documented soft spot to loud rejection).
+ *
+ *  Doc notes landed in this rev: (a) constraint-class actions are S0 by engine design
+ *  (zeroResult; impact materializes on the next scheduling change through the edge) -
+ *  see section 12 dependency row and DominoResult.advisoryViolations; (b) stale REJECT
+ *  returns 200 by design - a reject mutates no graph, so a stale base is irrelevant;
+ *  the CR itself is protected by ALREADY_RESOLVED on repeat decisions. */
+
+// ============================================================
+// 15. WHITELIST ONBOARDING [v1.18] - admin-approved phone login
+// ============================================================
+
+/** Product-owner ruling (relayed via main, 2026-09-14): the OTP code step is
+ *  REMOVED from phone login at this stage. Admin pre-registers allowed phones;
+ *  the user's first entry collects their details; admin approval IS the
+ *  credential. SMS/WhatsApp send infrastructure stays built but OFF (demo
+ *  posture) and re-arms at real pilot. CONTAKE_DEV_OTP devCode remains for
+ *  QA/dev under the flag only.
+ *
+ *  Lifecycle: invited -> pending_approval -> approved | rejected.
+ *    invited:          admin pre-registered the phone; user has not registered.
+ *    pending_approval: user submitted details; awaits admin decision.
+ *    approved:         admin assigned the REAL role; phone logs in with no code.
+ *    rejected:         terminal for this entry (admin may re-invite via a new
+ *                      POST /v1/whitelist, which resets the same phone row to
+ *                      invited - phone stays UNIQUE, one row per phone).
+ *
+ *  Camp protection: on deploy, every existing pilot phone (admin, counselors,
+ *  rakezim) is pre-seeded as approved with its current role/org - the camp
+ *  pilot sees ZERO behavior change. Seed is idempotent (upsert on phone). */
+
+export type WhitelistStatus = 'invited' | 'pending_approval' | 'approved' | 'rejected';
+
+export interface WhitelistEntry {
+  phone: string;              // E.164, globally unique (one row per phone)
+  status: WhitelistStatus;
+  orgId: ID;                  // inviting admin's org, server-derived at invite
+  displayName?: string;       // from the registration form (pending_approval+)
+  requestedRole?: Role;       // what the user ASKED for - never granted directly
+  assignedRole?: Role;        // the real grant, set by admin at approve
+  linkedResourceId?: ID;      // focus_worker binding, set at approve (Principal rule)
+  decidedBy?: ID;             // admin userId at approve/reject
+  decidedAt?: ISODateTime;
+  createdAt: ISODateTime;     // invite time
+  rejectedReasonHe?: string;  // optional admin note at reject
+}
+
+/** Endpoints (admin rows per matrix v1.4: whitelist.* = admin allow, all other
+ *  roles deny; every mutation audited with entityType 'whitelist_entry',
+ *  beforeJson/afterJson per QA §9; denied non-admin attempts append the v1.9
+ *  denied-audit row):
+ *
+ *    POST /v1/whitelist { phone } -> WhitelistEntry            whitelist.invite
+ *        orgId = caller's org (server-derived, never client-supplied). Upsert:
+ *        re-inviting an existing phone resets status to invited and clears
+ *        decision fields (full audit trail on each transition).
+ *    GET  /v1/whitelist?status= -> WhitelistEntry[]            whitelist.list
+ *        Org-scoped. Phone numbers leave this endpoint ONLY for admins.
+ *    POST /v1/whitelist/:phone/approve { role, linkedResourceId? } -> WhitelistEntry
+ *                                                             whitelist.approve
+ *        Requires status pending_approval (409 otherwise). Creates or binds the
+ *        user account: role is the ADMIN-assigned role (requestedRole is
+ *        advisory only); focus_worker requires linkedResourceId (Principal
+ *        invariant). Emits 'whitelist.updated' to adminsRoom(orgId).
+ *    POST /v1/whitelist/:phone/reject { reasonHe? } -> WhitelistEntry
+ *                                                             whitelist.reject
+ *        Requires status pending_approval (409 otherwise).
+ *
+ *  Public auth endpoints (UNAUTHENTICATED - rate-limited; whitelist-check is a
+ *  phone-registered oracle by design, accepted as demo posture, revisited at
+ *  real pilot together with OTP re-arm):
+ *    POST /v1/auth/whitelist-check { phone } -> { status: WhitelistStatus | 'unknown' }
+ *        'unknown' phones get the contact-your-manager UX; no self-signup path.
+ *    POST /v1/auth/whitelist-register { phone, displayName, requestedRole } -> WhitelistEntry
+ *        Only from status 'invited' (409 otherwise; idempotent re-submit of the
+ *        SAME details returns 200 with the unchanged entry). Transitions to
+ *        pending_approval and emits 'whitelist.updated' to adminsRoom(orgId).
+ *    POST /v1/auth/login { phone } -> session                  (behavior change)
+ *        status approved => session issued, NO OTP challenge. Any other status
+ *        => 403 with the status code so the FE renders the matching screen
+ *        (pending: "ממתין לאישור ההנהלה", rejected/unknown: contact manager).
+ *        DEV_OTP devCode path unchanged, gated by CONTAKE_DEV_OTP, QA/dev only.
+ *
+ *  Notify: on pending_approval, an in_app notification to adminsRoom(orgId)
+ *  ("משתמש חדש ממתין לאישור" + displayName/phone) via the existing notify
+ *  engine; SMS/WhatsApp channels stay OFF. Approval/rejection produces NO
+ *  outbound message to the user at this stage - the user discovers it on next
+ *  login attempt (demo posture; SMS/WhatsApp re-arms at real pilot). */
+
+export interface WhitelistInviteRequest { phone: string; }
+export interface WhitelistApproveRequest { role: Role; linkedResourceId?: ID; }
+export interface WhitelistRejectRequest { reasonHe?: string; }
+export interface WhitelistCheckRequest { phone: string; }
+export interface WhitelistCheckResponse { status: WhitelistStatus | 'unknown'; }
+export interface WhitelistRegisterRequest { phone: string; displayName: string; requestedRole: Role; }

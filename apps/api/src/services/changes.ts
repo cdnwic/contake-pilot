@@ -1,5 +1,5 @@
 import type {
-  Action, AuditEntityType, ChangeRequest, DominoResult, GraphSnapshot, ID, ImpactClass,
+  Action, AuditEntityType, ChangeRequest, DomainProfile, DominoResult, GraphSnapshot, ID, ImpactClass,
   Principal, ProposedChange, TaskNode,
 } from '@contake/core';
 import { computeDomino, effectiveDecision, getProfile, inScope, rawDecision, reportAutoApplies } from '@contake/core';
@@ -80,9 +80,12 @@ function taskSite(snapshot: GraphSnapshot, change: ProposedChange): string | und
   return snapshot.event.siteIds[0];
 }
 
-export function reasonFor(impactClass: ImpactClass, base: string): string {
+export function reasonFor(impactClass: ImpactClass, base: string, profile?: DomainProfile): string {
+  // Stage 1: S3 names the profile's external stakeholders when the registry
+  // provides a label (e.g. לקוחות); generic text remains the fallback.
+  const s3 = profile?.rules.externalStakeholderLabel ? `השפעה על ${profile.rules.externalStakeholderLabel}` : 'השפעה על בעלי עניין חיצוניים';
   const classes: Record<ImpactClass, string> = {
-    S0: 'השפעה מקומית', S1: 'השפעה על כל האתר', S2: 'השפעה חוצת אתרים', S3: 'השפעה על בעלי עניין חיצוניים',
+    S0: 'השפעה מקומית', S1: 'השפעה על כל האתר', S2: 'השפעה חוצת אתרים', S3: s3,
   };
   return `${classes[impactClass]} — נדרש אישור מנהל-על (${base})`;
 }
@@ -136,7 +139,7 @@ export async function proposeMutation(
       change,
       dominoResult: domino,
       state: 'pending_review',
-      reasonHe: reasonFor(impactClass, action),
+      reasonHe: reasonFor(impactClass, action, profile),
       createdAt: new Date().toISOString(),
     };
     await withAuditSafety(repo, async () => {

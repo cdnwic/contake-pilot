@@ -1,6 +1,7 @@
 import type {
   AuditLogEntry, ChangeRequest, DependencyEdge, EventNode, GraphSnapshot, ID,
   NotificationJob, Principal, PushSubscription, ResourceNode, Role, StatusReport, TaskNode,
+  WhitelistEntry, WhitelistStatus,
 } from '@contake/core';
 
 /** Authenticated user record (the Principal plus login material). */
@@ -119,6 +120,12 @@ export interface GraphRepository {
   /** Unguarded delete for the dispatcher's 404/410 dead-subscription cleanup. */
   deletePushSubscriptionByEndpoint(endpoint: string): Promise<boolean>;
 
+  // whitelist onboarding (contracts v1.18 §15): one row per phone, globally unique.
+  /** Upsert on phone - invite reset and seed share this path (idempotent). */
+  upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry>;
+  getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined>;
+  listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]>;
+
   // audit (append-only by construction: no update/delete methods exist, QA AC-AUD-2)
   appendAudit(e: AuditLogEntry): Promise<void>;
   listAudit(orgId: ID): Promise<AuditLogEntry[]>;
@@ -131,7 +138,7 @@ export interface SeedData {
   events: EventNode[];
   tasks: TaskNode[];
   resources: ResourceNode[];
-  dependencies: DependencyEdge[];
+  dependencies: DependencyEdge[];  whitelist?: WhitelistEntry[];
 }
 
 export type { Role };

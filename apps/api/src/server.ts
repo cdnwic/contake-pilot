@@ -10,13 +10,20 @@ import { createDispatcher, type DispatchStateStore, type MessageProvider } from 
 import { createTwilioProvider, twilioConfigFromEnv } from './services/twilio.js';
 import { createWhatsAppCloudProvider, whatsAppCloudConfigFromEnv } from './services/whatsapp-cloud.js';
 import { createLogPushProvider, createVapidPushProvider, vapidConfigFromEnv } from './services/webpush.js';
-import { campDemoSeed, ensureCampDemoStaging } from './demo/camp-demo.js';
+import { campDemoSeed, campWhitelistEntries, ensureCampDemoStaging, ensureCampWhitelist } from './demo/camp-demo.js';
+import { seedFilmShoot } from './seeds/film-shoot.seed.js';
+import { seedEventProduction } from './seeds/event-production.seed.js';
+import { seedEducation } from './seeds/education.seed.js';
+import { seedAfterSchool } from './seeds/after-school.seed.js';
+import { seedConference } from './seeds/conference.seed.js';
+import { seedLogistics } from './seeds/logistics.seed.js';
+import type { SeedData } from './repo/graph-repository.js';
 
-// Deploy pin check (contracts v1.12 / matrix v1.3): refuse boot on a wrong
+// Deploy pin check (contracts v1.18 / matrix v1.4): refuse boot on a wrong
 // pinned matrix drop-in. File-hash pinning happens at review/build time (the
 // pinned sha256 is checked against TL-published hashes before deploy); the
 // compiled runtime asserts the version marker of the actually-loaded matrix.
-const PINNED_MATRIX_VERSION = '1.3';
+const PINNED_MATRIX_VERSION = '1.4';
 if (RBAC_MATRIX_VERSION !== PINNED_MATRIX_VERSION) {
   throw new Error(`RBAC matrix pin mismatch: expected v${PINNED_MATRIX_VERSION}, loaded v${RBAC_MATRIX_VERSION} - refusing to boot`);
 }
@@ -27,8 +34,31 @@ let repo: GraphRepository;
 let dispatchState: DispatchStateStore | undefined;
 let otpState: OtpStateStore | undefined;
 // CONTAKE_SEED=camp-demo loads the rich camp-day demo dataset (plan 3ח);
+// CONTAKE_SEED=all-demo loads camp + all six vertical seeds (Stage 1: one org
+// per vertical, D = current Jerusalem date at boot; memory-mode re-seed makes
+// re-anchoring free - restart with a fresh D before a demo);
 // anything else (or unset) loads the compact QA demo seed.
+const jerusalemToday = (): string => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
 const pickSeed = () => (process.env['CONTAKE_SEED'] === 'camp-demo' ? campDemoSeed() : seedDemo());
+const allDemoSeeds = (): SeedData[] => {
+  const D = jerusalemToday();
+  const verticals = [seedFilmShoot(D), seedEventProduction(D), seedEducation(D), seedAfterSchool(D), seedConference(D), seedLogistics(D)];
+  // v1.18 §15: vertical phone users (focus workers) pre-approved; camp pilot
+  // phones come from the shared campWhitelistEntries() source. Admin/manager
+  // users authenticate email+password and need no whitelist row.
+  return [
+    { ...campDemoSeed(), whitelist: campWhitelistEntries() },
+    ...verticals.map(seed => ({
+      ...seed,
+      whitelist: seed.users.filter(u => u.phone).map(u => ({
+        phone: u.phone as string, status: 'approved' as const, orgId: u.orgId,
+        assignedRole: u.role,
+        ...(u.linkedResourceId ? { linkedResourceId: u.linkedResourceId } : {}),
+        createdAt: new Date().toISOString(), decidedBy: 'system-seed', decidedAt: new Date().toISOString(),
+      })),
+    })),
+  ];
+};
 if (process.env['DATABASE_URL']) {
   const { Pool } = await import('pg');
   const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
@@ -43,9 +73,16 @@ if (process.env['DATABASE_URL']) {
     await ensureCampDemoStaging(repo);
     console.log('Postgres: camp-demo QA staging slice ensured (additive-if-absent)');
   }
+  // v1.18 §15 camp protection: pilot phones pre-approved on every boot
+  // (idempotent upsert on phone; zero camp behavior change).
+  await ensureCampWhitelist(repo);
   dispatchState = pgDispatchState(pool);
   otpState = await createPgOtpState(pool); // pilot-prep #4: shared OTP state
   console.log('Contake API: Postgres adapter (DATABASE_URL)');
+} else if (process.env['CONTAKE_SEED'] === 'all-demo') {
+  repo = new MemoryGraphRepository();
+  for (const seed of allDemoSeeds()) await applySeed(repo, seed);
+  console.log('Contake API: memory adapter, all-demo composite seed (camp + 6 verticals, D=' + jerusalemToday() + ')');
 } else {
   repo = MemoryGraphRepository.seeded(pickSeed());
 }

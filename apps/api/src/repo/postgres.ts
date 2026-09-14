@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type {
   AuditLogEntry, ChangeRequest, DependencyEdge, EventNode, GraphSnapshot, ID,
   NotificationJob, PushSubscription, ResourceNode, StatusReport, TaskNode,
+  WhitelistEntry, WhitelistStatus,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
 import type { DispatchStateStore } from '../services/dispatch.js';
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS reports(id text PRIMARY KEY, task_id text NOT NULL, c
 CREATE TABLE IF NOT EXISTS notification_jobs(id text PRIMARY KEY, event_id text NOT NULL, idempotency_key text, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_log(seq bigserial PRIMARY KEY, org_id text NOT NULL, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS push_subscriptions(endpoint text PRIMARY KEY, user_id text NOT NULL, org_id text NOT NULL, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS whitelist_entries(phone text PRIMARY KEY, org_id text NOT NULL, status text NOT NULL, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS dispatch_sent_keys(key text PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS dispatch_batch_windows(address text PRIMARY KEY, closes_at_ms bigint NOT NULL);
 CREATE TABLE IF NOT EXISTS dispatch_suppressed(address text PRIMARY KEY);
@@ -174,6 +176,25 @@ export class PostgresGraphRepository implements GraphRepository {
   async listUsers(orgId: ID): Promise<UserRecord[]> {
     const r = await this.q(`SELECT data FROM users WHERE org_id=$1`, [orgId]);
     return r.rows.map(row => row['data'] as UserRecord);
+  }
+
+  // whitelist onboarding (v1.18 §15): upsert on phone, org-scoped list.
+  async upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry> {
+    await this.q(
+      `INSERT INTO whitelist_entries(phone, org_id, status, data) VALUES($1,$2,$3,$4)
+       ON CONFLICT (phone) DO UPDATE SET org_id=$2, status=$3, data=$4`,
+      [e.phone, e.orgId, e.status, JSON.stringify(e)]);
+    return e;
+  }
+  async getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined> {
+    const r = await this.q(`SELECT data FROM whitelist_entries WHERE phone=$1 LIMIT 1`, [phone]);
+    return r.rows[0]?.['data'] as WhitelistEntry | undefined;
+  }
+  async listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]> {
+    const r = status
+      ? await this.q(`SELECT data FROM whitelist_entries WHERE org_id=$1 AND status=$2`, [orgId, status])
+      : await this.q(`SELECT data FROM whitelist_entries WHERE org_id=$1`, [orgId]);
+    return r.rows.map(row => row['data'] as WhitelistEntry);
   }
 
   async createChannel(c: ChannelRecord): Promise<ChannelRecord> {

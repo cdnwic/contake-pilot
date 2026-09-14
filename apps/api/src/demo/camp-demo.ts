@@ -1,4 +1,5 @@
 import type { GraphRepository, SeedData } from '../repo/graph-repository.js';
+import type { WhitelistEntry } from '@contake/core';
 import { hashPasswordPure } from '../auth.js';
 
 /** Camp demo seed (plan 3ח): a rich, realistic camp-day dataset for demos and
@@ -74,6 +75,24 @@ export async function ensureCampDemoStaging(repo: GraphRepository): Promise<void
   for (const r of slice.resources) if (!(await repo.getResource(r.id))) await repo.createResource(r);
   for (const t of slice.tasks) if (!(await repo.getTask(t.id))) await repo.createTask(t);
   if (!(await repo.getDependency('cd-qd-1'))) for (const d of slice.dependencies) await repo.createDependency(d);
+}
+
+/** v1.18 §15 camp protection: every existing pilot phone (admin, rakezim,
+ *  counselors, QA FMs) is pre-seeded as approved with its current role/org -
+ *  the camp pilot sees ZERO behavior change. Idempotent upsert on phone;
+ *  never touches cd-ev1 graph data. */
+export function campWhitelistEntries(): WhitelistEntry[] {
+  const now = new Date().toISOString();
+  return campDemoSeed().users.filter(u => u.phone).map(u => ({
+    phone: u.phone as string, status: 'approved' as const, orgId: u.orgId,
+    assignedRole: u.role,
+    ...(u.linkedResourceId ? { linkedResourceId: u.linkedResourceId } : {}),
+    createdAt: now, decidedBy: 'system-seed', decidedAt: now,
+  }));
+}
+
+export async function ensureCampWhitelist(repo: GraphRepository): Promise<void> {
+  for (const e of campWhitelistEntries()) await repo.upsertWhitelistEntry(e);
 }
 
 export function campDemoSeed(): SeedData {

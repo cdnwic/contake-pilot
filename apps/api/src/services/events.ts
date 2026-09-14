@@ -1,4 +1,4 @@
-import type { ChangeRequest, ID, StatusReport } from '@contake/core';
+import type { ChangeRequest, ID, StatusReport, WhitelistEntry } from '@contake/core';
 
 /** In-process event bus: mutation paths publish, realtime/dispatch subscribe.
  *  Keeps Socket.IO out of the service layer; tests subscribe directly. */
@@ -15,7 +15,9 @@ export type AppEvent =
   | { type: 'report.resolved'; report: StatusReport; eventId: ID; siteId: ID }
   | { type: 'notify.failed'; eventId: ID; jobId: ID; address: string; error: string }
   /** PR-3 (contracts v1.6/v1.7): shared FYI handled-state -> adminsRoom(orgId). */
-  | { type: 'notify.acked'; eventId: ID; orgId: ID; jobId: ID; acknowledgedBy: ID; acknowledgedAt: string };
+  | { type: 'notify.acked'; eventId: ID; orgId: ID; jobId: ID; acknowledgedBy: ID; acknowledgedAt: string }
+  /** v1.18 §15: whitelist lifecycle transition -> adminsRoom(orgId) only. */
+  | { type: 'whitelist.updated'; orgId: ID; entry: WhitelistEntry };
 
 type Listener = (e: AppEvent) => void;
 const listeners = new Set<Listener>();

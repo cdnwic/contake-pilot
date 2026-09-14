@@ -3,11 +3,11 @@ import { computeDomino } from '../src/domino/computeDomino.js';
 import { getProfile, listProfiles, PROFILES_VERSION } from '../src/profiles/profiles.js';
 import { scenarios } from './fixtures/golden-corpus.v1.1.js';
 
-const EXPECTED_IDS = ['camp', 'event-production', 'film-shoot', 'conference', 'logistics', 'after-school'];
+const EXPECTED_IDS = ['camp', 'event-production', 'film-shoot', 'conference', 'logistics', 'after-school', 'education'];
 
-describe('domain profiles v1.2 (QA AC-GRAPH-3: profile neutrality)', () => {
-  it('all 6 profiles load and validate', () => {
-    expect(PROFILES_VERSION).toBe('1.2');
+describe('domain profiles v1.3 (QA AC-GRAPH-3: profile neutrality)', () => {
+  it('all 7 profiles load and validate', () => {
+    expect(PROFILES_VERSION).toBe('1.3');
     expect(listProfiles().map(p => p.id).sort()).toEqual([...EXPECTED_IDS].sort());
   });
   it('label bijectivity: every kind and role labeled, no extras', () => {

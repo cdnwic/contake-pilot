@@ -143,6 +143,11 @@ export function createRealtime(
   };
 
   const unsubscribe = appEvents.subscribe(async (e) => {
+    if (e.type === 'whitelist.updated') {
+      // v1.18 §15: adminsRoom(orgId) only - phone numbers never reach other rooms.
+      io.to(adminsRoom(e.orgId)).emit('whitelist.updated', { type: 'whitelist.updated', entry: e.entry });
+      return;
+    }
     if (e.type === 'graph.removed') {
       // RT-PIN-4: tombstones to the rooms that previously held the task — NEVER adminsRoom.
       const base: GraphRemoveFrame = { type: 'graph.remove', eventId: e.eventId, version: e.version, taskIds: e.taskIds };

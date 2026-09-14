@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import type { ID, Principal, Role, Scope } from '@contake/core';
+import type { ID, Principal, Role, Scope, WhitelistStatus } from '@contake/core';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
 
 /**
@@ -169,6 +169,18 @@ export class AuthService {
     await this.otpStore.resetVerifyState(phone);
     const user = await this.repo.findUserByPhone(phone);
     if (!user || !user.active) return null;
+    return { token: this.issueToken(user.userId), principal: toPrincipal(user) };
+  }
+
+  /** v1.18 §15: whitelist-gated phone login. Approved entries log in with NO
+   *  OTP challenge - the admin approval IS the credential. Any other state
+   *  returns the status so the route can 403 with it (FE renders per-status). */
+  async loginWithPhone(phone: string): Promise<{ token: string; principal: Principal } | { status: WhitelistStatus | 'unknown' }> {
+    const entry = await this.repo.getWhitelistEntry(phone);
+    if (!entry) return { status: 'unknown' };
+    if (entry.status !== 'approved') return { status: entry.status };
+    const user = await this.repo.findUserByPhone(phone);
+    if (!user || !user.active) return { status: 'unknown' };
     return { token: this.issueToken(user.userId), principal: toPrincipal(user) };
   }
 }

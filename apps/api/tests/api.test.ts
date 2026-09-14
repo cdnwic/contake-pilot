@@ -91,7 +91,7 @@ describe('E2E-3/E2E-4 field escalation + reject', () => {
     expect(res.statusCode).toBe(200);
     const cr = res.json().changeRequest;
     expect(cr.state).toBe('pending_review');
-    expect(cr.reasonHe).toContain('חיצוניים');
+    expect(cr.reasonHe).toContain('הורים'); // Stage 1: camp externalStakeholderLabel
     expect((await repo.getTask('t1'))!.start).toBe(move('07:30')); // untouched pre-approval (AC-RBAC-7)
     // no stakeholder notification pre-approval (AC-NOT-5)
     const preJobs = await repo.listNotificationJobs('e1');

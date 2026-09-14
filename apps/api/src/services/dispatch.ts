@@ -235,7 +235,10 @@ export function createDispatcher(input: {
       const t = entries[0]!.target;
       const eventId = entries[0]!.job.eventId;
       const ev = await repo.getEvent(eventId);
-      const profile: DomainProfile = getProfile(ev?.domainProfileId ?? 'camp');
+      // Stage 1 hardening: fail loud when the event exists but its profile is
+      // unknown. The camp fallback is ONLY for sentinel jobs (eventId 'pending',
+      // e.g. whitelist pending-approval) that have no event row.
+      const profile: DomainProfile = ev ? getProfile(ev.domainProfileId) : getProfile('camp');
       if (await isOptedOut(t)) {
         for (const p of entries) {
           await state.markDispatched(p.key);
