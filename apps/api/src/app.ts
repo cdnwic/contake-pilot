@@ -365,10 +365,23 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
           lagMin: d.lagMin, hard: d.hard,
         });
       }
+      // TL ruling 2026-09-14: counselor bindings survive event duplication - same
+      // userIds, scope preserved, eventId repointed to the new event, siteIds remapped
+      // positionally (the duplicate keeps the SAME site ids today, so the map is the
+      // identity). Implicit like the tasks/resources copy: no contract surface change.
+      const siteIdMap = new Map(src.siteIds.map((s, i) => [s, event.siteIds[i] ?? s]));
+      let bindingsCloned = 0;
+      for (const u of await repo.listUsers(src.orgId)) {
+        const bound = u.scopes.filter(s => s.eventId === id);
+        if (bound.length === 0) continue;
+        const clones = bound.map(s => ({ eventId: event.id as ID, ...(s.siteId !== undefined ? { siteId: siteIdMap.get(s.siteId) ?? s.siteId } : {}) }));
+        await repo.updateUser(u.userId, { scopes: [...u.scopes, ...clones] });
+        bindingsCloned += clones.length;
+      }
       await audit(repo, {
         orgId: user.orgId, eventId: event.id, actorUserId: user.userId, role: user.role,
         action: 'event.create', entityType: 'event', entityId: event.id,
-        after: { ...event, duplicatedFrom: id, counts: { tasks: tasks.length, resources: resources.length, dependencies: deps.length } },
+        after: { ...event, duplicatedFrom: id, counts: { tasks: tasks.length, resources: resources.length, dependencies: deps.length, bindings: bindingsCloned } },
         deviceClass: deviceClassOf(ua(req)),
       });
     });

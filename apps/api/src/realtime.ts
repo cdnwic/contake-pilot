@@ -61,10 +61,9 @@ export function createRealtime(
     const rooms = [userRoom(user.userId)];
     if (user.role === 'admin') rooms.push(adminsRoom(user.orgId));
     if (user.role === 'field_manager') {
-      for (const s of user.scopes) {
-        if (s.siteId) { rooms.push(siteRoom(s.eventId, s.siteId)); continue; }
-        for (const siteId of (await repo.getEvent(s.eventId))?.siteIds ?? []) rooms.push(siteRoom(s.eventId, siteId));
-      }
+      // TL ruling 2026-09-14: site-bound managers join their site rooms; event-wide
+      // ('all') managers get NO site-room joins in v2 (admin joins stay adminsRoom-only).
+      for (const s of user.scopes) if (s.siteId) rooms.push(siteRoom(s.eventId, s.siteId));
     }
     return rooms;
   };
