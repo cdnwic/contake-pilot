@@ -237,8 +237,15 @@ export function createDispatcher(input: {
       const ev = await repo.getEvent(eventId);
       // Stage 1 hardening: fail loud when the event exists but its profile is
       // unknown. The camp fallback is ONLY for sentinel jobs (eventId 'pending',
-      // e.g. whitelist pending-approval) that have no event row.
-      const profile: DomainProfile = ev ? getProfile(ev.domainProfileId) : getProfile('camp');
+      // e.g. whitelist pending-approval) that have no event row. QA gate: the
+      // worker boundary emits error-monitor evidence BEFORE the throw.
+      let profile: DomainProfile;
+      try {
+        profile = ev ? getProfile(ev.domainProfileId) : getProfile('camp');
+      } catch (err) {
+        console.error(`[dispatch] FATAL unresolvable domain profile for event ${eventId}: ${(err as Error).message} - camp fallback refused, batch halted`);
+        throw err;
+      }
       if (await isOptedOut(t)) {
         for (const p of entries) {
           await state.markDispatched(p.key);

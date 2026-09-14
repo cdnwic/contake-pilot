@@ -317,8 +317,10 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       fail(409, 'WHITELIST_NOT_INVITED', 'הבקשה אינה פתוחה לרישום');
     }
     const next: WhitelistEntry = { ...entry, status: 'pending_approval', displayName: body.displayName, requestedRole: body.requestedRole };
-    await repo.upsertWhitelistEntry(next);
+    // QA gate: audit append FIRST - a failed append aborts the mutation (fail
+    // loud, no silent drop), never a state change without its immutable record.
     await wlAudit(req, phone, 'whitelist.register', 'success', 'pending_approval');
+    await repo.upsertWhitelistEntry(next);
     // NOTE: no audit_log row for this unauthenticated transition (AuditLogEntry.role
     // is the strict Role union and a fabricated role would corrupt QA's AC-AUD
     // trail). The immutable record lives in auth_audit (appended above, QA

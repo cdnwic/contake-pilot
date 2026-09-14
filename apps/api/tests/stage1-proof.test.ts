@@ -65,14 +65,19 @@ describe('Stage 1 proof: GET /v1/profiles wire contract (QA gate)', () => {
 
 describe('Stage 1 proof: domainProfileId gate on event create (QA gate)', () => {
   const base = { name: 'אירוע', date: '2026-09-15', timezone: 'Asia/Jerusalem', siteIds: ['s1'] };
-  it('missing domainProfileId -> 400', async () => {
+  it('missing domainProfileId -> 400 with Hebrew messageHe', async () => {
     const res = await app.inject({ method: 'POST', url: '/v1/events', headers: H(await adminLogin()), payload: base });
     expect(res.statusCode).toBe(400);
+    expect(res.json().error.messageHe).toBe('חסרים שדות חובה: name, date, timezone, domainProfileId, siteIds');
   });
-  it('unknown domainProfileId -> 400 UNKNOWN_PROFILE', async () => {
+  it('unknown domainProfileId -> 400 UNKNOWN_PROFILE with Hebrew messageHe (distinct contract)', async () => {
     const res = await app.inject({ method: 'POST', url: '/v1/events', headers: H(await adminLogin()), payload: { ...base, domainProfileId: 'no-such-profile' } });
     expect(res.statusCode).toBe(400);
     expect(res.json().error.code).toBe('UNKNOWN_PROFILE');
+    expect(res.json().error.messageHe).toBe('פרופיל תחום לא מוכר');
+    // distinct failure contracts -> distinct messages (equality N/A by design)
+    const missing = await app.inject({ method: 'POST', url: '/v1/events', headers: H(await adminLogin()), payload: base });
+    expect(res.json().error.messageHe).not.toBe(missing.json().error.messageHe);
   });
   it('valid camp profile still creates (regression)', async () => {
     const res = await app.inject({ method: 'POST', url: '/v1/events', headers: H(await adminLogin()), payload: { ...base, domainProfileId: 'camp' } });
@@ -94,12 +99,20 @@ describe('Stage 1 proof: dispatch fail-loud on corrupt profile (QA gate)', () =>
     const calls: { to: string; body: string }[] = [];
     const provider: MessageProvider = { name: 'whatsapp', send: (to, body) => { calls.push({ to, body }); return Promise.resolve({ ok: true, providerMessageId: 'x', retryable: false }); } };
     const d = createDispatcher({ repo, providers: { whatsapp: provider, sms: provider } });
+    // QA gate: worker-boundary error-monitor evidence, THEN fail loud.
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     let err: Error | undefined;
     try { await d.dispatchDue(); } catch (e) { err = e as Error; }
     expect(err, 'dispatch must fail loud on corrupt profile').toBeTruthy();
     expect(err!.message).toContain('corrupt-profile');
     expect(err!.message.includes('camp')).toBe(false); // no silent camp fallback
     expect(calls).toEqual([]); // nothing dispatched
+    const logged = errSpy.mock.calls.map(c => String(c[0])).join('\n');
+    expect(logged).toContain('[dispatch] FATAL');
+    expect(logged).toContain('ev-corrupt');
+    expect(logged).toContain('corrupt-profile');
+    expect(logged.includes('camp fallback refused')).toBe(true);
+    errSpy.mockRestore();
   });
 });
 

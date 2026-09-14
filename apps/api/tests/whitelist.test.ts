@@ -21,6 +21,7 @@ beforeEach(async () => {
     users: [
       { userId: 'u-admin', orgId: 'org-1', name: 'מנהל', role: 'admin', scopes: [], email: 'admin@x.local', passwordHash: hashPasswordPure('admin123'), active: true },
       { userId: 'u-fm', orgId: 'org-1', name: 'רכז', role: 'field_manager', scopes: [], email: 'fm@x.local', passwordHash: hashPasswordPure('fm12345'), active: true },
+      { userId: 'u-fw', orgId: 'org-1', name: 'עובד', role: 'focus_worker', scopes: [], email: 'fw@x.local', passwordHash: hashPasswordPure('fw12345'), active: true },
     ],
     channels: [], events: [], resources: [], tasks: [], dependencies: [],
   });
@@ -158,5 +159,44 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
       expect(blob).not.toContain('"ip"');
       expect(blob).not.toContain('token');
     }
+  });
+
+  it('route-wiring RBAC: focus_worker denied on all four whitelist endpoints (denied-audit on mutations)', async () => {
+    const admin = await adminLogin();
+    const fw = (await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: 'fw@x.local', password: 'fw12345' } })).json().token as string;
+    // pending entry to attempt approve/reject against
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone: '+972500999020' } });
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone: '+972500999020', displayName: 'מועמד', requestedRole: 'focus_worker' } });
+    expect((await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(fw), payload: { phone: '+972500999021' } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'GET', url: '/v1/whitelist', headers: H(fw) })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/v1/whitelist/+972500999020/approve', headers: H(fw), payload: { role: 'focus_worker', linkedResourceId: 'r-x' } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/v1/whitelist/+972500999020/reject', headers: H(fw), payload: {} })).statusCode).toBe(403);
+    const denied = (await repo.listAudit('org-1')).filter(a => a.outcome === 'denied' && a.actorUserId === 'u-fw');
+    const actions = denied.map(a => a.action).sort();
+    expect(actions).toEqual(['whitelist.approve', 'whitelist.invite', 'whitelist.reject']);
+    // entry untouched by the denied attempts
+    expect((await repo.getWhitelistEntry('+972500999020'))!.status).toBe('pending_approval');
+  });
+
+  it('field_manager denied on approve/reject (not only invite/list)', async () => {
+    const admin = await adminLogin();
+    const fm = (await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: 'fm@x.local', password: 'fm12345' } })).json().token as string;
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone: '+972500999022' } });
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone: '+972500999022', displayName: 'מועמד', requestedRole: 'admin' } });
+    expect((await app.inject({ method: 'POST', url: '/v1/whitelist/+972500999022/approve', headers: H(fm), payload: { role: 'admin' } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/v1/whitelist/+972500999022/reject', headers: H(fm), payload: {} })).statusCode).toBe(403);
+    expect((await repo.getWhitelistEntry('+972500999022'))!.status).toBe('pending_approval');
+  });
+
+  it('injected appendWhitelistAudit failure fails LOUD (500) and aborts the mutation - no silent drop', async () => {
+    const admin = await adminLogin();
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone: '+972500999030' } });
+    const broken = memoryOtpState();
+    broken.appendAuthAudit = () => Promise.reject(new Error('auth_audit store down'));
+    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, broken));
+    const res = await app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone: '+972500999030', displayName: 'חדש', requestedRole: 'focus_worker' } });
+    expect(res.statusCode).toBe(500); // fail loud
+    expect((await repo.getWhitelistEntry('+972500999030'))!.status).toBe('invited'); // mutation aborted
+    await app2.close();
   });
 });
