@@ -186,7 +186,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     // Round 8: the WHOLE invite mutation runs as one repository transition -
     // memory per-phone mutex / PG one tx holding the row. It can never
     // interleave a paused or rolling-back registration for the same phone.
-    return repo.withWhitelistMutation(phone, async (before) => {
+    const invited = await repo.withWhitelistMutation(phone, async (before) => {
       const now = new Date().toISOString();
       // Upsert: re-invite resets to invited and clears decision fields (§15).
       const entry: WhitelistEntry = { phone, status: 'invited', orgId: user.orgId, createdAt: before?.createdAt ?? now };
@@ -198,9 +198,12 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
           before, after: entry, deviceClass: deviceClassOf(ua(req)),
         });
       });
-      appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
       return entry;
     });
+    // Emit AFTER the transition unit resolves - post-commit on PG, so a
+    // rolled-back transaction can never publish phantom state (hardening note).
+    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry: invited });
+    return invited;
   });
 
   app.get('/v1/whitelist', async (req) => {
@@ -220,7 +223,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     // every write share the unit (PG: row lock in one tx), so a concurrent
     // approve/reject re-reads the DECIDED state and conflicts out: exactly
     // one decision, one audit row, at most one account.
-    return repo.withWhitelistMutation(phone, async (before) => {
+    const decided = await repo.withWhitelistMutation(phone, async (before) => {
       if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
       if (!body.role || !['admin', 'field_manager', 'focus_worker'].includes(body.role)) fail(400, 'BAD_REQUEST', 'חסר תפקיד לאישור');
       if (body.role === 'focus_worker' && !body.linkedResourceId) fail(400, 'BAD_REQUEST', 'עובד מיקוד דורש קישור למשאב');
@@ -247,9 +250,11 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
           before, after: entry, deviceClass: deviceClassOf(ua(req)),
         });
       });
-      appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
       return { entry, user: account };
     });
+    // Post-commit emit (hardening note): no rolled-back state can be published.
+    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry: decided.entry });
+    return decided;
   });
 
   app.post('/v1/whitelist/:phone/reject', async (req) => {
@@ -258,7 +263,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { reasonHe } = (req.body ?? {}) as { reasonHe?: string };
     wlDeny(user, 'whitelist.reject', phone);
     // Round 8: reject is one repository transition (same unit as approve).
-    return repo.withWhitelistMutation(phone, async (before) => {
+    const rejected = await repo.withWhitelistMutation(phone, async (before) => {
       if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
       const entry: WhitelistEntry = {
         ...before, status: 'rejected', decidedBy: user.userId, decidedAt: new Date().toISOString(),
@@ -272,9 +277,11 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
           before, after: entry, deviceClass: deviceClassOf(ua(req)),
         });
       });
-      appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
       return entry;
     });
+    // Post-commit emit (hardening note): no rolled-back state can be published.
+    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry: rejected });
+    return rejected;
   });
 
   // Public (unauthenticated) auth endpoints.
