@@ -94,6 +94,60 @@ run('whitelist route-level PG audit (real HTTP, PGlite)', () => {
     expect(rows.filter(r => detail(r).reasonCode === 'committed')).toHaveLength(1); // exactly once
   });
 
+  it('round-8 PG admin concurrency: approve-vs-approve - exactly one decision, one audit row, at most one account', async () => {
+    liveDb = new PGlite();
+    const db = pgliteConnectable(liveDb);
+    const repo = await PostgresGraphRepository.create(db);
+    await repo.createUser({ userId: 'u-admin', orgId: 'org-1', name: 'מנהל', role: 'admin', scopes: [], email: 'admin@x.local', passwordHash: hashPasswordPure('admin123'), active: true });
+    const otp = await createPgOtpState(db);
+    app = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
+    const admin = (await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: 'admin@x.local', password: 'admin123' } })).json().token as string;
+    const H = { authorization: `Bearer ${admin}` };
+    const phone = '+972500999060';
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H, payload: { phone } });
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מועמד', requestedRole: 'field_manager' } });
+    const [a, b] = await Promise.all([
+      app.inject({ method: 'POST', url: `/v1/whitelist/${phone}/approve`, headers: H, payload: { role: 'field_manager' } }),
+      app.inject({ method: 'POST', url: `/v1/whitelist/${phone}/approve`, headers: H, payload: { role: 'focus_worker', linkedResourceId: 'r-x' } }),
+    ]);
+    expect([a.statusCode, b.statusCode].sort((x, y) => x - y)).toEqual([200, 409]);
+    expect((a.statusCode === 409 ? a : b).json().error.code).toBe('WHITELIST_NOT_PENDING'); // deterministic loser
+    const entry = (await repo.getWhitelistEntry(phone))!;
+    expect(entry.status).toBe('approved'); // exactly one decision landed
+    expect(['field_manager', 'focus_worker']).toContain(entry.assignedRole);
+    const decisions = (await repo.listAudit('org-1')).filter(x => x.action === 'whitelist.approve');
+    expect(decisions).toHaveLength(1); // exactly one decision audit row
+    const accounts = (await repo.listUsers('org-1')).filter(u => u.phone === phone);
+    expect(accounts).toHaveLength(1); // at most one account created
+  });
+
+  it('round-8 PG admin concurrency: approve-vs-reject - exactly one terminal state, one decision audit, account only if approve won', async () => {
+    liveDb = new PGlite();
+    const db = pgliteConnectable(liveDb);
+    const repo = await PostgresGraphRepository.create(db);
+    await repo.createUser({ userId: 'u-admin', orgId: 'org-1', name: 'מנהל', role: 'admin', scopes: [], email: 'admin@x.local', passwordHash: hashPasswordPure('admin123'), active: true });
+    const otp = await createPgOtpState(db);
+    app = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
+    const admin = (await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: 'admin@x.local', password: 'admin123' } })).json().token as string;
+    const H = { authorization: `Bearer ${admin}` };
+    const phone = '+972500999061';
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H, payload: { phone } });
+    await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מועמד', requestedRole: 'field_manager' } });
+    const [a, r] = await Promise.all([
+      app.inject({ method: 'POST', url: `/v1/whitelist/${phone}/approve`, headers: H, payload: { role: 'field_manager' } }),
+      app.inject({ method: 'POST', url: `/v1/whitelist/${phone}/reject`, headers: H, payload: { reasonHe: 'לא' } }),
+    ]);
+    expect([a.statusCode, r.statusCode].sort((x, y) => x - y)).toEqual([200, 409]);
+    expect((a.statusCode === 409 ? a : r).json().error.code).toBe('WHITELIST_NOT_PENDING'); // deterministic loser
+    const entry = (await repo.getWhitelistEntry(phone))!;
+    expect(['approved', 'rejected']).toContain(entry.status); // one terminal state, no last-write-wins blend
+    const decisions = (await repo.listAudit('org-1')).filter(x => x.action === 'whitelist.approve' || x.action === 'whitelist.reject');
+    expect(decisions).toHaveLength(1); // exactly one decision audit row
+    expect(decisions[0]!.action).toBe(entry.status === 'approved' ? 'whitelist.approve' : 'whitelist.reject'); // audit matches the landed state
+    const accounts = (await repo.listUsers('org-1')).filter(u => u.phone === phone);
+    expect(accounts).toHaveLength(entry.status === 'approved' ? 1 : 0); // account exists only when approve won
+  });
+
   it('round-5 PG concurrency: Promise.all same-phone register yields exactly one winner, one committed row, deterministic loser', async () => {
     liveDb = new PGlite();
     const db = pgliteConnectable(liveDb);

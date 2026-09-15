@@ -197,9 +197,17 @@ export class PostgresGraphRepository implements GraphRepository {
    *  one transition. The committed audit row is inserted for the winner only,
    *  inside the same tx, so a failed insert ROLLBACKs the transition (state
    *  stays invited, no success row) and retry is unambiguous. */
-  /** QA round-7 interface: PG owns same-phone concurrency via row locks and
-   *  the CAS UPDATE (QA-signed), so the repository mutex is a passthrough. */
-  async withWhitelistLock<T>(_phone: string, fn: () => Promise<T> | T): Promise<T> { return fn(); }
+  /** Round 8: ONE transaction holds the phone's row (SELECT ... FOR UPDATE)
+   *  for the whole mutation - status check, account mutation, entry write and
+   *  audit all share this tx client through the ambient scope (nested runInTx
+   *  flattens into the outer tx). Concurrent decisions serialize on the row
+   *  lock; the loser re-reads the DECIDED state and conflicts out. */
+  async withWhitelistMutation<T>(phone: string, fn: (locked: WhitelistEntry | undefined) => Promise<T>): Promise<T> {
+    return this.runInTx(async () => {
+      const r = await this.q(`SELECT data FROM whitelist_entries WHERE phone=$1 FOR UPDATE`, [phone]);
+      return fn(r.rows[0]?.['data'] as WhitelistEntry | undefined);
+    });
+  }
 
   async commitWhitelistRegistration(entry: WhitelistEntry, audit: AuthAuditEntry): Promise<'applied' | 'duplicate'> {
     return this.runInTx(async () => {

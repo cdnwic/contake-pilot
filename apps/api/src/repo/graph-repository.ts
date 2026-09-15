@@ -141,14 +141,15 @@ export interface GraphRepository {
     appendAudit?: (a: { phone: string; kind: string; detail?: unknown }) => void | Promise<void>,
   ): Promise<'applied' | 'duplicate'>;
 
-  /** QA round-7: per-phone serialization for EVERY whitelist mutation
-   *  (invite, register CAS, approve, reject). Memory: a promise-chain mutex -
-   *  a mutation starts only after the previous mutation for the same phone
-   *  fully settled (applied OR rolled back), so a paused/rejected
-   *  registration audit can never interleave with an admin mutation and roll
-   *  back over its later state. PG: passthrough (row locks + CAS own
-   *  concurrency there, QA-signed). */
-  withWhitelistLock<T>(phone: string, fn: () => Promise<T> | T): Promise<T>;
+  /** Repository transition primitive (round 8): run fn with the phone's
+   *  whitelist row exclusively held, and every read/write inside fn in the
+   *  SAME unit - memory: the per-phone mutex; PG: ONE transaction opened
+   *  around fn with SELECT ... FOR UPDATE on the row, nested withAuditSafety
+   *  and all repo writes sharing the same tx client via the ambient scope.
+   *  invite / approve / reject route through it, so a status check and its
+   *  writes can never be interleaved by a concurrent decision. fn receives
+   *  the exclusively-held entry (undefined when none). */
+  withWhitelistMutation<T>(phone: string, fn: (locked: WhitelistEntry | undefined) => Promise<T>): Promise<T>;
   listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]>;
 
   // audit (append-only by construction: no update/delete methods exist, QA AC-AUD-2)

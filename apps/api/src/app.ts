@@ -183,12 +183,11 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { phone } = (req.body ?? {}) as { phone?: string };
     if (!phone) fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
     wlDeny(user, 'whitelist.invite', phone);
-    // QA round-7: the WHOLE invite mutation runs under the repository's
-    // per-phone lock - it can never interleave a paused or rolling-back
-    // registration for the same phone (memory mutex; PG passthrough).
-    return repo.withWhitelistLock(phone, async () => {
+    // Round 8: the WHOLE invite mutation runs as one repository transition -
+    // memory per-phone mutex / PG one tx holding the row. It can never
+    // interleave a paused or rolling-back registration for the same phone.
+    return repo.withWhitelistMutation(phone, async (before) => {
       const now = new Date().toISOString();
-      const before = await repo.getWhitelistEntry(phone);
       // Upsert: re-invite resets to invited and clears decision fields (§15).
       const entry: WhitelistEntry = { phone, status: 'invited', orgId: user.orgId, createdAt: before?.createdAt ?? now };
       await withAuditSafety(repo, async () => {
@@ -217,9 +216,11 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { phone } = req.params as { phone: string };
     const body = (req.body ?? {}) as { role?: UserRecord['role']; linkedResourceId?: ID };
     wlDeny(user, 'whitelist.approve', phone);
-    // QA round-7: approve runs under the same per-phone repository lock.
-    return repo.withWhitelistLock(phone, async () => {
-      const before = await repo.getWhitelistEntry(phone);
+    // Round 8: approve is one repository transition - the pending check and
+    // every write share the unit (PG: row lock in one tx), so a concurrent
+    // approve/reject re-reads the DECIDED state and conflicts out: exactly
+    // one decision, one audit row, at most one account.
+    return repo.withWhitelistMutation(phone, async (before) => {
       if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
       if (!body.role || !['admin', 'field_manager', 'focus_worker'].includes(body.role)) fail(400, 'BAD_REQUEST', 'חסר תפקיד לאישור');
       if (body.role === 'focus_worker' && !body.linkedResourceId) fail(400, 'BAD_REQUEST', 'עובד מיקוד דורש קישור למשאב');
@@ -256,9 +257,8 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { phone } = req.params as { phone: string };
     const { reasonHe } = (req.body ?? {}) as { reasonHe?: string };
     wlDeny(user, 'whitelist.reject', phone);
-    // QA round-7: reject runs under the same per-phone repository lock.
-    return repo.withWhitelistLock(phone, async () => {
-      const before = await repo.getWhitelistEntry(phone);
+    // Round 8: reject is one repository transition (same unit as approve).
+    return repo.withWhitelistMutation(phone, async (before) => {
       if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
       const entry: WhitelistEntry = {
         ...before, status: 'rejected', decidedBy: user.userId, decidedAt: new Date().toISOString(),

@@ -61,7 +61,13 @@ export class MemoryGraphRepository implements GraphRepository {
    *  restore over the admin's later state. Chain tails self-clean. */
   private readonly wlLocks = new Map<string, Promise<void>>();
 
-  async withWhitelistLock<T>(phone: string, fn: () => Promise<T> | T): Promise<T> {
+  /** Round 8: invite/approve/reject mutations run under the same per-phone
+   *  mutex as the registration CAS; fn receives the exclusively-held entry. */
+  async withWhitelistMutation<T>(phone: string, fn: (locked: WhitelistEntry | undefined) => Promise<T>): Promise<T> {
+    return this.withWhitelistLock(phone, () => fn(this.whitelist.get(phone)));
+  }
+
+  private async withWhitelistLock<T>(phone: string, fn: () => Promise<T> | T): Promise<T> {
     const prev = this.wlLocks.get(phone) ?? Promise.resolve();
     const result = prev.then(() => fn());
     const tail = result.then(() => undefined, () => undefined);
@@ -121,6 +127,7 @@ export class MemoryGraphRepository implements GraphRepository {
       tasks: [...this.tasks], resources: [...this.resources], dependencies: [...this.dependencies],
       changeRequests: [...this.changeRequests], reports: [...this.reports],
       notificationJobs: [...this.notificationJobs], pushSubscriptions: [...this.pushSubscriptions], auditLog: this.auditLog,
+      whitelist: [...this.whitelist],
     });
   }
   async commit(_cp: string): Promise<void> { /* in-memory: nothing to commit */ }
@@ -132,6 +139,7 @@ export class MemoryGraphRepository implements GraphRepository {
     this.changeRequests = new Map(d['changeRequests']!); this.reports = new Map(d['reports']!);
     this.notificationJobs = new Map(d['notificationJobs']!); this.auditLog = d['auditLog'] as never[] as typeof this.auditLog;
     this.pushSubscriptions = new Map((d['pushSubscriptions'] ?? []) as [string, PushSubscription][]);
+    this.whitelist = new Map((d['whitelist'] ?? []) as [string, WhitelistEntry][]);
   }
 
   async createEvent(e: EventNode): Promise<EventNode> { this.events.set(e.id, e); return e; }
