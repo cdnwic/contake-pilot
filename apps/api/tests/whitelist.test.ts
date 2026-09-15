@@ -209,6 +209,83 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     })).toBe(true);
   });
 
+  it('round-7: admin approve cannot interleave a PAUSED registration audit - defined ordering, no stale overwrite', async () => {
+    const admin = await adminLogin();
+    const phone = '+972500999050';
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
+    // Sink pauses on the committed append: registration holds the per-phone lock mid-commit
+    const flaky = memoryOtpState();
+    const orig = flaky.appendAuthAudit.bind(flaky);
+    let calls = 0;
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(res => { release = res; });
+    const enteredP = new Promise<void>(res => { entered = res; });
+    flaky.appendAuthAudit = (e: { phone: string; kind: string; detail?: unknown }) => {
+      calls += 1;
+      if (calls === 2) { entered(); return gate.then(() => orig(e)); } // paused, then REALLY appends
+      return orig(e);
+    };
+    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, flaky));
+    const regP = app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מועמד', requestedRole: 'field_manager' } });
+    await enteredP; // registration is mid-commit, holding the repo lock
+    const approveP = app2.inject({ method: 'POST', url: `/v1/whitelist/${phone}/approve`, headers: H(admin), payload: { role: 'field_manager' } });
+    let approveSettled = false;
+    void approveP.then(() => { approveSettled = true; });
+    await new Promise(r => setTimeout(r, 30));
+    expect(approveSettled).toBe(false); // BLOCKED by the repository lock while the audit is paused
+    release();
+    const [reg, approve] = await Promise.all([regP, approveP]);
+    expect(reg.statusCode).toBe(200);
+    expect(approve.statusCode).toBe(200);
+    const entry = (await repo.getWhitelistEntry(phone))!;
+    expect(entry.status).toBe('approved'); // the admin's LATER state is intact
+    expect(entry.assignedRole).toBe('field_manager');
+    const rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(rows.filter(r => (r.detail as { reasonCode?: string }).reasonCode === 'committed')).toHaveLength(1);
+    await app2.close();
+  });
+
+  it('round-7: a REJECTED registration audit rolls back BEFORE a racing re-invite - no stale overwrite', async () => {
+    const admin = await adminLogin();
+    const phone = '+972500999051';
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
+    const flaky = memoryOtpState();
+    const orig = flaky.appendAuthAudit.bind(flaky);
+    let calls = 0;
+    let failGate!: (e: Error) => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((res, rej) => { failGate = rej; });
+    const enteredP = new Promise<void>(res => { entered = res; });
+    flaky.appendAuthAudit = (e: { phone: string; kind: string; detail?: unknown }) => {
+      calls += 1;
+      if (calls === 2) { entered(); return gate; }
+      return orig(e);
+    };
+    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, flaky));
+    const regP = app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מועמד', requestedRole: 'focus_worker' } });
+    await enteredP; // mid-commit, lock held
+    const reinviteP = app2.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
+    let reinviteSettled = false;
+    void reinviteP.then(() => { reinviteSettled = true; });
+    await new Promise(r => setTimeout(r, 30));
+    expect(reinviteSettled).toBe(false); // BLOCKED: admin mutation queues behind the registration
+    failGate(new Error('auth_audit store down mid-commit'));
+    const [reg, reinvite] = await Promise.all([regP, reinviteP]);
+    expect(reg.statusCode).toBe(500); // fail loud
+    expect(reinvite.statusCode).toBe(200); // runs only AFTER the rollback: defined ordering
+    const entry = (await repo.getWhitelistEntry(phone))!;
+    expect(entry.status).toBe('invited'); // rolled back, then re-invited - the rollback never overwrote the admin's write
+    // zero committed rows from the failed attempt; a fresh retry is unambiguous
+    let rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(rows.filter(r => (r.detail as { reasonCode?: string }).reasonCode === 'committed')).toHaveLength(0);
+    const retry = await app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מועמד', requestedRole: 'focus_worker' } });
+    expect(retry.statusCode).toBe(200);
+    rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(rows.filter(r => (r.detail as { reasonCode?: string }).reasonCode === 'committed')).toHaveLength(1);
+    await app2.close();
+  });
+
   it('round-5 concurrency: Promise.all same-phone register yields exactly one winner, one committed row, deterministic loser', async () => {
     const admin = await adminLogin();
     const phone = '+972500999033';

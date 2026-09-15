@@ -181,24 +181,14 @@ export class AuthService {
     await this.otpStore.appendAuthAudit({ phone, kind, detail });
   }
 
-  /** QA round-6: delegate to the repository CAS primitive and SERIALIZE
-   *  same-phone registrations across the primitive's sink await: a second
-   *  call for the same phone starts only after the first fully settled
-   *  (applied or rolled back), so exactly one winner exists and the loser
-   *  result is deterministic. The sink promise is awaited inside the
-   *  primitive's try/catch - a Promise.reject can no longer escape as an
-   *  unhandled rejection (round-6 contract fix). PG ignores the sink. */
-  private readonly registrationChain = new Map<string, Promise<void>>();
-
+  /** QA round-7: plain delegate - per-phone serialization lives IN the
+   *  repository (memory: withWhitelistLock around the CAS; PG: row locks +
+   *  CAS UPDATE), so admin invite/approve/reject and registration share ONE
+   *  ordering domain. The sink is awaited inside the repo primitive's
+   *  try/catch; no lock or compensation logic lives here. */
   async commitWhitelistRegistration(entry: WhitelistEntry, kind: string, detail: Record<string, unknown>): Promise<'applied' | 'duplicate'> {
     const audit = { phone: entry.phone, kind, detail };
-    const phone = entry.phone;
-    const prev = this.registrationChain.get(phone) ?? Promise.resolve();
-    const result = prev.then(() => this.repo.commitWhitelistRegistration(entry, audit, a => this.otpStore.appendAuthAudit(a)));
-    const tail = result.then(() => undefined, () => undefined);
-    this.registrationChain.set(phone, tail);
-    void tail.then(() => { if (this.registrationChain.get(phone) === tail) this.registrationChain.delete(phone); });
-    return result;
+    return this.repo.commitWhitelistRegistration(entry, audit, a => this.otpStore.appendAuthAudit(a));
   }
 
   /** v1.18 §15: whitelist-gated phone login. Approved entries log in with NO

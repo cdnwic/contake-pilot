@@ -53,28 +53,47 @@ export class MemoryGraphRepository implements GraphRepository {
   // whitelist onboarding (v1.18 §15)
   async upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry> { this.whitelist.set(e.phone, e); return e; }
   async getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined> { return this.whitelist.get(phone); }
-  /** QA round-6: CAS - invited -> entry, one winner only. The winner's
-   *  committed audit row is appended via the AWAITED sink inside the same
-   *  unit: a REJECTING sink (Promise.reject included) is caught here and
-   *  rolls back the EXACT prior entry object, never a reconstruction - no
-   *  stale rollback, no escaped rejection. The await is a yield point, so
-   *  callers must serialize same-phone calls (AuthService does); a loser
-   *  never mutates anything. */
+  /** QA round-7: per-phone promise-chain mutex. EVERY whitelist mutation
+   *  (invite, register CAS, approve, reject) runs through it, so a mutation
+   *  starts only after the previous one for the same phone fully settled.
+   *  The sink await inside the registration CAS is a yield point; without
+   *  this lock an admin mutation could interleave and the CAS rollback could
+   *  restore over the admin's later state. Chain tails self-clean. */
+  private readonly wlLocks = new Map<string, Promise<void>>();
+
+  async withWhitelistLock<T>(phone: string, fn: () => Promise<T> | T): Promise<T> {
+    const prev = this.wlLocks.get(phone) ?? Promise.resolve();
+    const result = prev.then(() => fn());
+    const tail = result.then(() => undefined, () => undefined);
+    this.wlLocks.set(phone, tail);
+    void tail.then(() => { if (this.wlLocks.get(phone) === tail) this.wlLocks.delete(phone); });
+    return result;
+  }
+
+  /** QA round-7: CAS - invited -> entry, one winner only, serialized per
+   *  phone through withWhitelistLock. The winner's committed audit row is
+   *  appended via the AWAITED sink inside the same unit: a REJECTING sink
+   *  (Promise.reject included) is caught here and rolls back the EXACT prior
+   *  entry object, never a reconstruction - no stale rollback, no escaped
+   *  rejection, and the rollback always lands BEFORE any queued admin
+   *  mutation for the phone. A loser never mutates anything. */
   async commitWhitelistRegistration(
     entry: WhitelistEntry,
     audit: { phone: string; kind: string; detail?: unknown },
     appendAudit?: (a: { phone: string; kind: string; detail?: unknown }) => void | Promise<void>,
   ): Promise<'applied' | 'duplicate'> {
-    const cur = this.whitelist.get(entry.phone);
-    if (!cur || cur.status !== 'invited') return 'duplicate';
-    this.whitelist.set(entry.phone, entry);
-    try {
-      await appendAudit?.(audit);
-    } catch (e) {
-      this.whitelist.set(entry.phone, cur);
-      throw e;
-    }
-    return 'applied';
+    return this.withWhitelistLock(entry.phone, async () => {
+      const cur = this.whitelist.get(entry.phone);
+      if (!cur || cur.status !== 'invited') return 'duplicate';
+      this.whitelist.set(entry.phone, entry);
+      try {
+        await appendAudit?.(audit);
+      } catch (e) {
+        this.whitelist.set(entry.phone, cur);
+        throw e;
+      }
+      return 'applied';
+    });
   }
   async listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]> {
     return [...this.whitelist.values()].filter(e => e.orgId === orgId && (!status || e.status === status));

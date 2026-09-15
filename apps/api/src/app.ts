@@ -183,20 +183,25 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { phone } = (req.body ?? {}) as { phone?: string };
     if (!phone) fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
     wlDeny(user, 'whitelist.invite', phone);
-    const now = new Date().toISOString();
-    const before = await repo.getWhitelistEntry(phone);
-    // Upsert: re-invite resets to invited and clears decision fields (§15).
-    const entry: WhitelistEntry = { phone, status: 'invited', orgId: user.orgId, createdAt: before?.createdAt ?? now };
-    await withAuditSafety(repo, async () => {
-      await repo.upsertWhitelistEntry(entry);
-      await audit(repo, {
-        orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
-        action: 'whitelist.invite', entityType: 'whitelist_entry', entityId: phone,
-        before, after: entry, deviceClass: deviceClassOf(ua(req)),
+    // QA round-7: the WHOLE invite mutation runs under the repository's
+    // per-phone lock - it can never interleave a paused or rolling-back
+    // registration for the same phone (memory mutex; PG passthrough).
+    return repo.withWhitelistLock(phone, async () => {
+      const now = new Date().toISOString();
+      const before = await repo.getWhitelistEntry(phone);
+      // Upsert: re-invite resets to invited and clears decision fields (§15).
+      const entry: WhitelistEntry = { phone, status: 'invited', orgId: user.orgId, createdAt: before?.createdAt ?? now };
+      await withAuditSafety(repo, async () => {
+        await repo.upsertWhitelistEntry(entry);
+        await audit(repo, {
+          orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+          action: 'whitelist.invite', entityType: 'whitelist_entry', entityId: phone,
+          before, after: entry, deviceClass: deviceClassOf(ua(req)),
+        });
       });
+      appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
+      return entry;
     });
-    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
-    return entry;
   });
 
   app.get('/v1/whitelist', async (req) => {
@@ -212,35 +217,38 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { phone } = req.params as { phone: string };
     const body = (req.body ?? {}) as { role?: UserRecord['role']; linkedResourceId?: ID };
     wlDeny(user, 'whitelist.approve', phone);
-    const before = await repo.getWhitelistEntry(phone);
-    if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
-    if (!body.role || !['admin', 'field_manager', 'focus_worker'].includes(body.role)) fail(400, 'BAD_REQUEST', 'חסר תפקיד לאישור');
-    if (body.role === 'focus_worker' && !body.linkedResourceId) fail(400, 'BAD_REQUEST', 'עובד מיקוד דורש קישור למשאב');
-    // Create or bind the user account: role is ADMIN-assigned (requestedRole advisory).
-    const existing = await repo.findUserByPhone(phone);
-    const account = existing
-      ? await repo.updateUser(existing.userId, { role: body.role, ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}), active: true })
-      : await repo.createUser({
-          userId: newId('u'), orgId: user.orgId, name: before.displayName ?? phone,
-          role: body.role, scopes: [], phone,
-          ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}), active: true,
+    // QA round-7: approve runs under the same per-phone repository lock.
+    return repo.withWhitelistLock(phone, async () => {
+      const before = await repo.getWhitelistEntry(phone);
+      if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
+      if (!body.role || !['admin', 'field_manager', 'focus_worker'].includes(body.role)) fail(400, 'BAD_REQUEST', 'חסר תפקיד לאישור');
+      if (body.role === 'focus_worker' && !body.linkedResourceId) fail(400, 'BAD_REQUEST', 'עובד מיקוד דורש קישור למשאב');
+      // Create or bind the user account: role is ADMIN-assigned (requestedRole advisory).
+      const existing = await repo.findUserByPhone(phone);
+      const account = existing
+        ? await repo.updateUser(existing.userId, { role: body.role, ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}), active: true })
+        : await repo.createUser({
+            userId: newId('u'), orgId: user.orgId, name: before.displayName ?? phone,
+            role: body.role, scopes: [], phone,
+            ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}), active: true,
+          });
+      const now = new Date().toISOString();
+      const entry: WhitelistEntry = {
+        ...before, status: 'approved', assignedRole: body.role,
+        ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}),
+        decidedBy: user.userId, decidedAt: now,
+      };
+      await withAuditSafety(repo, async () => {
+        await repo.upsertWhitelistEntry(entry);
+        await audit(repo, {
+          orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+          action: 'whitelist.approve', entityType: 'whitelist_entry', entityId: phone,
+          before, after: entry, deviceClass: deviceClassOf(ua(req)),
         });
-    const now = new Date().toISOString();
-    const entry: WhitelistEntry = {
-      ...before, status: 'approved', assignedRole: body.role,
-      ...(body.linkedResourceId ? { linkedResourceId: body.linkedResourceId } : {}),
-      decidedBy: user.userId, decidedAt: now,
-    };
-    await withAuditSafety(repo, async () => {
-      await repo.upsertWhitelistEntry(entry);
-      await audit(repo, {
-        orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
-        action: 'whitelist.approve', entityType: 'whitelist_entry', entityId: phone,
-        before, after: entry, deviceClass: deviceClassOf(ua(req)),
       });
+      appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
+      return { entry, user: account };
     });
-    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
-    return { entry, user: account };
   });
 
   app.post('/v1/whitelist/:phone/reject', async (req) => {
@@ -248,22 +256,25 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { phone } = req.params as { phone: string };
     const { reasonHe } = (req.body ?? {}) as { reasonHe?: string };
     wlDeny(user, 'whitelist.reject', phone);
-    const before = await repo.getWhitelistEntry(phone);
-    if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
-    const entry: WhitelistEntry = {
-      ...before, status: 'rejected', decidedBy: user.userId, decidedAt: new Date().toISOString(),
-      ...(reasonHe ? { rejectedReasonHe: reasonHe } : {}),
-    };
-    await withAuditSafety(repo, async () => {
-      await repo.upsertWhitelistEntry(entry);
-      await audit(repo, {
-        orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
-        action: 'whitelist.reject', entityType: 'whitelist_entry', entityId: phone,
-        before, after: entry, deviceClass: deviceClassOf(ua(req)),
+    // QA round-7: reject runs under the same per-phone repository lock.
+    return repo.withWhitelistLock(phone, async () => {
+      const before = await repo.getWhitelistEntry(phone);
+      if (!before || before.status !== 'pending_approval') fail(409, 'WHITELIST_NOT_PENDING', 'הבקשה אינה ממתינה לאישור');
+      const entry: WhitelistEntry = {
+        ...before, status: 'rejected', decidedBy: user.userId, decidedAt: new Date().toISOString(),
+        ...(reasonHe ? { rejectedReasonHe: reasonHe } : {}),
+      };
+      await withAuditSafety(repo, async () => {
+        await repo.upsertWhitelistEntry(entry);
+        await audit(repo, {
+          orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+          action: 'whitelist.reject', entityType: 'whitelist_entry', entityId: phone,
+          before, after: entry, deviceClass: deviceClassOf(ua(req)),
+        });
       });
+      appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
+      return entry;
     });
-    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry });
-    return entry;
   });
 
   // Public (unauthenticated) auth endpoints.

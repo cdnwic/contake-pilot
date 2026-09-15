@@ -140,6 +140,15 @@ export interface GraphRepository {
     audit: { phone: string; kind: string; detail?: unknown },
     appendAudit?: (a: { phone: string; kind: string; detail?: unknown }) => void | Promise<void>,
   ): Promise<'applied' | 'duplicate'>;
+
+  /** QA round-7: per-phone serialization for EVERY whitelist mutation
+   *  (invite, register CAS, approve, reject). Memory: a promise-chain mutex -
+   *  a mutation starts only after the previous mutation for the same phone
+   *  fully settled (applied OR rolled back), so a paused/rejected
+   *  registration audit can never interleave with an admin mutation and roll
+   *  back over its later state. PG: passthrough (row locks + CAS own
+   *  concurrency there, QA-signed). */
+  withWhitelistLock<T>(phone: string, fn: () => Promise<T> | T): Promise<T>;
   listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]>;
 
   // audit (append-only by construction: no update/delete methods exist, QA AC-AUD-2)
