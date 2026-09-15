@@ -317,16 +317,23 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       fail(409, 'WHITELIST_NOT_INVITED', 'הבקשה אינה פתוחה לרישום');
     }
     const next: WhitelistEntry = { ...entry, status: 'pending_approval', displayName: body.displayName, requestedRole: body.requestedRole };
-    // QA gate (round 4): the pre-write row records the ACCEPTED request (fail
-    // loud - a failed append aborts before any mutation). The upsert and the
-    // committed SUCCESS row commit ATOMICALLY (PG: one tx; memory: synchronous
-    // pair + compensating rollback): no false success ledger, no pending state
-    // without its success record, and a failed pair leaves the entry invited so
-    // a retry is unambiguous and exactly-once.
+    // QA gate (round 5): the pre-write row records the ACCEPTED request (fail
+    // loud - a failed append aborts before any mutation). The transition and
+    // the committed SUCCESS row then commit as ONE repository-level CAS unit
+    // (PG: UPDATE ... WHERE status='invited' + INSERT in one tx; memory: one
+    // synchronous block with exact-prior-object restore): no false success
+    // ledger, exactly one winner under concurrency, and a failed unit leaves
+    // the entry invited so a retry is unambiguous.
     await wlAudit(req, phone, 'whitelist.register', 'accepted', 'pending_approval');
-    await auth.commitWhitelistRegistration(next, 'whitelist.register', {
+    const commit = await auth.commitWhitelistRegistration(next, 'whitelist.register', {
       outcome: 'success', reasonCode: 'committed', deviceClass: deviceClassOf(ua(req)), requestId: String(req.id),
     });
+    if (commit === 'duplicate') {
+      // Deterministic loser: a concurrent winner took the transition - no
+      // state write and no committed row from this request.
+      await wlAudit(req, phone, 'whitelist.register', 'duplicate', 'concurrent_lost');
+      fail(409, 'WHITELIST_NOT_INVITED', 'הבקשה אינה פתוחה לרישום');
+    }
     // NOTE: no audit_log row for this unauthenticated transition (AuditLogEntry.role
     // is the strict Role union and a fabricated role would corrupt QA's AC-AUD
     // trail). The immutable record lives in auth_audit (appended above, QA

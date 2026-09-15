@@ -93,4 +93,32 @@ run('whitelist route-level PG audit (real HTTP, PGlite)', () => {
     rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
     expect(rows.filter(r => detail(r).reasonCode === 'committed')).toHaveLength(1); // exactly once
   });
+
+  it('round-5 PG concurrency: Promise.all same-phone register yields exactly one winner, one committed row, deterministic loser', async () => {
+    liveDb = new PGlite();
+    const db = pgliteConnectable(liveDb);
+    const repo = await PostgresGraphRepository.create(db);
+    await repo.createUser({ userId: 'u-admin', orgId: 'org-1', name: 'מנהל', role: 'admin', scopes: [], email: 'admin@x.local', passwordHash: hashPasswordPure('admin123'), active: true });
+    const otp = await createPgOtpState(db);
+    app = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
+    const admin = (await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: 'admin@x.local', password: 'admin123' } })).json().token as string;
+    const H = { authorization: `Bearer ${admin}` };
+    const phone = '+972500999042';
+    expect((await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H, payload: { phone } })).statusCode).toBe(200);
+    // Distinct names close the idempotent branch for the loser: 200/409 in every interleaving
+    const [a, b] = await Promise.all([
+      app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מתמודד א', requestedRole: 'field_manager' } }),
+      app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מתמודד ב', requestedRole: 'field_manager' } }),
+    ]);
+    expect([a.statusCode, b.statusCode].sort((x, y) => x - y)).toEqual([200, 409]);
+    expect((a.statusCode === 409 ? a : b).json().error.code).toBe('WHITELIST_NOT_INVITED');
+    const entry = (await repo.getWhitelistEntry(phone))!;
+    expect(entry.status).toBe('pending_approval'); // exactly one transition, winner intact
+    expect(['מתמודד א', 'מתמודד ב']).toContain(entry.displayName);
+    const det = (r: { detail?: unknown }) => r.detail as { outcome?: string; reasonCode?: string };
+    const rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(rows.filter(r => det(r).reasonCode === 'committed')).toHaveLength(1); // exactly one committed row
+    expect(rows.filter(r => det(r).outcome === 'accepted').length).toBeGreaterThanOrEqual(1);
+    expect(rows.filter(r => det(r).reasonCode === 'concurrent_lost').length + rows.filter(r => det(r).reasonCode === 'not_invited').length).toBe(1);
+  });
 });

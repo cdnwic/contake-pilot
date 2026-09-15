@@ -190,15 +190,21 @@ export class PostgresGraphRepository implements GraphRepository {
     const r = await this.q(`SELECT data FROM whitelist_entries WHERE phone=$1 LIMIT 1`, [phone]);
     return r.rows[0]?.['data'] as WhitelistEntry | undefined;
   }
-  /** QA round-4 atomic unit: upsert + committed auth_audit insert run inside
-   *  ONE runInTx on the ambient client. A failed audit insert ROLLBACKs the
-   *  upsert (state stays invited, no success row), and a committed upsert can
-   *  never miss its success record - retry after a failure is unambiguous and
-   *  exactly-once. */
-  async commitWhitelistRegistration(entry: WhitelistEntry, audit: AuthAuditEntry): Promise<void> {
-    await this.runInTx(async () => {
-      await this.upsertWhitelistEntry(entry);
+  /** QA round-5 CAS primitive: the transition applies ONLY while the row is
+   *  still 'invited' (UPDATE ... WHERE status='invited' RETURNING). A
+   *  concurrent register blocks on the row lock, re-evaluates after the
+   *  winner's COMMIT, matches zero rows and loses deterministically - exactly
+   *  one transition. The committed audit row is inserted for the winner only,
+   *  inside the same tx, so a failed insert ROLLBACKs the transition (state
+   *  stays invited, no success row) and retry is unambiguous. */
+  async commitWhitelistRegistration(entry: WhitelistEntry, audit: AuthAuditEntry): Promise<'applied' | 'duplicate'> {
+    return this.runInTx(async () => {
+      const r = await this.q(
+        `UPDATE whitelist_entries SET org_id=$2, status=$3, data=$4 WHERE phone=$1 AND status='invited' RETURNING phone`,
+        [entry.phone, entry.orgId, entry.status, JSON.stringify(entry)]);
+      if (r.rows.length === 0) return 'duplicate';
       await this.q(`INSERT INTO auth_audit(phone, kind, data) VALUES($1,$2,$3)`, [audit.phone, audit.kind, audit.detail ?? null]);
+      return 'applied';
     });
   }
   async listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]> {

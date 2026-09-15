@@ -124,12 +124,20 @@ export interface GraphRepository {
   /** Upsert on phone - invite reset and seed share this path (idempotent). */
   upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry>;
   getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined>;
-  /** QA round-4 atomic unit (PG): whitelist upsert + committed auth_audit row
-   *  in ONE transaction - the pair lives or dies together, so the ledger can
-   *  never claim success for an uncommitted write nor lose the success record
-   *  of a committed one. Absent on the memory repo; AuthService falls back to
-   *  a synchronous pair with compensating rollback there. */
-  commitWhitelistRegistration?(entry: WhitelistEntry, audit: { phone: string; kind: string; detail?: unknown }): Promise<void>;
+  /** QA round-5 CAS registration primitive: atomically transition ONLY a
+   *  status='invited' entry and append the committed auth_audit row for the
+   *  winner alone. 'applied' = this call won the transition; 'duplicate' =
+   *  the entry was no longer invited (concurrent winner or other state) and
+   *  nothing was written. Identical semantics on both adapters:
+   *  PG = UPDATE ... WHERE status='invited' + INSERT in one tx; memory = one
+   *  synchronous block (single-threaded = atomic) with exact-prior-object
+   *  restore if the audit sink throws. `appendAudit` is the memory path's
+   *  synchronous winner-only audit sink; PG ignores it (own INSERT). */
+  commitWhitelistRegistration(
+    entry: WhitelistEntry,
+    audit: { phone: string; kind: string; detail?: unknown },
+    appendAudit?: (a: { phone: string; kind: string; detail?: unknown }) => void,
+  ): Promise<'applied' | 'duplicate'>;
   listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]>;
 
   // audit (append-only by construction: no update/delete methods exist, QA AC-AUD-2)

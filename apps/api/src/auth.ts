@@ -181,27 +181,17 @@ export class AuthService {
     await this.otpStore.appendAuthAudit({ phone, kind, detail });
   }
 
-  /** QA round-4: commit the whitelist registration ATOMICALLY with its
-   *  committed auth_audit row. PG repos run both writes in one transaction
-   *  (PostgresGraphRepository.commitWhitelistRegistration). The memory path is
-   *  a synchronous pair (no interleaving between the mutations on one thread)
-   *  with compensating rollback: if the audit append fails, the upsert is
-   *  undone, so a failure never leaves a pending state without its success
-   *  record - and a success row can never precede the write it certifies. */
-  async commitWhitelistRegistration(entry: WhitelistEntry, kind: string, detail: Record<string, unknown>): Promise<void> {
-    const atomic = this.repo.commitWhitelistRegistration;
-    if (typeof atomic === 'function') {
-      await atomic.call(this.repo, entry, { phone: entry.phone, kind, detail });
-      return;
-    }
-    const before = await this.repo.getWhitelistEntry(entry.phone);
-    await this.repo.upsertWhitelistEntry(entry);
-    try {
-      await this.otpStore.appendAuthAudit({ phone: entry.phone, kind, detail });
-    } catch (e) {
-      if (before) await this.repo.upsertWhitelistEntry(before);
-      throw e;
-    }
+  /** QA round-5: delegate to the repository CAS primitive - the
+   *  invited->pending transition and the winner-only committed audit row are
+   *  one atomic unit per adapter (PG: CAS UPDATE + INSERT in one tx; memory:
+   *  one synchronous block with exact-prior-object restore on sink failure).
+   *  No compensation logic lives here. The sink is used ONLY by the memory
+   *  repo; the memory store's appendAuthAudit body is synchronous, so the push
+   *  lands inside the primitive's atomic block (a synchronous throw from an
+   *  injected double propagates the same way). */
+  async commitWhitelistRegistration(entry: WhitelistEntry, kind: string, detail: Record<string, unknown>): Promise<'applied' | 'duplicate'> {
+    const audit = { phone: entry.phone, kind, detail };
+    return this.repo.commitWhitelistRegistration(entry, audit, a => { void this.otpStore.appendAuthAudit(a); });
   }
 
   /** v1.18 §15: whitelist-gated phone login. Approved entries log in with NO

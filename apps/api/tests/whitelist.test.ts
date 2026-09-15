@@ -209,6 +209,30 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     })).toBe(true);
   });
 
+  it('round-5 concurrency: Promise.all same-phone register yields exactly one winner, one committed row, deterministic loser', async () => {
+    const admin = await adminLogin();
+    const phone = '+972500999033';
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
+    // Distinct names close the idempotent-resubmit branch for the loser: every
+    // interleaving ends 200/409 deterministically.
+    const [a, b] = await Promise.all([
+      app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מתמודד א', requestedRole: 'focus_worker' } }),
+      app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מתמודד ב', requestedRole: 'focus_worker' } }),
+    ]);
+    expect([a.statusCode, b.statusCode].sort((x, y) => x - y)).toEqual([200, 409]);
+    const loser = a.statusCode === 409 ? a : b;
+    expect(loser.json().error.code).toBe('WHITELIST_NOT_INVITED');
+    // exactly one state transition, never a stale rollback of the winner
+    const entry = (await repo.getWhitelistEntry(phone))!;
+    expect(entry.status).toBe('pending_approval');
+    expect(['מתמודד א', 'מתמודד ב']).toContain(entry.displayName);
+    const rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    const det = (r: { detail?: unknown }) => r.detail as { outcome?: string; reasonCode?: string };
+    expect(rows.filter(r => det(r).reasonCode === 'committed')).toHaveLength(1); // exactly one committed row
+    expect(rows.filter(r => det(r).outcome === 'accepted').length).toBeGreaterThanOrEqual(1); // every attempt that reaches commit records accepted
+    expect(rows.filter(r => det(r).reasonCode === 'concurrent_lost') .length + rows.filter(r => det(r).reasonCode === 'not_invited').length).toBe(1); // one deterministic loser record
+  });
+
   it('round-4 atomicity: failed committed append rolls the mutation back; retry is exactly-once', async () => {
     const admin = await adminLogin();
     const phone = '+972500999032';
@@ -217,9 +241,11 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     const flaky = memoryOtpState();
     const orig = flaky.appendAuthAudit.bind(flaky);
     let calls = 0;
+    // The memory CAS sink is synchronous, so the double must THROW synchronously
     flaky.appendAuthAudit = (e: { phone: string; kind: string; detail?: unknown }) => {
       calls += 1;
-      return calls === 2 ? Promise.reject(new Error('auth_audit store down mid-commit')) : orig(e);
+      if (calls === 2) throw new Error('auth_audit store down mid-commit');
+      return orig(e);
     };
     const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, flaky));
     // attempt 1: accepted row lands, upsert+committed pair fails -> rolled back
