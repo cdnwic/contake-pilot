@@ -53,21 +53,23 @@ export class MemoryGraphRepository implements GraphRepository {
   // whitelist onboarding (v1.18 §15)
   async upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry> { this.whitelist.set(e.phone, e); return e; }
   async getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined> { return this.whitelist.get(phone); }
-  /** QA round-5: synchronous CAS - invited -> entry, one winner only. The
-   *  winner's committed audit row is appended via the sink inside the SAME
-   *  synchronous block (single-threaded = no interleaving); a throwing sink
-   *  restores the EXACT prior entry object, never a reconstruction, so no
-   *  stale rollback is possible. A loser never mutates anything. */
+  /** QA round-6: CAS - invited -> entry, one winner only. The winner's
+   *  committed audit row is appended via the AWAITED sink inside the same
+   *  unit: a REJECTING sink (Promise.reject included) is caught here and
+   *  rolls back the EXACT prior entry object, never a reconstruction - no
+   *  stale rollback, no escaped rejection. The await is a yield point, so
+   *  callers must serialize same-phone calls (AuthService does); a loser
+   *  never mutates anything. */
   async commitWhitelistRegistration(
     entry: WhitelistEntry,
     audit: { phone: string; kind: string; detail?: unknown },
-    appendAudit?: (a: { phone: string; kind: string; detail?: unknown }) => void,
+    appendAudit?: (a: { phone: string; kind: string; detail?: unknown }) => void | Promise<void>,
   ): Promise<'applied' | 'duplicate'> {
     const cur = this.whitelist.get(entry.phone);
     if (!cur || cur.status !== 'invited') return 'duplicate';
     this.whitelist.set(entry.phone, entry);
     try {
-      appendAudit?.(audit);
+      await appendAudit?.(audit);
     } catch (e) {
       this.whitelist.set(entry.phone, cur);
       throw e;

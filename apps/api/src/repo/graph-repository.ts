@@ -130,13 +130,15 @@ export interface GraphRepository {
    *  the entry was no longer invited (concurrent winner or other state) and
    *  nothing was written. Identical semantics on both adapters:
    *  PG = UPDATE ... WHERE status='invited' + INSERT in one tx; memory = one
-   *  synchronous block (single-threaded = atomic) with exact-prior-object
-   *  restore if the audit sink throws. `appendAudit` is the memory path's
-   *  synchronous winner-only audit sink; PG ignores it (own INSERT). */
+   *  synchronous CAS + AWAITED winner-only audit sink: a rejecting sink is
+   *  caught and rolls back the exact prior object (QA round-6: the sink is
+   *  async so no Promise rejection can escape the try/catch; AuthService
+   *  serializes same-phone calls across the await). `appendAudit` is the
+   *  memory path's winner-only audit sink; PG ignores it (own INSERT). */
   commitWhitelistRegistration(
     entry: WhitelistEntry,
     audit: { phone: string; kind: string; detail?: unknown },
-    appendAudit?: (a: { phone: string; kind: string; detail?: unknown }) => void,
+    appendAudit?: (a: { phone: string; kind: string; detail?: unknown }) => void | Promise<void>,
   ): Promise<'applied' | 'duplicate'>;
   listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]>;
 

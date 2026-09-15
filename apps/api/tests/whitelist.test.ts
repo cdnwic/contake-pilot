@@ -241,12 +241,15 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     const flaky = memoryOtpState();
     const orig = flaky.appendAuthAudit.bind(flaky);
     let calls = 0;
-    // The memory CAS sink is synchronous, so the double must THROW synchronously
+    // QA round-6 contract: the double REJECTS asynchronously - the awaited
+    // sink must catch it (rollback) with NO unhandled rejection escaping
     flaky.appendAuthAudit = (e: { phone: string; kind: string; detail?: unknown }) => {
       calls += 1;
-      if (calls === 2) throw new Error('auth_audit store down mid-commit');
-      return orig(e);
+      return calls === 2 ? Promise.reject(new Error('auth_audit store down mid-commit')) : orig(e);
     };
+    const unhandled: unknown[] = [];
+    const onRej = (r: unknown): void => { unhandled.push(r); };
+    process.on('unhandledRejection', onRej);
     const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, flaky));
     // attempt 1: accepted row lands, upsert+committed pair fails -> rolled back
     const r1 = await app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'חדש', requestedRole: 'focus_worker' } });
@@ -262,6 +265,9 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     expect((await repo.getWhitelistEntry(phone))!.status).toBe('pending_approval');
     rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
     expect(rows.filter(r => detail(r).reasonCode === 'committed')).toHaveLength(1); // exactly once
+    await new Promise(r => setImmediate(r)); // let any stray rejection surface
+    process.off('unhandledRejection', onRej);
+    expect(unhandled).toHaveLength(0); // no escaped rejection
     await app2.close();
   });
 

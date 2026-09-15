@@ -181,17 +181,24 @@ export class AuthService {
     await this.otpStore.appendAuthAudit({ phone, kind, detail });
   }
 
-  /** QA round-5: delegate to the repository CAS primitive - the
-   *  invited->pending transition and the winner-only committed audit row are
-   *  one atomic unit per adapter (PG: CAS UPDATE + INSERT in one tx; memory:
-   *  one synchronous block with exact-prior-object restore on sink failure).
-   *  No compensation logic lives here. The sink is used ONLY by the memory
-   *  repo; the memory store's appendAuthAudit body is synchronous, so the push
-   *  lands inside the primitive's atomic block (a synchronous throw from an
-   *  injected double propagates the same way). */
+  /** QA round-6: delegate to the repository CAS primitive and SERIALIZE
+   *  same-phone registrations across the primitive's sink await: a second
+   *  call for the same phone starts only after the first fully settled
+   *  (applied or rolled back), so exactly one winner exists and the loser
+   *  result is deterministic. The sink promise is awaited inside the
+   *  primitive's try/catch - a Promise.reject can no longer escape as an
+   *  unhandled rejection (round-6 contract fix). PG ignores the sink. */
+  private readonly registrationChain = new Map<string, Promise<void>>();
+
   async commitWhitelistRegistration(entry: WhitelistEntry, kind: string, detail: Record<string, unknown>): Promise<'applied' | 'duplicate'> {
     const audit = { phone: entry.phone, kind, detail };
-    return this.repo.commitWhitelistRegistration(entry, audit, a => { void this.otpStore.appendAuthAudit(a); });
+    const phone = entry.phone;
+    const prev = this.registrationChain.get(phone) ?? Promise.resolve();
+    const result = prev.then(() => this.repo.commitWhitelistRegistration(entry, audit, a => this.otpStore.appendAuthAudit(a)));
+    const tail = result.then(() => undefined, () => undefined);
+    this.registrationChain.set(phone, tail);
+    void tail.then(() => { if (this.registrationChain.get(phone) === tail) this.registrationChain.delete(phone); });
+    return result;
   }
 
   /** v1.18 §15: whitelist-gated phone login. Approved entries log in with NO
