@@ -209,6 +209,36 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     })).toBe(true);
   });
 
+  it('round-4 atomicity: failed committed append rolls the mutation back; retry is exactly-once', async () => {
+    const admin = await adminLogin();
+    const phone = '+972500999032';
+    await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
+    // Store that fails only on its SECOND append (the committed write, mid-commit)
+    const flaky = memoryOtpState();
+    const orig = flaky.appendAuthAudit.bind(flaky);
+    let calls = 0;
+    flaky.appendAuthAudit = (e: { phone: string; kind: string; detail?: unknown }) => {
+      calls += 1;
+      return calls === 2 ? Promise.reject(new Error('auth_audit store down mid-commit')) : orig(e);
+    };
+    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, flaky));
+    // attempt 1: accepted row lands, upsert+committed pair fails -> rolled back
+    const r1 = await app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'חדש', requestedRole: 'focus_worker' } });
+    expect(r1.statusCode).toBe(500);
+    expect((await repo.getWhitelistEntry(phone))!.status).toBe('invited'); // compensating rollback
+    const detail = (r: { detail?: unknown }) => r.detail as { outcome?: string; reasonCode?: string };
+    let rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(rows.some(r => detail(r).outcome === 'accepted')).toBe(true); // request record survives
+    expect(rows.some(r => detail(r).outcome === 'success')).toBe(false); // NO false success ledger
+    // retry (healthy store): unambiguous - entry is invited again
+    const r2 = await app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'חדש', requestedRole: 'focus_worker' } });
+    expect(r2.statusCode).toBe(200);
+    expect((await repo.getWhitelistEntry(phone))!.status).toBe('pending_approval');
+    rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(rows.filter(r => detail(r).reasonCode === 'committed')).toHaveLength(1); // exactly once
+    await app2.close();
+  });
+
   it('injected appendWhitelistAudit failure fails LOUD (500) and aborts the mutation - no silent drop', async () => {
     const admin = await adminLogin();
     await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone: '+972500999030' } });

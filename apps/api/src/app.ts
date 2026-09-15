@@ -317,14 +317,16 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       fail(409, 'WHITELIST_NOT_INVITED', 'הבקשה אינה פתוחה לרישום');
     }
     const next: WhitelistEntry = { ...entry, status: 'pending_approval', displayName: body.displayName, requestedRole: body.requestedRole };
-    // QA gate (round 3): TWO audit rows with distinct semantics. The pre-write
-    // row records the ACCEPTED request (fail loud - a failed append aborts the
-    // mutation, never a state change without its immutable record). The
-    // committed SUCCESS row is appended only AFTER the upsert lands, so a
-    // failed write can never produce a false success ledger.
+    // QA gate (round 4): the pre-write row records the ACCEPTED request (fail
+    // loud - a failed append aborts before any mutation). The upsert and the
+    // committed SUCCESS row commit ATOMICALLY (PG: one tx; memory: synchronous
+    // pair + compensating rollback): no false success ledger, no pending state
+    // without its success record, and a failed pair leaves the entry invited so
+    // a retry is unambiguous and exactly-once.
     await wlAudit(req, phone, 'whitelist.register', 'accepted', 'pending_approval');
-    await repo.upsertWhitelistEntry(next);
-    await wlAudit(req, phone, 'whitelist.register', 'success', 'committed');
+    await auth.commitWhitelistRegistration(next, 'whitelist.register', {
+      outcome: 'success', reasonCode: 'committed', deviceClass: deviceClassOf(ua(req)), requestId: String(req.id),
+    });
     // NOTE: no audit_log row for this unauthenticated transition (AuditLogEntry.role
     // is the strict Role union and a fabricated role would corrupt QA's AC-AUD
     // trail). The immutable record lives in auth_audit (appended above, QA

@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import type { ID, Principal, Role, Scope, WhitelistStatus } from '@contake/core';
+import type { ID, Principal, Role, Scope, WhitelistEntry, WhitelistStatus } from '@contake/core';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
 
 /**
@@ -179,6 +179,29 @@ export class AuthService {
    *  admin-mutations only (its role field is the strict Role union). */
   async appendWhitelistAudit(phone: string, kind: string, detail: Record<string, unknown>): Promise<void> {
     await this.otpStore.appendAuthAudit({ phone, kind, detail });
+  }
+
+  /** QA round-4: commit the whitelist registration ATOMICALLY with its
+   *  committed auth_audit row. PG repos run both writes in one transaction
+   *  (PostgresGraphRepository.commitWhitelistRegistration). The memory path is
+   *  a synchronous pair (no interleaving between the mutations on one thread)
+   *  with compensating rollback: if the audit append fails, the upsert is
+   *  undone, so a failure never leaves a pending state without its success
+   *  record - and a success row can never precede the write it certifies. */
+  async commitWhitelistRegistration(entry: WhitelistEntry, kind: string, detail: Record<string, unknown>): Promise<void> {
+    const atomic = this.repo.commitWhitelistRegistration;
+    if (typeof atomic === 'function') {
+      await atomic.call(this.repo, entry, { phone: entry.phone, kind, detail });
+      return;
+    }
+    const before = await this.repo.getWhitelistEntry(entry.phone);
+    await this.repo.upsertWhitelistEntry(entry);
+    try {
+      await this.otpStore.appendAuthAudit({ phone: entry.phone, kind, detail });
+    } catch (e) {
+      if (before) await this.repo.upsertWhitelistEntry(before);
+      throw e;
+    }
   }
 
   /** v1.18 §15: whitelist-gated phone login. Approved entries log in with NO

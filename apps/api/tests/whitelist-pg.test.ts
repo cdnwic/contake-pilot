@@ -64,4 +64,33 @@ run('whitelist route-level PG audit (real HTTP, PGlite)', () => {
       expect((r.detail as Record<string, unknown>)['requestId']).toBeTruthy();
     }
   });
+
+  it('round-4 PG atomicity: committed-insert failure rolls the upsert back in one tx; retry exactly-once', async () => {
+    liveDb = new PGlite();
+    const db = pgliteConnectable(liveDb);
+    const repo = await PostgresGraphRepository.create(db);
+    await repo.createUser({ userId: 'u-admin', orgId: 'org-1', name: 'מנהל', role: 'admin', scopes: [], email: 'admin@x.local', passwordHash: hashPasswordPure('admin123'), active: true });
+    const otp = await createPgOtpState(db);
+    app = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
+    const admin = (await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: 'admin@x.local', password: 'admin123' } })).json().token as string;
+    const H = { authorization: `Bearer ${admin}` };
+    const phone = '+972500999041';
+    expect((await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H, payload: { phone } })).statusCode).toBe(200);
+    // Trigger fails ONLY the committed insert: accepted lands, upsert+committed tx aborts
+    await liveDb.query(`CREATE OR REPLACE FUNCTION fail_committed_audit() RETURNS trigger AS $fn$ BEGIN RAISE EXCEPTION 'injected committed-audit failure'; END; $fn$ LANGUAGE plpgsql`);
+    await liveDb.query(`CREATE TRIGGER fail_committed BEFORE INSERT ON auth_audit FOR EACH ROW WHEN (NEW.kind = 'whitelist.register' AND NEW.data->>'reasonCode' = 'committed') EXECUTE FUNCTION fail_committed_audit()`);
+    const r1 = await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'פלוני', requestedRole: 'field_manager' } });
+    expect(r1.statusCode).toBe(500);
+    expect((await repo.getWhitelistEntry(phone))!.status).toBe('invited'); // tx ROLLBACK: no ambiguous pending
+    const detail = (r: { detail?: unknown }) => r.detail as { outcome?: string; reasonCode?: string };
+    let rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(rows.some(r => detail(r).outcome === 'accepted')).toBe(true);
+    expect(rows.some(r => detail(r).outcome === 'success')).toBe(false); // no false success row persisted
+    await liveDb.query('DROP TRIGGER fail_committed ON auth_audit');
+    const r2 = await app.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'פלוני', requestedRole: 'field_manager' } });
+    expect(r2.statusCode).toBe(200);
+    expect((await repo.getWhitelistEntry(phone))!.status).toBe('pending_approval');
+    rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    expect(rows.filter(r => detail(r).reasonCode === 'committed')).toHaveLength(1); // exactly once
+  });
 });

@@ -190,6 +190,17 @@ export class PostgresGraphRepository implements GraphRepository {
     const r = await this.q(`SELECT data FROM whitelist_entries WHERE phone=$1 LIMIT 1`, [phone]);
     return r.rows[0]?.['data'] as WhitelistEntry | undefined;
   }
+  /** QA round-4 atomic unit: upsert + committed auth_audit insert run inside
+   *  ONE runInTx on the ambient client. A failed audit insert ROLLBACKs the
+   *  upsert (state stays invited, no success row), and a committed upsert can
+   *  never miss its success record - retry after a failure is unambiguous and
+   *  exactly-once. */
+  async commitWhitelistRegistration(entry: WhitelistEntry, audit: AuthAuditEntry): Promise<void> {
+    await this.runInTx(async () => {
+      await this.upsertWhitelistEntry(entry);
+      await this.q(`INSERT INTO auth_audit(phone, kind, data) VALUES($1,$2,$3)`, [audit.phone, audit.kind, audit.detail ?? null]);
+    });
+  }
   async listWhitelist(orgId: ID, status?: WhitelistStatus): Promise<WhitelistEntry[]> {
     const r = status
       ? await this.q(`SELECT data FROM whitelist_entries WHERE org_id=$1 AND status=$2`, [orgId, status])
