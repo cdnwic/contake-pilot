@@ -14,6 +14,7 @@ import { AuthService } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
 import { auditDenied, type DenialMeta, audit, deviceClassOf } from './services/audit.js';
+import type { AuditEntityType, Branch, ContentItem, ExternalParty, StatusToken, TaskContentRole, TaskResourceLink } from '@contake/core';
 import { buildApprovalNeededJob, recordJobs } from './services/notify.js';
 
 declare module 'fastify' {
@@ -93,6 +94,9 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
 
   app.addHook('onRequest', async (req, reply) => {
     if (req.url.startsWith('/v1/auth/') || req.url === '/v1/health') return;
+    // v1.20: token-gated guest surface (§22 G6) and provider-webhook intake (§25)
+    // authenticate by their own secrets, not by user session.
+    if (req.url.startsWith('/v1/public/status/') || req.url === '/v1/webhooks/inbound') return;
     const header = req.headers.authorization;
     const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
     const user = await auth.authenticate(token);
@@ -1009,6 +1013,17 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       });
       return { report, changeRequest: cr };
     });
+    // v1.20 §24: a blocked field report raises a manager-surface job (surface only, no push).
+    if (report.status === 'blocked') {
+      const admins = (await repo.listUsers(user.orgId)).filter(u => u.role === 'admin' && u.active);
+      await repo.createNotificationJob({
+        id: newId('nj'), eventId: task.eventId, createdAt: new Date().toISOString(),
+        kind: 'report_blocked',
+        targets: admins.map(a => ({ channel: 'in_app' as const, address: a.userId, recipientLabel: a.name })),
+        templateKey: 'report_blocked', params: { reportId: report.id, taskId: task.id },
+        idempotencyKey: `report_blocked:${report.id}`, batchWindowSec: 60,
+      });
+    }
     // TL pinned semantic: a report-originated escalated CR mirrors proposeMutation —
     // admins see change.pending in realtime AND get the admin-only approval-needed job.
     if ('changeRequest' in outcome) {
@@ -1135,6 +1150,480 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       appEvents.emit({ type: 'notify.acked', eventId: acked.job.eventId, orgId: user.orgId, jobId: id, acknowledgedBy: user.userId, acknowledgedAt: ackAt });
     }
     return { job: acked.job }; // lost a concurrent first-ack race -> carries the winner's ack
+  });
+
+  // ============================================================
+  // v1.20 — Builder content surface / stakeholders / branches (additive-only)
+  // ============================================================
+  const gate120 = (user: UserRecord, action: Action, entityType: AuditEntityType, entityId: ID): void => {
+    const d = rawDecision(action, user.role);
+    if (d === 'allow' || d === 'scope') return;
+    fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+      reason: 'matrix_deny', action, entityType, entityId, eventId: 'pending',
+    });
+  };
+  const sameOrg = (user: UserRecord, orgId: ID, action: Action): void => {
+    if (orgId !== user.orgId) fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+      reason: 'scope_violation', action, entityType: 'user', entityId: user.userId, eventId: 'pending',
+    });
+  };
+
+  // ---- §20 content items ----
+  app.post('/v1/orgs/:orgId/content', async (req) => {
+    const user = await me(req);
+    const { orgId } = req.params as { orgId: ID };
+    gate120(user, 'content.create', 'content_item', 'pending');
+    sameOrg(user, orgId, 'content.create');
+    const body = (req.body ?? {}) as Partial<ContentItem> & { clientMutationId?: string };
+    if (!body.kind || !body.title) fail(400, 'BAD_REQUEST', 'חסרים kind / title');
+    if (!['text', 'link', 'checklist', 'equipment', 'form'].includes(body.kind)) fail(400, 'BAD_REQUEST', 'סוג תוכן לא תקין');
+    // clientMutationId dedupe (same pattern as clientReportId on reports).
+    if (body.clientMutationId) {
+      const dup = (await repo.listContentItems(orgId)).find(c => c.meta?.['clientMutationId'] === body.clientMutationId);
+      if (dup) return { item: dup, deduped: true };
+    }
+    const item: ContentItem = {
+      id: newId('ci'), orgId, kind: body.kind, title: body.title,
+      ...(body.body !== undefined ? { body: body.body } : {}),
+      ...(body.url !== undefined ? { url: body.url } : {}),
+      ...(body.checklistItems !== undefined ? { checklistItems: body.checklistItems } : {}),
+      meta: { ...(body.meta ?? {}), ...(body.clientMutationId ? { clientMutationId: body.clientMutationId } : {}) },
+      createdBy: user.userId, createdAt: new Date().toISOString(), version: 1,
+    };
+    await withAuditSafety(repo, async () => {
+      await repo.createContentItem(item);
+      await audit(repo, { orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'content.create', entityType: 'content_item', entityId: item.id, after: item, deviceClass: deviceClassOf(ua(req)) });
+    });
+    return { item };
+  });
+
+  app.get('/v1/orgs/:orgId/content', async (req) => {
+    const user = await me(req);
+    const { orgId } = req.params as { orgId: ID };
+    gate120(user, 'content.read', 'content_item', 'list');
+    sameOrg(user, orgId, 'content.read');
+    return { items: await repo.listContentItems(orgId) };
+  });
+
+  app.patch('/v1/content/:id', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'content.update', 'content_item', id);
+    const before = await repo.getContentItem(id);
+    if (!before || before.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'פריט התוכן לא נמצא');
+    const patch = (req.body ?? {}) as Partial<ContentItem>;
+    delete (patch as Record<string, unknown>)['id'];
+    delete (patch as Record<string, unknown>)['orgId'];
+    delete (patch as Record<string, unknown>)['version'];
+    const next = await withAuditSafety(repo, async () => {
+      const n = await repo.updateContentItem(id, patch);
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'content.update', entityType: 'content_item', entityId: id, before, after: n, deviceClass: deviceClassOf(ua(req)) });
+      return n;
+    });
+    return { item: next };
+  });
+
+  // §20: hard delete is admin-only at Alpha (§18 deprecation path pending).
+  app.delete('/v1/content/:id', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    if (user.role !== 'admin') {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'content.delete', entityType: 'content_item', entityId: id, eventId: 'pending',
+      });
+    }
+    const before = await repo.getContentItem(id);
+    if (!before || before.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'פריט התוכן לא נמצא');
+    await withAuditSafety(repo, async () => {
+      await repo.deleteContentItem(id);
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'content.delete', entityType: 'content_item', entityId: id, before, deviceClass: deviceClassOf(ua(req)) });
+    });
+    return { deleted: true };
+  });
+
+  app.post('/v1/tasks/:id/content', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'content.attach', 'content_item', id);
+    const task = await repo.getTask(id);
+    if (!task) fail(404, 'NOT_FOUND', 'המשימה לא נמצאה');
+    const ev = await repo.getEvent(task.eventId);
+    if (!ev || ev.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'המשימה לא נמצאה');
+    const body = (req.body ?? {}) as { contentId?: ID; role?: TaskResourceLink['role']; visibleFromOffsetMin?: number; visibleUntil?: string; ackRequired?: boolean };
+    if (!body.contentId || !body.role) fail(400, 'BAD_REQUEST', 'חסרים contentId / role');
+    const item = await repo.getContentItem(body.contentId);
+    if (!item || item.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'פריט התוכן לא נמצא');
+    // natural-key idempotency: same task+content link upserts (clientMutationId carried for contract shape).
+    const link: TaskResourceLink = {
+      taskId: id, contentId: body.contentId as ID, role: body.role as TaskContentRole,
+      visibleFromOffsetMin: body.visibleFromOffsetMin ?? 0,
+      ...(body.visibleUntil ? { visibleUntil: body.visibleUntil } : {}),
+      ...(body.ackRequired !== undefined ? { ackRequired: body.ackRequired } : {}),
+    };
+    const existed = (await repo.listTaskContent(id)).some(l => l.contentId === body.contentId);
+    await withAuditSafety(repo, async () => {
+      await repo.attachTaskContent(link);
+      await audit(repo, { orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
+        action: 'content.attach', entityType: 'content_item', entityId: body.contentId as ID, after: link, deviceClass: deviceClassOf(ua(req)) });
+    });
+    return { link, deduped: existed };
+  });
+
+  app.delete('/v1/tasks/:id/content/:contentId', async (req) => {
+    const user = await me(req);
+    const { id, contentId } = req.params as { id: ID; contentId: ID };
+    gate120(user, 'content.attach', 'content_item', contentId);
+    const task = await repo.getTask(id);
+    if (!task) fail(404, 'NOT_FOUND', 'המשימה לא נמצאה');
+    const ev = await repo.getEvent(task.eventId);
+    if (!ev || ev.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'המשימה לא נמצאה');
+    const before = (await repo.listTaskContent(id)).find(l => l.contentId === contentId);
+    const removed = await repo.detachTaskContent(id, contentId);
+    if (!removed) fail(404, 'NOT_FOUND', 'הקישור לא נמצא');
+    await audit(repo, { orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
+      action: 'content.attach', entityType: 'content_item', entityId: contentId, before, deviceClass: deviceClassOf(ua(req)) });
+    return { removed: true };
+  });
+
+  // §20 focus surface: current/next task + in-window visible content. A simple
+  // task always returns visibleResources: [] (progressive disclosure in contract).
+  app.get('/v1/focus/now', async (req) => {
+    const user = await me(req);
+    const orgEvents = await repo.listEvents(user.orgId);
+    const scoped = user.role === 'admin' ? orgEvents : orgEvents.filter(e => user.scopes.some(s => s.eventId === e.id));
+    const now = Date.now();
+    let currentTask: TaskNode | undefined;
+    let nextTask: TaskNode | undefined;
+    for (const e of scoped) {
+      for (const t of await repo.listTasks(e.id)) {
+        if (!t.start || t.status === 'cancelled' || t.status === 'done') continue;
+        const st = Date.parse(t.start);
+        const en = st + t.durationMin * 60000;
+        if (now >= st && now < en && (!currentTask || st < Date.parse(currentTask.start!))) currentTask = t;
+        else if (st > now && (!nextTask || st < Date.parse(nextTask.start!))) nextTask = t;
+      }
+    }
+    const visibleResources: { link: TaskResourceLink; item: ContentItem }[] = [];
+    if (currentTask) {
+      for (const link of await repo.listTaskContent(currentTask.id)) {
+        const st = Date.parse(currentTask.start!);
+        const from = st - link.visibleFromOffsetMin * 60000;
+        const until = link.visibleUntil ? Date.parse(link.visibleUntil) : Number.POSITIVE_INFINITY;
+        if (now < from || now > until) continue;
+        const item = await repo.getContentItem(link.contentId);
+        if (item) visibleResources.push({ link, item });
+      }
+    }
+    return {
+      currentTask: currentTask ?? null,
+      nextTask: nextTask ?? null,
+      visibleResources,
+      window: currentTask ? { from: currentTask.start, until: new Date(Date.parse(currentTask.start!) + currentTask.durationMin * 60000).toISOString() } : null,
+    };
+  });
+
+  app.post('/v1/content/:id/ack', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'content.ack', 'content_item', id);
+    const body = (req.body ?? {}) as { clientAckId?: string; taskId?: ID };
+    if (!body.clientAckId || !body.taskId) fail(400, 'BAD_REQUEST', 'חסרים clientAckId / taskId');
+    const item = await repo.getContentItem(id);
+    if (!item || item.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'פריט התוכן לא נמצא');
+    const existing = await repo.getContentAck(body.clientAckId);
+    if (existing) return { ack: existing, deduped: true };
+    const ack = { clientAckId: body.clientAckId, contentId: id, taskId: body.taskId, userId: user.userId, at: new Date().toISOString() };
+    await withAuditSafety(repo, async () => {
+      await repo.createContentAck(ack);
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'content.ack', entityType: 'content_item', entityId: id, after: ack, deviceClass: deviceClassOf(ua(req)) });
+    });
+    return { ack };
+  });
+
+  // ---- §21 org matrix (read-only, grouped by branchId) ----
+  app.get('/v1/orgs/:orgId/matrix', async (req) => {
+    const user = await me(req);
+    const { orgId } = req.params as { orgId: ID };
+    gate120(user, 'org.matrix.read', 'branch', 'matrix');
+    sameOrg(user, orgId, 'org.matrix.read');
+    const { from, to } = (req.query ?? {}) as { from?: string; to?: string };
+    const events = (await repo.listEvents(orgId)).filter(e => (!from || e.date >= from) && (!to || e.date <= to));
+    const grouped: Record<string, { event: EventNode; tasks: TaskNode[] }[]> = {};
+    for (const e of events) {
+      const key = e.branchId ?? '_unassigned';
+      (grouped[key] ??= []).push({ event: e, tasks: await repo.listTasks(e.id) });
+    }
+    return { branches: await repo.listBranches(orgId), grouped };
+  });
+
+  // ---- §22 stakeholders ----
+  app.post('/v1/orgs/:orgId/stakeholders', async (req) => {
+    const user = await me(req);
+    const { orgId } = req.params as { orgId: ID };
+    gate120(user, 'stakeholder.create', 'external_party', 'pending');
+    sameOrg(user, orgId, 'stakeholder.create');
+    const body = (req.body ?? {}) as Partial<ExternalParty> & { clientMutationId?: string };
+    if (!body.kind || !body.displayName) fail(400, 'BAD_REQUEST', 'חסרים kind / displayName');
+    if (!['guardian', 'supplier', 'client'].includes(body.kind)) fail(400, 'BAD_REQUEST', 'סוג נמען לא תקין');
+    const party: ExternalParty = {
+      id: newId('xp'), orgId, kind: body.kind, displayName: body.displayName,
+      contactRefs: (body.contactRefs ?? []).map(c => ({ ...c, transport: 'deferred' as const })),
+      links: body.links ?? [],
+      consent: { status: body.consent?.status ?? 'pending', at: new Date().toISOString() },
+      createdAt: new Date().toISOString(), version: 1,
+    };
+    await withAuditSafety(repo, async () => {
+      await repo.createExternalParty(party);
+      await audit(repo, { orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'stakeholder.create', entityType: 'external_party', entityId: party.id, after: party, deviceClass: deviceClassOf(ua(req)) });
+    });
+    return { party };
+  });
+
+  app.get('/v1/stakeholders', async (req) => {
+    const user = await me(req);
+    gate120(user, 'stakeholder.read', 'external_party', 'list');
+    // contactRefs carry the contactPhone privacy class: admin/field_manager only,
+    // which are exactly the roles stakeholder.read allows; focus_worker is denied above.
+    return { parties: await repo.listExternalParties(user.orgId) };
+  });
+
+  app.patch('/v1/stakeholders/:id', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'stakeholder.update', 'external_party', id);
+    const before = await repo.getExternalParty(id);
+    if (!before || before.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הנמען לא נמצא');
+    const patch = (req.body ?? {}) as Partial<ExternalParty>;
+    delete (patch as Record<string, unknown>)['id'];
+    delete (patch as Record<string, unknown>)['orgId'];
+    delete (patch as Record<string, unknown>)['version'];
+    const next = await withAuditSafety(repo, async () => {
+      const n = await repo.updateExternalParty(id, patch);
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'stakeholder.update', entityType: 'external_party', entityId: id, before, after: n, deviceClass: deviceClassOf(ua(req)) });
+      return n;
+    });
+    return { party: next };
+  });
+
+  app.delete('/v1/stakeholders/:id', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'stakeholder.delete', 'external_party', id);
+    const before = await repo.getExternalParty(id);
+    if (!before || before.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הנמען לא נמצא');
+    await withAuditSafety(repo, async () => {
+      await repo.deleteExternalParty(id);
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'stakeholder.delete', entityType: 'external_party', entityId: id, before, deviceClass: deviceClassOf(ua(req)) });
+    });
+    return { deleted: true };
+  });
+
+  app.post('/v1/stakeholders/:id/links', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'stakeholder.link', 'external_party', id);
+    const before = await repo.getExternalParty(id);
+    if (!before || before.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הנמען לא נמצא');
+    const body = (req.body ?? {}) as { entity?: 'event' | 'task' | 'resource'; entityId?: ID; relation?: string };
+    if (!body.entity || !body.entityId || !body.relation) fail(400, 'BAD_REQUEST', 'חסרים entity / entityId / relation');
+    const link = { entity: body.entity, entityId: body.entityId, relation: body.relation };
+    const next = await withAuditSafety(repo, async () => {
+      const n = await repo.updateExternalParty(id, { links: [...before.links, link] });
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'stakeholder.link', entityType: 'external_party', entityId: id, before: before.links, after: n?.links, deviceClass: deviceClassOf(ua(req)) });
+      return n;
+    });
+    return { party: next };
+  });
+
+  // §22 G6: manager-issued, revocable guest status token.
+  app.post('/v1/stakeholders/:id/status-token', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    if (user.role === 'focus_worker') {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'stakeholder.link', entityType: 'status_token', entityId: id, eventId: 'pending',
+      });
+    }
+    const party = await repo.getExternalParty(id);
+    if (!party || party.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הנמען לא נמצא');
+    const tok: StatusToken = {
+      id: newId('st'), orgId: user.orgId, externalPartyId: id,
+      token: `tk_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`,
+      createdBy: user.userId, createdAt: new Date().toISOString(),
+    };
+    await withAuditSafety(repo, async () => {
+      await repo.createStatusToken(tok);
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'stakeholder.link', entityType: 'status_token', entityId: tok.id, after: { externalPartyId: id }, deviceClass: deviceClassOf(ua(req)) });
+    });
+    return { statusToken: tok };
+  });
+
+  app.delete('/v1/status-tokens/:id', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    if (user.role === 'focus_worker') {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'stakeholder.link', entityType: 'status_token', entityId: id, eventId: 'pending',
+      });
+    }
+    // revoke by token id or by raw token (operator convenience)
+    const target = (await repo.getStatusToken(id)) ?? (await repo.getStatusTokenByToken(id));
+    if (!target) fail(404, 'NOT_FOUND', 'הטוקן לא נמצא');
+    if (target.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הטוקן לא נמצא');
+    const next = await repo.updateStatusToken(target.id, { revokedAt: new Date().toISOString() });
+    await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+      action: 'stakeholder.link', entityType: 'status_token', entityId: target.id, after: { revokedAt: next?.revokedAt }, deviceClass: deviceClassOf(ua(req)) });
+    return { statusToken: next };
+  });
+
+  // §22 G6 public guest surface (token-authenticated, no session). Read-only;
+  // schedule + statuses of linked entities only; no PII beyond participant name.
+  app.get('/v1/public/status/:accessToken', async (req) => {
+    const { accessToken } = req.params as { accessToken: string };
+    const tok = await repo.getStatusTokenByToken(accessToken);
+    if (!tok || tok.revokedAt) fail(404, 'NOT_FOUND', 'הקישור אינו זמין');
+    const party = await repo.getExternalParty(tok.externalPartyId);
+    if (!party) fail(404, 'NOT_FOUND', 'הקישור אינו זמין');
+    const schedule: { eventId: ID; name: string; date: string; status: string; tasks: { id: ID; name: string; start: string | null; status: string }[] }[] = [];
+    for (const l of party.links.filter(l => l.entity === 'event')) {
+      const e = await repo.getEvent(l.entityId);
+      if (!e || e.orgId !== tok.orgId) continue;
+      schedule.push({
+        eventId: e.id, name: e.name, date: e.date, status: e.status,
+        tasks: (await repo.listTasks(e.id)).map(t => ({ id: t.id, name: t.name, start: t.start, status: t.status })),
+      });
+    }
+    return { participant: party.displayName, schedule };
+  });
+
+  // ---- §23 branches ----
+  app.post('/v1/orgs/:orgId/branches', async (req) => {
+    const user = await me(req);
+    const { orgId } = req.params as { orgId: ID };
+    gate120(user, 'branch.create', 'branch', 'pending');
+    sameOrg(user, orgId, 'branch.create');
+    const body = (req.body ?? {}) as { name?: string; location?: string };
+    if (!body.name) fail(400, 'BAD_REQUEST', 'חסר שם סניף');
+    const branch: Branch = { id: newId('br'), orgId, name: body.name, ...(body.location ? { location: body.location } : {}), active: true, createdAt: new Date().toISOString(), version: 1 };
+    await withAuditSafety(repo, async () => {
+      await repo.createBranch(branch);
+      await audit(repo, { orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'branch.create', entityType: 'branch', entityId: branch.id, after: branch, deviceClass: deviceClassOf(ua(req)) });
+    });
+    return { branch };
+  });
+
+  app.get('/v1/branches', async (req) => {
+    const user = await me(req);
+    gate120(user, 'branch.read', 'branch', 'list');
+    return { branches: await repo.listBranches(user.orgId) };
+  });
+
+  app.patch('/v1/branches/:id', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'branch.update', 'branch', id);
+    const before = await repo.getBranch(id);
+    if (!before || before.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הסניף לא נמצא');
+    const patch = (req.body ?? {}) as Partial<Branch>;
+    delete (patch as Record<string, unknown>)['id'];
+    delete (patch as Record<string, unknown>)['orgId'];
+    delete (patch as Record<string, unknown>)['version'];
+    const next = await withAuditSafety(repo, async () => {
+      const n = await repo.updateBranch(id, patch);
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'branch.update', entityType: 'branch', entityId: id, before, after: n, deviceClass: deviceClassOf(ua(req)) });
+      return n;
+    });
+    return { branch: next };
+  });
+
+  app.post('/v1/branches/:id/archive', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'branch.archive', 'branch', id);
+    const before = await repo.getBranch(id);
+    if (!before || before.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הסניף לא נמצא');
+    const next = await withAuditSafety(repo, async () => {
+      const n = await repo.updateBranch(id, { active: false });
+      await audit(repo, { orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'branch.archive', entityType: 'branch', entityId: id, before, after: n, deviceClass: deviceClassOf(ua(req)) });
+      return n;
+    });
+    return { branch: next };
+  });
+
+  // ---- §24 report list + read state ----
+  app.get('/v1/reports', async (req) => {
+    const user = await me(req);
+    gate120(user, 'report.list', 'report', 'list');
+    const { eventId, status, unread } = (req.query ?? {}) as { eventId?: ID; status?: string; unread?: string };
+    const orgEvents = await repo.listEvents(user.orgId);
+    const events = eventId ? orgEvents.filter(e => e.id === eventId) : orgEvents;
+    if (eventId && events.length === 0) fail(404, 'NOT_FOUND', 'האירוע לא נמצא');
+    const readStates = await repo.listReportReadStates(user.userId);
+    const readAtByReport = new Map(readStates.map(r => [r.reportId, r.readAt]));
+    const reports: (StatusReport & { readAt?: string })[] = [];
+    for (const e of events) {
+      for (const r of await repo.listReports(e.id)) {
+        if (status && r.status !== status) continue;
+        const readAt = readAtByReport.get(r.id);
+        if (unread === 'true' && readAt) continue;
+        reports.push({ ...r, ...(readAt ? { readAt } : {}) });
+      }
+    }
+    return { reports };
+  });
+
+  app.post('/v1/reports/:id/read', async (req) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    gate120(user, 'report.mark_read', 'report', id);
+    const report = await repo.getReport(id);
+    if (!report) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+    const task = await repo.getTask(report.taskId);
+    const ev = task ? await repo.getEvent(task.eventId) : undefined;
+    if (!ev || ev.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+    const st = { reportId: id, userId: user.userId, readAt: new Date().toISOString() };
+    await repo.markReportRead(st);
+    return { readState: st };
+  });
+
+  // ---- §25 inbound opt-out webhook (provider-neutral; shared-secret header) ----
+  app.post('/v1/webhooks/inbound', async (req) => {
+    const expected = process.env['CONTAKE_INBOUND_SECRET'];
+    if (expected && req.headers['x-inbound-secret'] !== expected) {
+      fail(401, 'UNAUTHENTICATED', 'נדרש אימות');
+    }
+    const body = (req.body ?? {}) as { channel?: string; from?: string; body?: string };
+    if (!body.from) fail(400, 'BAD_REQUEST', 'חסר from');
+    const text = (body.body ?? '').trim();
+    const isStop = /^(stop|remove)\b/i.test(text) || /^(הסרה?|ביטול|בטל)(\s|$)/.test(text);
+    if (!isStop) return { handled: 0, reason: 'not_opt_out' };
+    // §25: modelled ExternalParty -> consent revoked (system state; works while
+    // external transports stay deferred). Unmodelled number -> channel opt-out
+    // under the existing ND-5 semantics. Webhook never reveals which path hit.
+    const party = await repo.findExternalPartyByContactRef(body.from);
+    if (party && party.consent.status !== 'revoked') {
+      const before = party.consent;
+      await repo.updateExternalParty(party.id, { consent: { status: 'revoked', at: new Date().toISOString() } });
+      await audit(repo, { orgId: party.orgId, eventId: 'pending', actorUserId: 'system-inbound', role: 'admin',
+        action: 'stakeholder.update', entityType: 'external_party', entityId: party.id,
+        before, after: { status: 'revoked', via: 'inbound_webhook' } });
+      return { handled: 1 };
+    }
+    const ch = await repo.findChannelByAddress(body.from);
+    if (ch && !ch.optedOut) await repo.updateChannel(ch.id, { optedOut: true }); // ND-5 semantics, as the existing STOP handler
+    return { handled: 1 };
   });
 
   return app;

@@ -133,6 +133,7 @@ export interface EventNode {
   orgId: ID;
   domainProfileId: ID;        // e.g. 'camp', 'film-shoot', 'conference'
   name: string;
+  branchId?: ID;              // v1.20 §23: additive, nullable; event without branch stays valid
   date: string;               // ISO date, event-local wall time
   timezone: string;           // IANA, e.g. 'Asia/Jerusalem' — the rendering + working-window timezone
   siteIds: ID[];
@@ -248,7 +249,13 @@ export type Action =
   | 'notify.send.targeted'
   | 'notify.ack'               // v1.8 — audit completeness for the ack endpoint
   | 'push.subscribe' | 'push.unsubscribe' // v1.10 — push self-service audit (no matrix rows, v1.8 precedent)
-  | 'whitelist.invite' | 'whitelist.list' | 'whitelist.approve' | 'whitelist.reject'; // v1.18 - matrix v1.4 rows, admin-only
+  | 'whitelist.invite' | 'whitelist.list' | 'whitelist.approve' | 'whitelist.reject' // v1.18 - matrix v1.4 rows, admin-only
+  // v1.20 (matrix v1.5, additive, 27 -> 45 actions):
+  | 'content.create' | 'content.update' | 'content.delete' | 'content.attach' | 'content.read' | 'content.ack'
+  | 'report.list' | 'report.mark_read'
+  | 'stakeholder.create' | 'stakeholder.update' | 'stakeholder.delete' | 'stakeholder.link' | 'stakeholder.read'
+  | 'branch.create' | 'branch.update' | 'branch.archive' | 'branch.read'
+  | 'org.matrix.read';
 
 export interface Scope { eventId: ID; siteId?: ID; }
 
@@ -386,7 +393,8 @@ export interface StatusReport {
 // 7. NOTIFICATIONS — targeted stakeholder sync
 // ============================================================
 
-export type NotificationKind = 'task_delayed' | 'task_moved' | 'task_cancelled' | 'change_needs_approval' | 'task_assigned' | 'task_unassigned';
+export type NotificationKind = 'task_delayed' | 'task_moved' | 'task_cancelled' | 'change_needs_approval' | 'task_assigned' | 'task_unassigned'
+  | 'report_blocked'; // v1.20 (matrix v1.5): manager-surface job when a field report lands status='blocked'; no push
 export type NotifyChannel = 'whatsapp' | 'sms' | 'in_app' | 'web_push'; // v1.10: dispatch-time delivery path over in_app targeting
 
 export interface NotificationTarget {
@@ -437,7 +445,8 @@ export interface PushSubscription {
 
 export type AuditEntityType = NodeKind | 'user' | 'change_request' | 'notification' | 'dependency' | 'whitelist_entry' /* v1.18 */
   | 'push_subscription'        // v1.10
-  | 'report';                  // v1.12 (report.resolve audits under its precise entity)
+  | 'report'                  // v1.12 (report.resolve audits under its precise entity)
+  | 'content_item' | 'external_party' | 'status_token' | 'branch'; // v1.20
 
 export interface AuditLogEntry {
   id: ID;
@@ -875,3 +884,105 @@ export interface WhitelistRejectRequest { reasonHe?: string; }
 export interface WhitelistCheckRequest { phone: string; }
 export interface WhitelistCheckResponse { status: WhitelistStatus | 'unknown'; }
 export interface WhitelistRegisterRequest { phone: string; displayName: string; requestedRole: Role; }
+
+// ============================================================
+// 14. v1.20 — BUILDER CONTENT SURFACE / STAKEHOLDERS / BRANCHES (additive-only)
+//     Source: contake-contracts-v1.20.md (TL-approved for dev branches, 2026-09-17).
+//     Coexistence: no existing route/field/enum changes; ResourceKind untouched;
+//     Day maps to Event-per-day; new write routes carry clientMutationId in body
+//     with server-side dedupe (same pattern as clientReportId on POST /v1/reports).
+// ============================================================
+
+/** §20 content kinds. 'file' is BLOCKED at Alpha: file = external URL only and
+ *  the file kind is never exposed in the Builder; no placeholders. */
+export type ContentKind = 'text' | 'link' | 'checklist' | 'equipment' | 'form';
+
+export interface ContentItem {
+  id: ID;
+  orgId: ID;
+  kind: ContentKind;
+  title: string;
+  body?: string;
+  url?: string;               // link + external-URL file reference
+  checklistItems?: { id: ID; text: string; done: boolean }[];
+  meta?: Record<string, unknown>;
+  createdBy: ID;
+  createdAt: ISODateTime;
+  version: number;            // content edit after publish = version++ (Focus always sees latest in open window)
+}
+
+/** §20 task<->content link (Appendix A: role 'media' merged into 'link';
+ *  visibleFrom represented as server-computed visibleFromOffsetMin). */
+export type TaskContentRole = 'instructions' | 'script' | 'checklist' | 'equipment' | 'form';
+export interface TaskResourceLink {
+  taskId: ID;
+  contentId: ID;
+  role: TaskContentRole;
+  visibleFromOffsetMin: number;
+  visibleUntil?: ISODateTime;
+  ackRequired?: boolean;
+}
+
+/** §20 offline ack, deduped by clientAckId (same pattern as clientReportId). */
+export interface ContentAck {
+  clientAckId: string;
+  contentId: ID;
+  taskId: ID;
+  userId: ID;
+  at: ISODateTime;
+}
+
+/** §22 external stakeholder. contactRefs privacy class = same as contactPhone:
+ *  admin/field_manager only; never in realtime frames or focus_worker payloads. */
+export type ExternalPartyKind = 'guardian' | 'supplier' | 'client';
+export type ConsentStatus = 'pending' | 'granted' | 'revoked';
+export interface ContactRef {
+  channel: 'in_app' | 'whatsapp' | 'sms';
+  value: string;
+  transport: 'deferred';      // v1.20: external channels deferred; delivery records status='not_sent_transport_deferred'
+}
+export interface StakeholderLink {
+  entity: 'event' | 'task' | 'resource';
+  entityId: ID;
+  relation: string;
+}
+export interface ExternalParty {
+  id: ID;
+  orgId: ID;
+  kind: ExternalPartyKind;
+  displayName: string;
+  contactRefs: ContactRef[];
+  links: StakeholderLink[];
+  consent: { status: ConsentStatus; at: ISODateTime };
+  createdAt: ISODateTime;
+  version: number;
+}
+
+/** §22 G6 guardian public status token (read-only guest surface, revocable). */
+export interface StatusToken {
+  id: ID;
+  orgId: ID;
+  externalPartyId: ID;
+  token: string;              // opaque access token used in GET /v1/public/status/:token
+  createdBy: ID;
+  createdAt: ISODateTime;
+  revokedAt?: ISODateTime;
+}
+
+/** §23 org-level branch. Coexists with event-level siteIds; no domino impact. */
+export interface Branch {
+  id: ID;
+  orgId: ID;
+  name: string;
+  location?: string;
+  active: boolean;
+  createdAt: ISODateTime;
+  version: number;
+}
+
+/** §24 per-manager report read state. */
+export interface ReportReadState {
+  reportId: ID;
+  userId: ID;
+  readAt: ISODateTime;
+}

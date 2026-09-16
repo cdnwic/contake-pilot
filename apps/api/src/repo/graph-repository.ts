@@ -1,6 +1,7 @@
 import type {
-  AuditLogEntry, ChangeRequest, DependencyEdge, EventNode, GraphSnapshot, ID,
-  NotificationJob, Principal, PushSubscription, ResourceNode, Role, StatusReport, TaskNode,
+  AuditLogEntry, Branch, ChangeRequest, ContentAck, ContentItem, DependencyEdge, EventNode,
+  ExternalParty, GraphSnapshot, ID, NotificationJob, Principal, PushSubscription, ReportReadState,
+  ResourceNode, Role, StatusReport, StatusToken, TaskNode, TaskResourceLink,
   WhitelistEntry, WhitelistStatus,
 } from '@contake/core';
 
@@ -155,6 +156,37 @@ export interface GraphRepository {
   // audit (append-only by construction: no update/delete methods exist, QA AC-AUD-2)
   appendAudit(e: AuditLogEntry): Promise<void>;
   listAudit(orgId: ID): Promise<AuditLogEntry[]>;
+
+  // v1.20 §20 content surface
+  createContentItem(c: ContentItem): Promise<ContentItem>;
+  getContentItem(id: ID): Promise<ContentItem | undefined>;
+  updateContentItem(id: ID, patch: Partial<ContentItem>): Promise<ContentItem | undefined>;
+  deleteContentItem(id: ID): Promise<boolean>;
+  listContentItems(orgId: ID): Promise<ContentItem[]>;
+  attachTaskContent(l: TaskResourceLink): Promise<TaskResourceLink>;
+  detachTaskContent(taskId: ID, contentId: ID): Promise<boolean>;
+  listTaskContent(taskId: ID): Promise<TaskResourceLink[]>;
+  createContentAck(a: ContentAck): Promise<ContentAck>;
+  getContentAck(clientAckId: string): Promise<ContentAck | undefined>;
+  // v1.20 §22 stakeholders (+ §22 G6 status tokens)
+  createExternalParty(p: ExternalParty): Promise<ExternalParty>;
+  getExternalParty(id: ID): Promise<ExternalParty | undefined>;
+  updateExternalParty(id: ID, patch: Partial<ExternalParty>): Promise<ExternalParty | undefined>;
+  deleteExternalParty(id: ID): Promise<boolean>;
+  listExternalParties(orgId: ID): Promise<ExternalParty[]>;
+  createStatusToken(t: StatusToken): Promise<StatusToken>;
+  getStatusToken(id: ID): Promise<StatusToken | undefined>;
+  getStatusTokenByToken(token: string): Promise<StatusToken | undefined>;
+  findExternalPartyByContactRef(value: string): Promise<ExternalParty | undefined>;
+  updateStatusToken(id: ID, patch: Partial<StatusToken>): Promise<StatusToken | undefined>;
+  // v1.20 §23 branches
+  createBranch(b: Branch): Promise<Branch>;
+  getBranch(id: ID): Promise<Branch | undefined>;
+  updateBranch(id: ID, patch: Partial<Branch>): Promise<Branch | undefined>;
+  listBranches(orgId: ID): Promise<Branch[]>;
+  // v1.20 §24 report read state
+  markReportRead(s: ReportReadState): Promise<ReportReadState>;
+  listReportReadStates(userId: ID): Promise<ReportReadState[]>;
 }
 
 export interface SeedData {
