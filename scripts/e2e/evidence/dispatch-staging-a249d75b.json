@@ -1,0 +1,124 @@
+{
+  "summary": {
+    "runId": "rmu4nc2br",
+    "base": "https://contake-api-staging.onrender.com",
+    "checks": 15,
+    "passed": 14,
+    "notes": 1,
+    "failed": 0,
+    "throttled": false
+  },
+  "evidence": [
+    {
+      "group": "setup",
+      "label": "scenario A (org film): event + watcher group + cascade -> 1 jobs",
+      "status": "PASS",
+      "eventId": "evt_mu4nc30y_385",
+      "jobs": 1
+    },
+    {
+      "group": "setup",
+      "label": "scenario B (org events): identical shape -> 1 jobs",
+      "status": "PASS",
+      "eventId": "evt_mu4nc4ab_386",
+      "jobs": 1
+    },
+    {
+      "group": "construction",
+      "label": "job kind is a known notification kind",
+      "status": "PASS",
+      "kind": "task_moved",
+      "templateKey": "task_moved"
+    },
+    {
+      "group": "construction",
+      "label": "idempotencyKey shaped eventId+changeRequestId+kind",
+      "status": "PASS",
+      "idempotencyKey": "evt_mu4nc30y_385+direct-mu4nc40i-210+task_moved+external"
+    },
+    {
+      "group": "construction",
+      "label": "batchWindowSec = 60 (ND-3 recipient batching)",
+      "status": "PASS",
+      "batchWindowSec": 60
+    },
+    {
+      "group": "construction",
+      "label": "params allowlist-respecting (ND-7): [taskName,newStart,summaryHe] within [taskName,newStart,summaryHe]",
+      "status": "PASS",
+      "params": {
+        "taskName": "zz-qa-D1",
+        "newStart": "2027-03-03T09:45:00+02:00",
+        "summaryHe": "אפקט דומינו: 1 משימות תלויות יזוזו (zz-qa-D2)"
+      }
+    },
+    {
+      "group": "split",
+      "label": "external targets exist for the subscriber-channel group (sandbox fanout): 1",
+      "status": "PASS",
+      "external": [
+        {
+          "channel": "whatsapp",
+          "address": "+972521100001",
+          "recipientLabel": "לקוח - מפיק ראשי (ערוץ)"
+        }
+      ],
+      "total": 1
+    },
+    {
+      "group": "split",
+      "label": "target split is explicit per target (channel/address typed, no implicit fanout)",
+      "status": "PASS",
+      "sample": [
+        {
+          "channel": "whatsapp",
+          "address": "+972521100001",
+          "recipientLabel": "לקוח - מפיק ראשי (ערוץ)"
+        }
+      ]
+    },
+    {
+      "group": "isolation",
+      "label": "org B admin reading org A event graph -> 404 (no cross-tenant existence leak)",
+      "status": "PASS",
+      "httpStatus": 404
+    },
+    {
+      "group": "isolation",
+      "label": "org B admin reading org A notification jobs -> 404",
+      "status": "PASS",
+      "httpStatus": 404
+    },
+    {
+      "group": "isolation",
+      "label": "org A jobs reference only org A event; org B jobs only org B event (disjoint)",
+      "status": "PASS"
+    },
+    {
+      "group": "isolation",
+      "label": "job id sets disjoint across tenants",
+      "status": "PASS"
+    },
+    {
+      "group": "surface",
+      "label": "NOTE: DispatchRecord lifecycle (sent/failed/attempts/provider receipts) has NO HTTP surface; sandbox providers are log-only on staging",
+      "status": "NOTE",
+      "gap": "provider-level lifecycle evidence needs a read-only deliveries endpoint or server-log capture - flagged to TL, not a test failure",
+      "adapters": "twilio/whatsapp-cloud/webpush sandbox adapters never invent creds; nothing leaves the process"
+    },
+    {
+      "group": "cleanup",
+      "label": "both orgs: sacrificial events deleted",
+      "status": "PASS",
+      "a": 200,
+      "b": 200
+    },
+    {
+      "group": "cleanup",
+      "label": "leftover sweep: zero zz-qa- events in both orgs",
+      "status": "PASS",
+      "a": [],
+      "b": []
+    }
+  ]
+}

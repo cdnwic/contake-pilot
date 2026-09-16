@@ -1,0 +1,1212 @@
+{
+  "summary": {
+    "runId": "rmu4mgvwm",
+    "base": "https://contake-api-staging.onrender.com",
+    "at": "2026-09-16T21:38:34.174Z",
+    "verticals": [
+      "film-shoot",
+      "event-production",
+      "conference",
+      "logistics",
+      "after-school",
+      "education"
+    ],
+    "checks": 115,
+    "passed": 115,
+    "failed": 0,
+    "throttled": false
+  },
+  "evidence": [
+    {
+      "at": "2026-09-16T21:38:04.581Z",
+      "vertical": "setup",
+      "check": "health warm-up 200",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:09.589Z",
+      "vertical": "film-shoot",
+      "check": "event.create applied (admin allow, no CR)",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mgzxf_56"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:09.762Z",
+      "vertical": "film-shoot",
+      "check": "resource.create watcher group applied",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "grpId": "res_mu4mh02c_1"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:10.304Z",
+      "vertical": "film-shoot",
+      "check": "task.create x3 applied with createdIds",
+      "pass": true,
+      "detail": {
+        "ids": [
+          "task_mu4mh073_2",
+          "task_mu4mh0c2_3",
+          "task_mu4mh0ha_4"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:10.645Z",
+      "vertical": "film-shoot",
+      "check": "dependency.create B depends-on A, C depends-on B (hard, lag 0)",
+      "pass": true,
+      "detail": {
+        "s1": 200,
+        "s2": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:10.837Z",
+      "vertical": "film-shoot",
+      "check": "event.publish applied",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:11.043Z",
+      "vertical": "film-shoot",
+      "check": "graph readable, chain present",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:11.216Z",
+      "vertical": "film-shoot",
+      "check": "domino.compute dry-run previews B and C moving",
+      "pass": true,
+      "detail": {
+        "ok": true,
+        "moved": [
+          "task_mu4mh073_2",
+          "task_mu4mh0c2_3",
+          "task_mu4mh0ha_4"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:11.399Z",
+      "vertical": "film-shoot",
+      "check": "task.move applied by admin, cascade B+C",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "moved": [
+          "task_mu4mh073_2",
+          "task_mu4mh0c2_3",
+          "task_mu4mh0ha_4"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:11.576Z",
+      "vertical": "film-shoot",
+      "check": "B start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T09:30:00+02:00",
+        "after": "2027-03-03T10:15:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:11.576Z",
+      "vertical": "film-shoot",
+      "check": "C start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T10:00:00+02:00",
+        "after": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:11.753Z",
+      "vertical": "film-shoot",
+      "check": "duplicate move retry rejected (VERSION_CONFLICT 409), no double-apply",
+      "pass": true,
+      "detail": {
+        "status": 409,
+        "code": "VERSION_CONFLICT"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:11.923Z",
+      "vertical": "film-shoot",
+      "check": "graph unchanged after duplicate retry",
+      "pass": true,
+      "detail": {
+        "b": "2027-03-03T10:15:00+02:00",
+        "c": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:12.107Z",
+      "vertical": "film-shoot",
+      "check": "notification jobs recorded for domino cascade (task_moved, external fanout)",
+      "pass": true,
+      "detail": {
+        "count": 1,
+        "kinds": [
+          "task_moved"
+        ],
+        "external": [
+          null
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:12.279Z",
+      "vertical": "film-shoot",
+      "check": "audit covers full lifecycle",
+      "pass": true,
+      "detail": {
+        "missing": []
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:12.454Z",
+      "vertical": "film-shoot",
+      "check": "cross-tenant graph read denied (404)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:12.627Z",
+      "vertical": "film-shoot",
+      "check": "cross-tenant mutation denied (404/403)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:12.814Z",
+      "vertical": "film-shoot",
+      "check": "cleanup: sacrificial event deleted",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mgzxf_56"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:12.983Z",
+      "vertical": "film-shoot",
+      "check": "cleanup verified: graph 404 after delete",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:13.161Z",
+      "vertical": "film-shoot",
+      "check": "leftover sweep: zero zz-qa- events remain",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "at": "2026-09-16T21:38:13.742Z",
+      "vertical": "event-production",
+      "check": "event.create applied (admin allow, no CR)",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mh34m_57"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:13.921Z",
+      "vertical": "event-production",
+      "check": "resource.create watcher group applied",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "grpId": "res_mu4mh39w_7"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:14.443Z",
+      "vertical": "event-production",
+      "check": "task.create x3 applied with createdIds",
+      "pass": true,
+      "detail": {
+        "ids": [
+          "task_mu4mh3ek_8",
+          "task_mu4mh3jh_9",
+          "task_mu4mh3ob_10"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:14.808Z",
+      "vertical": "event-production",
+      "check": "dependency.create B depends-on A, C depends-on B (hard, lag 0)",
+      "pass": true,
+      "detail": {
+        "s1": 200,
+        "s2": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:14.978Z",
+      "vertical": "event-production",
+      "check": "event.publish applied",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:15.159Z",
+      "vertical": "event-production",
+      "check": "graph readable, chain present",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:15.339Z",
+      "vertical": "event-production",
+      "check": "domino.compute dry-run previews B and C moving",
+      "pass": true,
+      "detail": {
+        "ok": true,
+        "moved": [
+          "task_mu4mh3ek_8",
+          "task_mu4mh3jh_9",
+          "task_mu4mh3ob_10"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:15.517Z",
+      "vertical": "event-production",
+      "check": "task.move applied by admin, cascade B+C",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "moved": [
+          "task_mu4mh3ek_8",
+          "task_mu4mh3jh_9",
+          "task_mu4mh3ob_10"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:15.693Z",
+      "vertical": "event-production",
+      "check": "B start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T09:30:00+02:00",
+        "after": "2027-03-03T10:15:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:15.693Z",
+      "vertical": "event-production",
+      "check": "C start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T10:00:00+02:00",
+        "after": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:15.873Z",
+      "vertical": "event-production",
+      "check": "duplicate move retry rejected (VERSION_CONFLICT 409), no double-apply",
+      "pass": true,
+      "detail": {
+        "status": 409,
+        "code": "VERSION_CONFLICT"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:16.060Z",
+      "vertical": "event-production",
+      "check": "graph unchanged after duplicate retry",
+      "pass": true,
+      "detail": {
+        "b": "2027-03-03T10:15:00+02:00",
+        "c": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:16.231Z",
+      "vertical": "event-production",
+      "check": "notification jobs recorded for domino cascade (task_moved, external fanout)",
+      "pass": true,
+      "detail": {
+        "count": 1,
+        "kinds": [
+          "task_moved"
+        ],
+        "external": [
+          null
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:16.401Z",
+      "vertical": "event-production",
+      "check": "audit covers full lifecycle",
+      "pass": true,
+      "detail": {
+        "missing": []
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:16.573Z",
+      "vertical": "event-production",
+      "check": "cross-tenant graph read denied (404)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:16.749Z",
+      "vertical": "event-production",
+      "check": "cross-tenant mutation denied (404/403)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:16.917Z",
+      "vertical": "event-production",
+      "check": "cleanup: sacrificial event deleted",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mh34m_57"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:17.098Z",
+      "vertical": "event-production",
+      "check": "cleanup verified: graph 404 after delete",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:17.268Z",
+      "vertical": "event-production",
+      "check": "leftover sweep: zero zz-qa- events remain",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "at": "2026-09-16T21:38:17.836Z",
+      "vertical": "conference",
+      "check": "event.create applied (admin allow, no CR)",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mh6ak_58"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:18.006Z",
+      "vertical": "conference",
+      "check": "resource.create watcher group applied",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "grpId": "res_mu4mh6fb_13"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:18.516Z",
+      "vertical": "conference",
+      "check": "task.create x3 applied with createdIds",
+      "pass": true,
+      "detail": {
+        "ids": [
+          "task_mu4mh6k1_14",
+          "task_mu4mh6or_15",
+          "task_mu4mh6th_16"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:18.891Z",
+      "vertical": "conference",
+      "check": "dependency.create B depends-on A, C depends-on B (hard, lag 0)",
+      "pass": true,
+      "detail": {
+        "s1": 200,
+        "s2": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:19.078Z",
+      "vertical": "conference",
+      "check": "event.publish applied",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:19.279Z",
+      "vertical": "conference",
+      "check": "graph readable, chain present",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:19.456Z",
+      "vertical": "conference",
+      "check": "domino.compute dry-run previews B and C moving",
+      "pass": true,
+      "detail": {
+        "ok": true,
+        "moved": [
+          "task_mu4mh6k1_14",
+          "task_mu4mh6or_15",
+          "task_mu4mh6th_16"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:19.628Z",
+      "vertical": "conference",
+      "check": "task.move applied by admin, cascade B+C",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "moved": [
+          "task_mu4mh6k1_14",
+          "task_mu4mh6or_15",
+          "task_mu4mh6th_16"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:19.798Z",
+      "vertical": "conference",
+      "check": "B start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T09:30:00+02:00",
+        "after": "2027-03-03T10:15:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:19.798Z",
+      "vertical": "conference",
+      "check": "C start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T10:00:00+02:00",
+        "after": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:19.988Z",
+      "vertical": "conference",
+      "check": "duplicate move retry rejected (VERSION_CONFLICT 409), no double-apply",
+      "pass": true,
+      "detail": {
+        "status": 409,
+        "code": "VERSION_CONFLICT"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:20.168Z",
+      "vertical": "conference",
+      "check": "graph unchanged after duplicate retry",
+      "pass": true,
+      "detail": {
+        "b": "2027-03-03T10:15:00+02:00",
+        "c": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:20.354Z",
+      "vertical": "conference",
+      "check": "notification jobs recorded for domino cascade (task_moved, external fanout)",
+      "pass": true,
+      "detail": {
+        "count": 1,
+        "kinds": [
+          "task_moved"
+        ],
+        "external": [
+          null
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:20.537Z",
+      "vertical": "conference",
+      "check": "audit covers full lifecycle",
+      "pass": true,
+      "detail": {
+        "missing": []
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:20.723Z",
+      "vertical": "conference",
+      "check": "cross-tenant graph read denied (404)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:20.909Z",
+      "vertical": "conference",
+      "check": "cross-tenant mutation denied (404/403)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:21.099Z",
+      "vertical": "conference",
+      "check": "cleanup: sacrificial event deleted",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mh6ak_58"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:21.268Z",
+      "vertical": "conference",
+      "check": "cleanup verified: graph 404 after delete",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:21.445Z",
+      "vertical": "conference",
+      "check": "leftover sweep: zero zz-qa- events remain",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "at": "2026-09-16T21:38:22.036Z",
+      "vertical": "logistics",
+      "check": "event.create applied (admin allow, no CR)",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mh9j5_59"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:22.221Z",
+      "vertical": "logistics",
+      "check": "resource.create watcher group applied",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "grpId": "res_mu4mh9o6_19"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:22.752Z",
+      "vertical": "logistics",
+      "check": "task.create x3 applied with createdIds",
+      "pass": true,
+      "detail": {
+        "ids": [
+          "task_mu4mh9tk_20",
+          "task_mu4mh9yc_21",
+          "task_mu4mha34_22"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:23.104Z",
+      "vertical": "logistics",
+      "check": "dependency.create B depends-on A, C depends-on B (hard, lag 0)",
+      "pass": true,
+      "detail": {
+        "s1": 200,
+        "s2": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:23.278Z",
+      "vertical": "logistics",
+      "check": "event.publish applied",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:23.453Z",
+      "vertical": "logistics",
+      "check": "graph readable, chain present",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:23.625Z",
+      "vertical": "logistics",
+      "check": "domino.compute dry-run previews B and C moving",
+      "pass": true,
+      "detail": {
+        "ok": true,
+        "moved": [
+          "task_mu4mh9tk_20",
+          "task_mu4mh9yc_21",
+          "task_mu4mha34_22"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:23.802Z",
+      "vertical": "logistics",
+      "check": "task.move applied by admin, cascade B+C",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "moved": [
+          "task_mu4mh9tk_20",
+          "task_mu4mh9yc_21",
+          "task_mu4mha34_22"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:23.994Z",
+      "vertical": "logistics",
+      "check": "B start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T09:30:00+02:00",
+        "after": "2027-03-03T10:15:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:23.994Z",
+      "vertical": "logistics",
+      "check": "C start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T10:00:00+02:00",
+        "after": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:24.181Z",
+      "vertical": "logistics",
+      "check": "duplicate move retry rejected (VERSION_CONFLICT 409), no double-apply",
+      "pass": true,
+      "detail": {
+        "status": 409,
+        "code": "VERSION_CONFLICT"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:24.360Z",
+      "vertical": "logistics",
+      "check": "graph unchanged after duplicate retry",
+      "pass": true,
+      "detail": {
+        "b": "2027-03-03T10:15:00+02:00",
+        "c": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:24.529Z",
+      "vertical": "logistics",
+      "check": "notification jobs recorded for domino cascade (task_moved, external fanout)",
+      "pass": true,
+      "detail": {
+        "count": 1,
+        "kinds": [
+          "task_moved"
+        ],
+        "external": [
+          null
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:24.710Z",
+      "vertical": "logistics",
+      "check": "audit covers full lifecycle",
+      "pass": true,
+      "detail": {
+        "missing": []
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:24.881Z",
+      "vertical": "logistics",
+      "check": "cross-tenant graph read denied (404)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:25.051Z",
+      "vertical": "logistics",
+      "check": "cross-tenant mutation denied (404/403)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:25.221Z",
+      "vertical": "logistics",
+      "check": "cleanup: sacrificial event deleted",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mh9j5_59"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:25.400Z",
+      "vertical": "logistics",
+      "check": "cleanup verified: graph 404 after delete",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:25.587Z",
+      "vertical": "logistics",
+      "check": "leftover sweep: zero zz-qa- events remain",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "at": "2026-09-16T21:38:26.169Z",
+      "vertical": "after-school",
+      "check": "event.create applied (admin allow, no CR)",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mhcpr_60"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:26.358Z",
+      "vertical": "after-school",
+      "check": "resource.create watcher group applied",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "grpId": "res_mu4mhcvb_25"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:26.883Z",
+      "vertical": "after-school",
+      "check": "task.create x3 applied with createdIds",
+      "pass": true,
+      "detail": {
+        "ids": [
+          "task_mu4mhd04_26",
+          "task_mu4mhd53_27",
+          "task_mu4mhd9w_28"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:27.238Z",
+      "vertical": "after-school",
+      "check": "dependency.create B depends-on A, C depends-on B (hard, lag 0)",
+      "pass": true,
+      "detail": {
+        "s1": 200,
+        "s2": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:27.406Z",
+      "vertical": "after-school",
+      "check": "event.publish applied",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:27.619Z",
+      "vertical": "after-school",
+      "check": "graph readable, chain present",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:27.806Z",
+      "vertical": "after-school",
+      "check": "domino.compute dry-run previews B and C moving",
+      "pass": true,
+      "detail": {
+        "ok": true,
+        "moved": [
+          "task_mu4mhd04_26",
+          "task_mu4mhd53_27",
+          "task_mu4mhd9w_28"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:27.980Z",
+      "vertical": "after-school",
+      "check": "task.move applied by admin, cascade B+C",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "moved": [
+          "task_mu4mhd04_26",
+          "task_mu4mhd53_27",
+          "task_mu4mhd9w_28"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:28.149Z",
+      "vertical": "after-school",
+      "check": "B start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T09:30:00+02:00",
+        "after": "2027-03-03T10:15:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:28.149Z",
+      "vertical": "after-school",
+      "check": "C start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T10:00:00+02:00",
+        "after": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:28.338Z",
+      "vertical": "after-school",
+      "check": "duplicate move retry rejected (VERSION_CONFLICT 409), no double-apply",
+      "pass": true,
+      "detail": {
+        "status": 409,
+        "code": "VERSION_CONFLICT"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:28.506Z",
+      "vertical": "after-school",
+      "check": "graph unchanged after duplicate retry",
+      "pass": true,
+      "detail": {
+        "b": "2027-03-03T10:15:00+02:00",
+        "c": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:28.674Z",
+      "vertical": "after-school",
+      "check": "notification jobs recorded for domino cascade (task_moved, external fanout)",
+      "pass": true,
+      "detail": {
+        "count": 1,
+        "kinds": [
+          "task_moved"
+        ],
+        "external": [
+          null
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:28.843Z",
+      "vertical": "after-school",
+      "check": "audit covers full lifecycle",
+      "pass": true,
+      "detail": {
+        "missing": []
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:29.009Z",
+      "vertical": "after-school",
+      "check": "cross-tenant graph read denied (404)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:29.194Z",
+      "vertical": "after-school",
+      "check": "cross-tenant mutation denied (404/403)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:29.381Z",
+      "vertical": "after-school",
+      "check": "cleanup: sacrificial event deleted",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mhcpr_60"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:29.568Z",
+      "vertical": "after-school",
+      "check": "cleanup verified: graph 404 after delete",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:29.736Z",
+      "vertical": "after-school",
+      "check": "leftover sweep: zero zz-qa- events remain",
+      "pass": true,
+      "detail": []
+    },
+    {
+      "at": "2026-09-16T21:38:30.305Z",
+      "vertical": "education",
+      "check": "event.create applied (admin allow, no CR)",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mhfwy_61"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:30.477Z",
+      "vertical": "education",
+      "check": "resource.create watcher group applied",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "grpId": "res_mu4mhg1p_31"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:31.007Z",
+      "vertical": "education",
+      "check": "task.create x3 applied with createdIds",
+      "pass": true,
+      "detail": {
+        "ids": [
+          "task_mu4mhg6x_32",
+          "task_mu4mhgbq_33",
+          "task_mu4mhggf_34"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:31.364Z",
+      "vertical": "education",
+      "check": "dependency.create B depends-on A, C depends-on B (hard, lag 0)",
+      "pass": true,
+      "detail": {
+        "s1": 200,
+        "s2": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:31.535Z",
+      "vertical": "education",
+      "check": "event.publish applied",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:31.702Z",
+      "vertical": "education",
+      "check": "graph readable, chain present",
+      "pass": true,
+      "detail": {
+        "status": 200
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:31.887Z",
+      "vertical": "education",
+      "check": "domino.compute dry-run previews B and C moving",
+      "pass": true,
+      "detail": {
+        "ok": true,
+        "moved": [
+          "task_mu4mhg6x_32",
+          "task_mu4mhgbq_33",
+          "task_mu4mhggf_34"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:32.058Z",
+      "vertical": "education",
+      "check": "task.move applied by admin, cascade B+C",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "moved": [
+          "task_mu4mhg6x_32",
+          "task_mu4mhgbq_33",
+          "task_mu4mhggf_34"
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:32.225Z",
+      "vertical": "education",
+      "check": "B start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T09:30:00+02:00",
+        "after": "2027-03-03T10:15:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:32.225Z",
+      "vertical": "education",
+      "check": "C start shifted +45m on graph",
+      "pass": true,
+      "detail": {
+        "before": "2027-03-03T10:00:00+02:00",
+        "after": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:32.397Z",
+      "vertical": "education",
+      "check": "duplicate move retry rejected (VERSION_CONFLICT 409), no double-apply",
+      "pass": true,
+      "detail": {
+        "status": 409,
+        "code": "VERSION_CONFLICT"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:32.563Z",
+      "vertical": "education",
+      "check": "graph unchanged after duplicate retry",
+      "pass": true,
+      "detail": {
+        "b": "2027-03-03T10:15:00+02:00",
+        "c": "2027-03-03T10:45:00+02:00"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:32.732Z",
+      "vertical": "education",
+      "check": "notification jobs recorded for domino cascade (task_moved, external fanout)",
+      "pass": true,
+      "detail": {
+        "count": 1,
+        "kinds": [
+          "task_moved"
+        ],
+        "external": [
+          null
+        ]
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:32.897Z",
+      "vertical": "education",
+      "check": "audit covers full lifecycle",
+      "pass": true,
+      "detail": {
+        "missing": []
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:33.065Z",
+      "vertical": "education",
+      "check": "cross-tenant graph read denied (404)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:33.232Z",
+      "vertical": "education",
+      "check": "cross-tenant mutation denied (404/403)",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:33.399Z",
+      "vertical": "education",
+      "check": "cleanup: sacrificial event deleted",
+      "pass": true,
+      "detail": {
+        "status": 200,
+        "eventId": "evt_mu4mhfwy_61"
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:33.588Z",
+      "vertical": "education",
+      "check": "cleanup verified: graph 404 after delete",
+      "pass": true,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "at": "2026-09-16T21:38:33.773Z",
+      "vertical": "education",
+      "check": "leftover sweep: zero zz-qa- events remain",
+      "pass": true,
+      "detail": []
+    }
+  ]
+}

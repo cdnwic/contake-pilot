@@ -1,0 +1,12 @@
+{
+  "service": {"name": "contake-otp-proof", "id": "srv-dalgq36k1f9s73872h4g", "url": "https://contake-otp-proof.onrender.com", "region": "frankfurt", "plan": "free", "branch": "main", "commitId": "ea02ba0e4dbb2e91c5fe32b856682550b9bc01fd", "liveDeploy": "dep-dalgq6m5vjqs73fbm2j0", "liveAt": "2026-09-17T00:42:56+03:00"},
+  "env": {"NODE_VERSION": "22", "CONTAKE_DEV_OTP": "false", "DATABASE_URL": "<absent: memory OTP store; free PG quota blocks 2nd DB>", "CONTAKE_SEED": "<absent: default seedDemo org-1/org-2>"},
+  "verified": {
+    "oldBuildConfirmed": "GET /v1/debug/whitelist-check -> NOT_FOUND",
+    "otpRequest": "POST /v1/auth/otp/request -> {\"sent\":true} NO devCode",
+    "qaEmailLogin": "admin@camp.local/admin123 -> token issued",
+    "renderLogsAccess": "GET /v1/logs?ownerId=tea-daje8o95efls738jg8c0&resource=<svcId>[&text=...] -> 200"
+  },
+  "materialFinding": "Build ea02ba0 (=prod) NEVER delivers OTP codes: auth.requestOtp generates+stores the code and returns it internally; no SMS/provider call, no log line. Providers are log-sandbox but the auth path does not use them. Intended-delivery proof is unsatisfiable on this build in any configuration.",
+  "prodLoginState": {"emailQaFm": "qa-all@oranim-camp.local/camp-qa-all-1 WORKS", "emailAdmin": "dana@oranim-camp.local/camp-admin-1 -> BAD_CREDENTIALS (09-13-seeded row predates admin password in seed)", "otp": "inert by design: request accepted, code stored, never delivered"}
+}

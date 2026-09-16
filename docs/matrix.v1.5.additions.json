@@ -1,0 +1,29 @@
+{
+  "baseVersion": "1.4",
+  "version": "1.5",
+  "date": "2026-09-17",
+  "additiveOnly": true,
+  "actions": {
+    "content.create": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "content.update": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "content.delete": {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "content.attach": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "content.read": {"admin": "allow", "field_manager": "scope", "focus_worker": "scope"},
+    "content.ack": {"admin": "allow", "field_manager": "scope", "focus_worker": "scope"},
+    "report.list": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "report.mark_read": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "stakeholder.create": {"admin": "allow", "field_manager": "deny", "focus_worker": "deny"},
+    "stakeholder.update": {"admin": "allow", "field_manager": "deny", "focus_worker": "deny"},
+    "stakeholder.delete": {"admin": "allow", "field_manager": "deny", "focus_worker": "deny"},
+    "stakeholder.link": {"admin": "allow", "field_manager": "deny", "focus_worker": "deny"},
+    "stakeholder.read": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "branch.create": {"admin": "allow", "field_manager": "deny", "focus_worker": "deny"},
+    "branch.update": {"admin": "allow", "field_manager": "deny", "focus_worker": "deny"},
+    "branch.archive": {"admin": "allow", "field_manager": "deny", "focus_worker": "deny"},
+    "branch.read": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "org.matrix.read": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"}
+  },
+  "notificationKindsAdded": ["report_blocked"],
+  "auditEntityTypesAdded": ["content_item", "external_party", "status_token", "branch"],
+  "notes": "27 -> 45 actions. denyByDefault unchanged. scope = own site/event scope per matrix v1.4 semantics."
+}

@@ -1,0 +1,128 @@
+{
+  "summary": {
+    "runId": "rmu4n7lfx",
+    "base": "https://contake-api-staging.onrender.com",
+    "checks": 14,
+    "passed": 14,
+    "failed": 0,
+    "throttled": false
+  },
+  "evidence": [
+    {
+      "group": "setup",
+      "label": "focus_worker OTP login",
+      "status": "PASS"
+    },
+    {
+      "group": "setup",
+      "label": "scenario applied (event, 2 tasks, dep, publish, move+cascade)",
+      "status": "PASS",
+      "httpStatus": 200
+    },
+    {
+      "group": "audit",
+      "label": "rows returned for sacrificial event: 10",
+      "status": "PASS",
+      "count": 10
+    },
+    {
+      "group": "audit",
+      "label": "causal order: event.create -> task.create -> dependency.create -> publish -> task.move -> report -> resolve",
+      "status": "PASS",
+      "actions": [
+        "event.create",
+        "task.create",
+        "dependency.create",
+        "event.publish",
+        "task.move",
+        "report.status.create",
+        "report.resolve"
+      ]
+    },
+    {
+      "group": "audit",
+      "label": "createdAt/id ordering is consistent",
+      "status": "PASS"
+    },
+    {
+      "group": "audit",
+      "label": "every row carries actor/role/action/entity/createdAt/beforeJson/afterJson fields",
+      "status": "PASS",
+      "missing": 0
+    },
+    {
+      "group": "audit",
+      "label": "task.create row: null before, after carries created task (name zz-qa-A1)",
+      "status": "PASS",
+      "hasRow": true
+    },
+    {
+      "group": "audit",
+      "label": "task.move row: before start 09:00, after start 09:45 (real old/new values)",
+      "status": "PASS",
+      "before": {
+        "kind": "task",
+        "eventId": "evt_mu4n7mmj_329",
+        "siteId": "film-site-1",
+        "name": "zz-qa-A1",
+        "start": "2027-03-03T09:00:00+02:00",
+        "durationMin": 30,
+        "status": "planned",
+        "locked": false,
+        "assigneeResourceIds": [],
+        "id": "task_mu4n7ms5_342",
+        "version": 1
+      },
+      "after": {
+        "kind": "task",
+        "eventId": "evt_mu4n7mmj_329",
+        "siteId": "film-site-1",
+        "name": "zz-qa-A1",
+        "start": "2027-03-03T09:45:00+02:00",
+        "durationMin": 30,
+        "status": "delayed",
+        "locked": false,
+        "assigneeResourceIds": [],
+        "id": "task_mu4n7ms5_342",
+        "version": 2
+      }
+    },
+    {
+      "group": "redaction",
+      "label": "org-wide audit scan (758 rows): no passwordHash/tokens/secrets/OTP/seeded credentials",
+      "status": "PASS",
+      "hits": [],
+      "rows": 758
+    },
+    {
+      "group": "visibility",
+      "label": "focus_worker GET /v1/audit -> 403",
+      "status": "PASS",
+      "httpStatus": 403
+    },
+    {
+      "group": "visibility",
+      "label": "mutating deny appended a denied row with null before/after (contracts v1.9)",
+      "status": "PASS",
+      "found": true
+    },
+    {
+      "group": "visibility",
+      "label": "field_manager audit view is scope-filtered (sacrificial event out of FM scope -> 0 rows, no admin event.create row)",
+      "status": "PASS",
+      "fmRows": 0
+    },
+    {
+      "group": "cleanup",
+      "label": "event deleted",
+      "status": "PASS",
+      "httpStatus": 200
+    },
+    {
+      "group": "cleanup",
+      "label": "leftover sweep: zero zz-qa- events remain",
+      "status": "PASS",
+      "swept": []
+    }
+  ]
+}

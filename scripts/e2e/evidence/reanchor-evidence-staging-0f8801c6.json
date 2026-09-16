@@ -1,0 +1,12 @@
+{
+  "evidence": {
+    "api": "https://contake-api-staging.onrender.com",
+    "source": "cd-ev1", "sourceDate": "2026-09-14",
+    "copy": "evt_mu4mayv4_1", "copyDate": "2026-09-17", "published": true,
+    "countsMatch": true, "offDateTasks": [], "nonPlannedTasks": [],
+    "counts": {"tasks": 18, "resources": 17, "dependencies": 19},
+    "verifiedAt": "2026-09-16T21:33:29.036Z"
+  },
+  "verdict": "PASS",
+  "dryRunAlsoVerified": true
+}
