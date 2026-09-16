@@ -1,0 +1,417 @@
+{
+  "summary": {
+    "runId": "rmu4na1h9",
+    "base": "https://contake-api-staging.onrender.com",
+    "expect": "pending",
+    "checks": 53,
+    "harnessPass": 9,
+    "neutralCoincidentalEqualOutcome": 7,
+    "expectedFailPendingImplementation": 33,
+    "untestedSharedState": 4,
+    "harnessErrors": 0,
+    "inventoryAligned": true,
+    "throttled": false,
+    "reading": "§17 is ABSENT, not partially passed: every claim/replay/409 row is an expected failure until the ledger lands"
+  },
+  "evidence": [
+    {
+      "group": "inventory",
+      "label": "app.ts effectful routes: 30; manifest: 30",
+      "status": "PASS",
+      "aligned": true
+    },
+    {
+      "group": "setup",
+      "label": "sacrificial event + 2 tasks + group + dep",
+      "status": "PASS",
+      "eventId": "evt_mu4na23t_359"
+    },
+    {
+      "group": "setup",
+      "label": "cascade move applied (t2 moved)",
+      "status": "PASS",
+      "httpStatus": 200
+    },
+    {
+      "group": "setup",
+      "label": "notify jobs present for ack case: 1",
+      "status": "PASS"
+    },
+    {
+      "group": "setup",
+      "label": "CRs for approve/reject cases",
+      "status": "PASS",
+      "cr1": "cr_mu4na3l3_376"
+    },
+    {
+      "group": "events",
+      "label": "POST /v1/events replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "events",
+      "label": "POST /v1/events divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "events",
+      "label": "POST /v1/events/:id/duplicate replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "events",
+      "label": "POST /v1/events/:id/duplicate divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "events",
+      "label": "PATCH /v1/events/:id replay",
+      "status": "NEUTRAL",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": true,
+      "interpretation": "coincidental-equal-outcome: business behavior, NOT §17 ledger replay"
+    },
+    {
+      "group": "events",
+      "label": "PATCH /v1/events/:id divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "events",
+      "label": "DELETE /v1/events/:id replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 404,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "events",
+      "label": "DELETE /v1/events/:id divergent-409 (same key, other event id)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "events",
+      "label": "POST /v1/events/:id/publish replay",
+      "status": "NEUTRAL",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": true,
+      "interpretation": "coincidental-equal-outcome: business behavior, NOT §17 ledger replay"
+    },
+    {
+      "group": "events",
+      "label": "POST /v1/events/:id/publish divergent-409 (same key, other event id)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "tasks",
+      "label": "POST /v1/events/:id/tasks replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "tasks",
+      "label": "POST /v1/events/:id/tasks divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "tasks",
+      "label": "PATCH /v1/tasks/:id replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "tasks",
+      "label": "PATCH /v1/tasks/:id divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "tasks",
+      "label": "DELETE /v1/tasks/:id replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 404,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "tasks",
+      "label": "DELETE /v1/tasks/:id divergent-409 (same key, other task id)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "resources",
+      "label": "POST /v1/events/:id/resources replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "resources",
+      "label": "POST /v1/events/:id/resources divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "resources",
+      "label": "PATCH /v1/resources/:id replay",
+      "status": "NEUTRAL",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": true,
+      "interpretation": "coincidental-equal-outcome: business behavior, NOT §17 ledger replay"
+    },
+    {
+      "group": "resources",
+      "label": "PATCH /v1/resources/:id divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "resources",
+      "label": "DELETE /v1/resources/:id replay",
+      "status": "NEUTRAL",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": true,
+      "interpretation": "coincidental-equal-outcome: business behavior, NOT §17 ledger replay"
+    },
+    {
+      "group": "resources",
+      "label": "DELETE /v1/resources/:id divergent-409 (same key, other resource id)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "dependencies",
+      "label": "POST /v1/events/:id/dependencies replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "dependencies",
+      "label": "POST /v1/events/:id/dependencies divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "dependencies",
+      "label": "DELETE /v1/dependencies/:id replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 404,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "dependencies",
+      "label": "DELETE /v1/dependencies/:id divergent-409 (same key, other dependency id)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "changes",
+      "label": "POST /v1/changes/:id/approve replay",
+      "status": "NEUTRAL",
+      "r1": 409,
+      "r2": 409,
+      "bodiesEqual": true,
+      "interpretation": "coincidental-equal-outcome: business behavior, NOT §17 ledger replay"
+    },
+    {
+      "group": "changes",
+      "label": "POST /v1/changes/:id/approve divergent-409 (same key, other CR id)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 409,
+      "code": "STALE_BASE",
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "changes",
+      "label": "POST /v1/changes/:id/reject replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 409,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "changes",
+      "label": "POST /v1/changes/:id/reject divergent-409 (same key, other CR id)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "reports",
+      "label": "POST /v1/reports replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "reports",
+      "label": "POST /v1/reports divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "reports",
+      "label": "note: replay hit clientReportId business dedupe (body differs -> not §17 exact replay)",
+      "status": "PASS",
+      "invariant": "clientReportId dedupe remains per §17"
+    },
+    {
+      "group": "reports",
+      "label": "POST /v1/reports/:id/resolve replay",
+      "status": "NEUTRAL",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": true,
+      "interpretation": "coincidental-equal-outcome: business behavior, NOT §17 ledger replay"
+    },
+    {
+      "group": "reports",
+      "label": "POST /v1/reports/:id/resolve divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "notify",
+      "label": "POST /v1/notify-jobs/:id/ack replay",
+      "status": "NEUTRAL",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": true,
+      "interpretation": "coincidental-equal-outcome: business behavior, NOT §17 ledger replay"
+    },
+    {
+      "group": "notify",
+      "label": "POST /v1/notify-jobs/:id/ack divergent-409 (same key, other job id)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 404,
+      "code": "NOT_FOUND",
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "push",
+      "label": "POST /v1/push/subscriptions replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 200,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "push",
+      "label": "POST /v1/push/subscriptions divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "push",
+      "label": "DELETE /v1/push/subscriptions replay",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "r1": 200,
+      "r2": 404,
+      "bodiesEqual": false,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "push",
+      "label": "DELETE /v1/push/subscriptions divergent-409",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "httpStatus": 200,
+      "reason": "§17 ledger not deployed (live probe 2026-09-17: no claim/replay/409 on POST /v1/events)"
+    },
+    {
+      "group": "whitelist",
+      "label": "POST /v1/whitelist claim/replay/409",
+      "status": "UNTESTED",
+      "reason": "shared-state route: no delete route — whitelist rows cannot be cleaned on shared staging; local-memory runs only"
+    },
+    {
+      "group": "whitelist",
+      "label": "POST /v1/auth/whitelist-register claim/replay/409",
+      "status": "UNTESTED",
+      "reason": "shared-state route: no delete route — whitelist rows cannot be cleaned on shared staging; local-memory runs only"
+    },
+    {
+      "group": "whitelist",
+      "label": "POST /v1/whitelist/:phone/approve claim/replay/409",
+      "status": "UNTESTED",
+      "reason": "shared-state route: no delete route — whitelist rows cannot be cleaned on shared staging; local-memory runs only"
+    },
+    {
+      "group": "whitelist",
+      "label": "POST /v1/whitelist/:phone/reject claim/replay/409",
+      "status": "UNTESTED",
+      "reason": "shared-state route: no delete route — whitelist rows cannot be cleaned on shared staging; local-memory runs only"
+    },
+    {
+      "group": "cleanup",
+      "label": "event deleted",
+      "status": "PASS",
+      "httpStatus": 200
+    },
+    {
+      "group": "cleanup",
+      "label": "no CR rows survive event delete",
+      "status": "PASS",
+      "httpStatus": 200
+    },
+    {
+      "group": "cleanup",
+      "label": "leftover sweep: zero zz-qa- events remain",
+      "status": "PASS",
+      "swept": []
+    }
+  ]
+}

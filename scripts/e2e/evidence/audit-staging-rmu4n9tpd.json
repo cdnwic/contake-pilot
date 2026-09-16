@@ -1,0 +1,174 @@
+{
+  "summary": {
+    "runId": "rmu4n9tpd",
+    "base": "https://contake-api-staging.onrender.com",
+    "checks": 21,
+    "passed": 16,
+    "xfailOpen": 5,
+    "failed": 0,
+    "throttled": false,
+    "canonicalVerdict": "B2/B3 audit-shape plus point C visibility evidence only; atomicity, broad C, D concurrency, E tamper, F retention remain open/XFAIL"
+  },
+  "evidence": [
+    {
+      "group": "setup",
+      "label": "focus_worker OTP login",
+      "status": "PASS"
+    },
+    {
+      "group": "setup",
+      "label": "one serial staging scenario applied (event, 2 tasks, dep, publish, move+cascade, report, resolve, one mutating deny)",
+      "status": "PASS",
+      "httpStatus": 200,
+      "scope": "single serial scenario - no concurrency claims"
+    },
+    {
+      "group": "audit",
+      "label": "rows returned for sacrificial event: 10",
+      "status": "PASS",
+      "count": 10
+    },
+    {
+      "group": "audit",
+      "label": "action-name causal sequence in ONE serial scenario (event.create -> task.create -> dependency.create -> publish -> task.move -> report -> resolve); NOT a concurrent/equal-timestamp ordering proof",
+      "status": "PASS",
+      "actions": [
+        "event.create",
+        "task.create",
+        "dependency.create",
+        "event.publish",
+        "task.move",
+        "report.status.create",
+        "report.resolve"
+      ]
+    },
+    {
+      "group": "audit",
+      "label": "createdAt/id ordering is consistent",
+      "status": "PASS"
+    },
+    {
+      "group": "audit",
+      "label": "every row carries actor/role/action/entity/createdAt/beforeJson/afterJson fields",
+      "status": "PASS",
+      "missing": 0
+    },
+    {
+      "group": "audit",
+      "label": "before/after truth, row 1 of 2: ONE task.create (null before, created task in after)",
+      "status": "PASS",
+      "hasRow": true,
+      "scope": "one create row only - not broad before/after coverage"
+    },
+    {
+      "group": "audit",
+      "label": "before/after truth, row 2 of 2: ONE initiating task.move (before start 09:00 v1, after start 09:45 v2, status planned->delayed)",
+      "status": "PASS",
+      "before": {
+        "kind": "task",
+        "eventId": "evt_mu4n9ur1_357",
+        "siteId": "film-site-1",
+        "name": "zz-qa-A1",
+        "start": "2027-03-03T09:00:00+02:00",
+        "durationMin": 30,
+        "status": "planned",
+        "locked": false,
+        "assigneeResourceIds": [],
+        "id": "task_mu4n9uw0_369",
+        "version": 1
+      },
+      "after": {
+        "kind": "task",
+        "eventId": "evt_mu4n9ur1_357",
+        "siteId": "film-site-1",
+        "name": "zz-qa-A1",
+        "start": "2027-03-03T09:45:00+02:00",
+        "durationMin": 30,
+        "status": "delayed",
+        "locked": false,
+        "assigneeResourceIds": [],
+        "id": "task_mu4n9uw0_369",
+        "version": 2
+      },
+      "scope": "one initiating move row only - not broad before/after coverage"
+    },
+    {
+      "group": "redaction",
+      "label": "configured-canary scan over 846 CURRENT org-wide rows: zero hits",
+      "status": "PASS",
+      "hits": [],
+      "rows": 846,
+      "canary": "key-name regex (password|secret|token|otp|devcode|authorization) + seeded credential values; point-in-time scan, not a standing guarantee"
+    },
+    {
+      "group": "visibility",
+      "label": "focus_worker GET /v1/audit -> 403",
+      "status": "PASS",
+      "httpStatus": 403
+    },
+    {
+      "group": "visibility",
+      "label": "mutating deny appended a denied row with null before/after (contracts v1.9)",
+      "status": "PASS",
+      "found": true
+    },
+    {
+      "group": "visibility",
+      "label": "NOTE: checks in this group are POINT visibility checks, not a full auth matrix (broad C remains open)",
+      "status": "PASS"
+    },
+    {
+      "group": "visibility",
+      "label": "field_manager audit view is scope-filtered (sacrificial event out of FM scope -> 0 rows, no admin event.create row)",
+      "status": "PASS",
+      "fmRows": 0
+    },
+    {
+      "group": "xfail",
+      "label": "ATOMICITY: mutation+audit same-transaction under failure injection",
+      "status": "XFAIL",
+      "reason": "open - requires fault injection into the repo/audit store; not black-box testable on shared staging"
+    },
+    {
+      "group": "xfail",
+      "label": "BROAD C: full role x state auth matrix on audit reads",
+      "status": "XFAIL",
+      "reason": "open - point checks only in this module; full matrix is a dedicated follow-up"
+    },
+    {
+      "group": "xfail",
+      "label": "D CONCURRENCY: ordering/atomic append under concurrent writers",
+      "status": "XFAIL",
+      "reason": "open - belongs to the concurrency suite (queue item 2)"
+    },
+    {
+      "group": "xfail",
+      "label": "E TAMPER: audit tamper evidence (hash-chain / append-only verification)",
+      "status": "XFAIL",
+      "reason": "open - queue item 7 stays XFAIL; hash-chain on post-demo backlog per v1.19 addendum"
+    },
+    {
+      "group": "xfail",
+      "label": "F RETENTION: retention windows / erasure-restore-purge lifecycle",
+      "status": "XFAIL",
+      "reason": "open - pending founder decisions (queue item 6); tombstone §18 pending founder approval"
+    },
+    {
+      "group": "cleanup",
+      "label": "note: append-only audit rows of the deleted sacrificial event persist by design - EXPECTED EVIDENCE, not leftovers",
+      "status": "PASS"
+    },
+    {
+      "group": "cleanup",
+      "label": "event deleted",
+      "status": "PASS",
+      "httpStatus": 200
+    },
+    {
+      "group": "cleanup",
+      "label": "leftover sweep: zero zz-qa- events remain",
+      "status": "PASS",
+      "swept": []
+    }
+  ]
+}
