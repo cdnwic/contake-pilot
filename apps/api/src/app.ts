@@ -1475,8 +1475,8 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
         reason: 'matrix_deny', action: 'stakeholder.link', entityType: 'status_token', entityId: id, eventId: 'pending',
       });
     }
-    // revoke by token id or by raw token (operator convenience)
-    const target = (await repo.getStatusToken(id)) ?? (await repo.getStatusTokenByToken(id));
+    // revoke by token id only (TL pre-merge review: raw token in URL path is 404)
+    const target = await repo.getStatusToken(id);
     if (!target) fail(404, 'NOT_FOUND', 'הטוקן לא נמצא');
     if (target.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הטוקן לא נמצא');
     const next = await repo.updateStatusToken(target.id, { revokedAt: new Date().toISOString() });
@@ -1622,7 +1622,12 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       return { handled: 1 };
     }
     const ch = await repo.findChannelByAddress(body.from);
-    if (ch && !ch.optedOut) await repo.updateChannel(ch.id, { optedOut: true }); // ND-5 semantics, as the existing STOP handler
+    if (ch && !ch.optedOut) {
+      await repo.updateChannel(ch.id, { optedOut: true }); // ND-5 semantics, as the existing STOP handler
+      await audit(repo, { orgId: ch.orgId, eventId: 'pending', actorUserId: 'system-inbound', role: 'admin',
+        action: 'push.unsubscribe', entityType: 'notification', entityId: ch.id,
+        after: { optedOut: true, via: 'inbound_webhook', channel: body.channel ?? null } });
+    }
     return { handled: 1 };
   });
 

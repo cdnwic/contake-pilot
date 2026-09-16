@@ -162,7 +162,7 @@
     },
     "content.delete": {
       "admin": "allow",
-      "field_manager": "propose",
+      "field_manager": "deny",
       "focus_worker": "deny"
     },
     "content.attach": {
