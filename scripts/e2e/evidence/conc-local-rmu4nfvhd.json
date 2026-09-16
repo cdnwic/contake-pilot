@@ -1,0 +1,104 @@
+{
+  "summary": {
+    "runId": "rmu4nfvhd",
+    "base": "http://127.0.0.1:3100",
+    "variant": "memory",
+    "checks": 12,
+    "operationalSetupCleanupPass": 5,
+    "memoryConvergenceObservations": 2,
+    "observedS17Failures": 2,
+    "scaffoldUnexecuted": 3,
+    "harnessErrors": 0,
+    "rollup": "5 operational/setup-cleanup passes; 2 memory-process report convergence observations; 2 observed §17 failures; 2 lost-response/out-of-order designs SCAFFOLD/UNEXECUTED; 1 PG proposal SCAFFOLD/UNEXECUTED. DB UNIQUE is a hypothesis (necessary, not sufficient); final D proof needs disposable real PostgreSQL + two independent connections + synchronized barrier"
+  },
+  "evidence": [
+    {
+      "group": "setup",
+      "label": "sacrificial event + task on local memory server",
+      "status": "PASS",
+      "eventId": "evt_mu4nfvjv_174",
+      "variant": "memory (single-process event loop - application serialization only, NOT true connection concurrency)"
+    },
+    {
+      "group": "race",
+      "label": "[memory] 50-way burst executed: 50 requests issued concurrently, all answered, no harness error",
+      "status": "PASS",
+      "okResponses": 50,
+      "rowKind": "operational"
+    },
+    {
+      "group": "race",
+      "label": "[memory] OBSERVATION: 50-way identical clientReportId converged to 1 distinct report id(s) in one memory process",
+      "status": "OBSERVATION",
+      "distinctReportIds": 1,
+      "dedupedFlagResponses": 49,
+      "rowKind": "convergence-observation",
+      "variant": "memory-process only: application-level getReportByClientId check under event-loop serialization; says NOTHING about two-connection Postgres behavior; not a concurrency-safety pass"
+    },
+    {
+      "group": "race",
+      "label": "[memory] 100-way burst executed: 100 requests issued concurrently, all answered, no harness error",
+      "status": "PASS",
+      "okResponses": 100,
+      "rowKind": "operational"
+    },
+    {
+      "group": "race",
+      "label": "[memory] OBSERVATION: 100-way identical clientReportId converged to 1 distinct report id(s) in one memory process",
+      "status": "OBSERVATION",
+      "distinctReportIds": 1,
+      "dedupedFlagResponses": 99,
+      "rowKind": "convergence-observation",
+      "variant": "memory-process only: application-level getReportByClientId check under event-loop serialization; says NOTHING about two-connection Postgres behavior; not a concurrency-safety pass"
+    },
+    {
+      "group": "race",
+      "label": "[memory] OBSERVED §17 failure: 50-way simultaneous POST /v1/events, identical Idempotency-Key -> 50 distinct events (§17 expects exactly 1)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "distinctEventsCreated": 50,
+      "expectation": "ledger: exactly 1",
+      "variant": "memory",
+      "reason": "§17 ledger not deployed (staging probe 2026-09-17)"
+    },
+    {
+      "group": "race",
+      "label": "[memory] OBSERVED §17 failure: 10-way divergent-body burst, one Idempotency-Key -> 10 commits, 0 IDEMPOTENCY_KEY_REUSED (§17 expects 1 commit + 9 conflicts)",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "committed": 10,
+      "idempotencyConflicts": 0,
+      "expectation": "1 commit, 9 conflicts",
+      "variant": "memory",
+      "reason": "§17 ledger not deployed"
+    },
+    {
+      "group": "scaffold",
+      "label": "lost-response scenario DESIGN (unexecuted): client retries with same key after simulated timeout - server must replay original commit, not re-execute",
+      "status": "SCAFFOLD-UNEXECUTED",
+      "needs": "§17 ledger + claim state observable across requests; harness: send, drop response client-side, retry identical request, assert replay + single mutation"
+    },
+    {
+      "group": "scaffold",
+      "label": "out-of-order scenario DESIGN (unexecuted): delayed original lands after its own retry - replay must still return the original commit exactly once",
+      "status": "SCAFFOLD-UNEXECUTED",
+      "needs": "§17 ledger; harness: hold first request, send retry, release original, assert single mutation + identical bodies"
+    },
+    {
+      "group": "scaffold",
+      "label": "PG variant PROPOSAL (unexecuted, NOT final Postgres proof): final D proof requires disposable real PostgreSQL, two independent connections, synchronized barrier. DB UNIQUE is a hypothesis - necessary, not sufficient; no losses evidenced because nothing here has executed on PG",
+      "status": "SCAFFOLD-UNEXECUTED",
+      "needs": "disposable real PostgreSQL + two pg.Pool connections + synchronized barrier (pglite is a convenience proposal only); addendum: current indexes are NOT unique"
+    },
+    {
+      "group": "cleanup",
+      "label": "sacrificial event deleted",
+      "status": "PASS",
+      "httpStatus": 200
+    },
+    {
+      "group": "cleanup",
+      "label": "leftover sweep: zero zz-qa- events remain",
+      "status": "PASS",
+      "swept": []
+    }
+  ]
+}
