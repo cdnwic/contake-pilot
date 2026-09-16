@@ -10,15 +10,15 @@
  *  - memory variant: one local API server on MemoryGraphRepository. JS
  *    single-process event loop: proves application-level serialization logic,
  *    NOT true concurrent-connection behavior. Every memory row says so.
- *  - pglite two-connection variant [SCAFFOLD]: two PostgresGraphRepository
- *    connections over one PGlite instance (server.ts boots PG via DATABASE_URL;
- *    the test harness will wire pglite-socket + two Pools). Addendum binding
- *    note: current indexes are NOT unique - application checks alone are
- *    insufficient under concurrency; DB-enforced UNIQUE (idempotency ledger,
- *    reports.clientReportId at tenant/producer scope, notification_jobs.
- *    idempotency_key at tenant scope) lands with Postgres. Until then the
- *    two-connection races are EXPECTED to lose; that is the evidence for the
- *    addendum's implementation requirement.
+ *  - pglite two-connection variant [SCAFFOLD/UNEXECUTED - a PROPOSAL, not
+ *    final Postgres proof]: two connections over one PGlite instance.
+ *    Final D proof requires DISPOSABLE REAL POSTGRESQL with two independent
+ *    connections and a SYNCHRONIZED BARRIER (QA ruling 2026-09-17).
+ *    DB-enforced UNIQUE (addendum: idempotency ledger, reports.clientReportId
+ *    at tenant/producer scope, notification_jobs.idempotency_key at tenant
+ *    scope) is a HYPOTHESIS for closing the races - necessary but NOT
+ *    sufficient; nothing here claims UNIQUE alone proves safety, and no
+ *    losses are evidenced (the PG variant is unexecuted).
  *
  * Cases (TL queue): 50/100-way identical-key, divergent-body, lost-response,
  * out-of-order, two-connection PG. §17 ledger is ABSENT (probe 2026-09-17), so
@@ -82,9 +82,12 @@ async function main() {
       const ok = results.filter((r) => r.status === 200);
       const ids = new Set(ok.map((r) => r.json?.report?.id));
       const dedupedCount = ok.filter((r) => r.json?.deduped === true).length;
-      rec('race', `[memory] ${N}-way simultaneous POST /v1/reports, identical clientReportId -> exactly ONE report row`, ids.size === 1 && ok.length === N, {
-        distinctReportIds: ids.size, okResponses: ok.length, dedupedFlagResponses: dedupedCount,
-        variant: 'memory: application-level getReportByClientId check under event-loop serialization; two-connection PG variant pending (see header)',
+      rec('race', `[memory] ${N}-way burst executed: ${N} requests issued concurrently, all answered, no harness error`, ok.length === N ? 'PASS' : 'FAIL', {
+        okResponses: ok.length, rowKind: 'operational',
+      });
+      rec('race', `[memory] OBSERVATION: ${N}-way identical clientReportId converged to ${ids.size} distinct report id(s) in one memory process`, 'OBSERVATION', {
+        distinctReportIds: ids.size, dedupedFlagResponses: dedupedCount, rowKind: 'convergence-observation',
+        variant: 'memory-process only: application-level getReportByClientId check under event-loop serialization; says NOTHING about two-connection Postgres behavior; not a concurrency-safety pass',
       });
     }
 
@@ -94,7 +97,7 @@ async function main() {
       const body = { name: `zz-qa-conc-x-${RUN_ID}`, date: DEMO_DATE, timezone: TZ, domainProfileId: V.id, siteIds: [V.siteId] };
       const results = await Promise.all(Array.from({ length: N1 }, () => call('POST', '/v1/events', { token: admin, body, key })));
       const ids = new Set(results.map((r) => r.json?.applied?.event?.id).filter(Boolean));
-      rec('race', `[memory] ${N1}-way simultaneous POST /v1/events, identical Idempotency-Key -> §17 expects ONE event`, 'EXPECTED-FAIL-PENDING-IMPLEMENTATION', {
+      rec('race', `[memory] OBSERVED §17 failure: ${N1}-way simultaneous POST /v1/events, identical Idempotency-Key -> ${ids.size} distinct events (§17 expects exactly 1)`, 'EXPECTED-FAIL-PENDING-IMPLEMENTATION', {
         distinctEventsCreated: ids.size, expectation: 'ledger: exactly 1', variant: 'memory', reason: '§17 ledger not deployed (staging probe 2026-09-17)',
       });
       // cleanup the burst events
@@ -108,7 +111,7 @@ async function main() {
         call('POST', '/v1/events', { token: admin, key, body: { name: `zz-qa-conc-d${i}-${RUN_ID}`, date: DEMO_DATE, timezone: TZ, domainProfileId: V.id, siteIds: [V.siteId] } })));
       const conflicts = results.filter((r) => r.status === 409 && r.json?.error?.code === 'IDEMPOTENCY_KEY_REUSED').length;
       const created = results.filter((r) => r.status === 200).length;
-      rec('race', '[memory] 10-way divergent-body burst, one Idempotency-Key -> §17 expects 1 commit + 9x 409 IDEMPOTENCY_KEY_REUSED', 'EXPECTED-FAIL-PENDING-IMPLEMENTATION', {
+      rec('race', `[memory] OBSERVED §17 failure: 10-way divergent-body burst, one Idempotency-Key -> ${created} commits, ${conflicts} IDEMPOTENCY_KEY_REUSED (§17 expects 1 commit + 9 conflicts)`, 'EXPECTED-FAIL-PENDING-IMPLEMENTATION', {
         committed: created, idempotencyConflicts: conflicts, expectation: '1 commit, 9 conflicts', variant: 'memory', reason: '§17 ledger not deployed',
       });
       const list = (await call('GET', '/v1/events', { token: admin })).json?.events ?? [];
@@ -116,9 +119,9 @@ async function main() {
     }
 
     // --- scaffolded cases (pending ledger / pglite wiring) ---
-    rec('scaffold', 'lost-response: client retries with same key after simulated timeout - server must replay original commit, not re-execute', 'EXPECTED-FAIL-PENDING-IMPLEMENTATION', { needs: '§17 ledger + claim state observable across requests; harness: send, drop response client-side, retry identical request, assert replay + single mutation' });
-    rec('scaffold', 'out-of-order: delayed original lands after its own retry - replay must still return the original commit exactly once', 'EXPECTED-FAIL-PENDING-IMPLEMENTATION', { needs: '§17 ledger; harness: hold first request, send retry, release original, assert single mutation + identical bodies' });
-    rec('scaffold', 'two-connection Postgres (pglite): same races over two Pools to one PGlite - expects losses until DB UNIQUE constraints land (addendum implementation requirement)', 'SCAFFOLD', { needs: 'pglite-socket + two pg.Pool wiring (server.ts boots PG via DATABASE_URL); addendum: current indexes are NOT unique - application checks insufficient under concurrency' });
+    rec('scaffold', 'lost-response scenario DESIGN (unexecuted): client retries with same key after simulated timeout - server must replay original commit, not re-execute', 'SCAFFOLD-UNEXECUTED', { needs: '§17 ledger + claim state observable across requests; harness: send, drop response client-side, retry identical request, assert replay + single mutation' });
+    rec('scaffold', 'out-of-order scenario DESIGN (unexecuted): delayed original lands after its own retry - replay must still return the original commit exactly once', 'SCAFFOLD-UNEXECUTED', { needs: '§17 ledger; harness: hold first request, send retry, release original, assert single mutation + identical bodies' });
+    rec('scaffold', 'PG variant PROPOSAL (unexecuted, NOT final Postgres proof): final D proof requires disposable real PostgreSQL, two independent connections, synchronized barrier. DB UNIQUE is a hypothesis - necessary, not sufficient; no losses evidenced because nothing here has executed on PG', 'SCAFFOLD-UNEXECUTED', { needs: 'disposable real PostgreSQL + two pg.Pool connections + synchronized barrier (pglite is a convenience proposal only); addendum: current indexes are NOT unique' });
   } finally {
     const del = await call('DELETE', `/v1/events/${eventId}`, { token: admin });
     rec('cleanup', 'sacrificial event deleted', del.status === 200 ? 'PASS' : 'FAIL', { httpStatus: del.status });
@@ -128,7 +131,13 @@ async function main() {
     rec('cleanup', 'leftover sweep: zero zz-qa- events remain', left.length === 0 ? 'PASS' : 'FAIL', { swept: left.map((e) => e.id) });
   }
   const fails = evidence.filter((e) => e.status === 'FAIL');
-  const summary = { runId: RUN_ID, base: BASE, variant: 'memory', checks: evidence.length, hardPass: evidence.filter((e) => e.status === 'PASS').length, expectedFailPending: evidence.filter((e) => e.status === 'EXPECTED-FAIL-PENDING-IMPLEMENTATION').length, scaffold: evidence.filter((e) => e.status === 'SCAFFOLD').length, harnessErrors: fails.length };
+  const summary = { runId: RUN_ID, base: BASE, variant: 'memory', checks: evidence.length,
+    operationalSetupCleanupPass: evidence.filter((e) => e.status === 'PASS').length,
+    memoryConvergenceObservations: evidence.filter((e) => e.status === 'OBSERVATION').length,
+    observedS17Failures: evidence.filter((e) => e.status === 'EXPECTED-FAIL-PENDING-IMPLEMENTATION').length,
+    scaffoldUnexecuted: evidence.filter((e) => e.status === 'SCAFFOLD-UNEXECUTED').length,
+    harnessErrors: fails.length,
+    rollup: '5 operational/setup-cleanup passes; 2 memory-process report convergence observations; 2 observed §17 failures; 2 lost-response/out-of-order designs SCAFFOLD/UNEXECUTED; 1 PG proposal SCAFFOLD/UNEXECUTED. DB UNIQUE is a hypothesis (necessary, not sufficient); final D proof needs disposable real PostgreSQL + two independent connections + synchronized barrier' };
   console.log(JSON.stringify(summary, null, 2));
   if (OUT) { writeFileSync(OUT, JSON.stringify({ summary, evidence }, null, 2)); console.log(`evidence written: ${OUT}`); }
   process.exit(fails.length ? 1 : 0);
