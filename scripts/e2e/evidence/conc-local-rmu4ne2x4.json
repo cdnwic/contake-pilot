@@ -1,0 +1,88 @@
+{
+  "summary": {
+    "runId": "rmu4ne2x4",
+    "base": "http://127.0.0.1:3100",
+    "variant": "memory",
+    "checks": 10,
+    "hardPass": 5,
+    "expectedFailPending": 4,
+    "scaffold": 1,
+    "harnessErrors": 0
+  },
+  "evidence": [
+    {
+      "group": "setup",
+      "label": "sacrificial event + task on local memory server",
+      "status": "PASS",
+      "eventId": "evt_mu4ne30z_111",
+      "variant": "memory (single-process event loop - application serialization only, NOT true connection concurrency)"
+    },
+    {
+      "group": "race",
+      "label": "[memory] 50-way simultaneous POST /v1/reports, identical clientReportId -> exactly ONE report row",
+      "status": "PASS",
+      "distinctReportIds": 1,
+      "okResponses": 50,
+      "dedupedFlagResponses": 49,
+      "variant": "memory: application-level getReportByClientId check under event-loop serialization; two-connection PG variant pending (see header)"
+    },
+    {
+      "group": "race",
+      "label": "[memory] 100-way simultaneous POST /v1/reports, identical clientReportId -> exactly ONE report row",
+      "status": "PASS",
+      "distinctReportIds": 1,
+      "okResponses": 100,
+      "dedupedFlagResponses": 99,
+      "variant": "memory: application-level getReportByClientId check under event-loop serialization; two-connection PG variant pending (see header)"
+    },
+    {
+      "group": "race",
+      "label": "[memory] 50-way simultaneous POST /v1/events, identical Idempotency-Key -> §17 expects ONE event",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "distinctEventsCreated": 50,
+      "expectation": "ledger: exactly 1",
+      "variant": "memory",
+      "reason": "§17 ledger not deployed (staging probe 2026-09-17)"
+    },
+    {
+      "group": "race",
+      "label": "[memory] 10-way divergent-body burst, one Idempotency-Key -> §17 expects 1 commit + 9x 409 IDEMPOTENCY_KEY_REUSED",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "committed": 10,
+      "idempotencyConflicts": 0,
+      "expectation": "1 commit, 9 conflicts",
+      "variant": "memory",
+      "reason": "§17 ledger not deployed"
+    },
+    {
+      "group": "scaffold",
+      "label": "lost-response: client retries with same key after simulated timeout - server must replay original commit, not re-execute",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "needs": "§17 ledger + claim state observable across requests; harness: send, drop response client-side, retry identical request, assert replay + single mutation"
+    },
+    {
+      "group": "scaffold",
+      "label": "out-of-order: delayed original lands after its own retry - replay must still return the original commit exactly once",
+      "status": "EXPECTED-FAIL-PENDING-IMPLEMENTATION",
+      "needs": "§17 ledger; harness: hold first request, send retry, release original, assert single mutation + identical bodies"
+    },
+    {
+      "group": "scaffold",
+      "label": "two-connection Postgres (pglite): same races over two Pools to one PGlite - expects losses until DB UNIQUE constraints land (addendum implementation requirement)",
+      "status": "SCAFFOLD",
+      "needs": "pglite-socket + two pg.Pool wiring (server.ts boots PG via DATABASE_URL); addendum: current indexes are NOT unique - application checks insufficient under concurrency"
+    },
+    {
+      "group": "cleanup",
+      "label": "sacrificial event deleted",
+      "status": "PASS",
+      "httpStatus": 200
+    },
+    {
+      "group": "cleanup",
+      "label": "leftover sweep: zero zz-qa- events remain",
+      "status": "PASS",
+      "swept": []
+    }
+  ]
+}

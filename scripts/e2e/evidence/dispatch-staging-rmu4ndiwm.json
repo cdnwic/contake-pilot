@@ -1,0 +1,148 @@
+{
+  "summary": {
+    "runId": "rmu4ndiwm",
+    "base": "https://contake-api-staging.onrender.com",
+    "checks": 15,
+    "passed": 14,
+    "notes": 1,
+    "failed": 0,
+    "throttled": false,
+    "canonicalClassification": "black-box construction/isolation smoke + explicit untested notes - NOT a lifecycle pass",
+    "rollup": {
+      "sampledConstructionShape": "PASS",
+      "pointTenantIsolation": "PASS",
+      "untested": [
+        "batching",
+        "idempotency",
+        "provider delivery/retry/receipt",
+        "durability/recovery"
+      ]
+    }
+  },
+  "evidence": [
+    {
+      "group": "setup",
+      "label": "scenario A (org film): event + watcher group + cascade -> 1 jobs",
+      "status": "PASS",
+      "eventId": "evt_mu4ndjnf_387",
+      "jobs": 1
+    },
+    {
+      "group": "setup",
+      "label": "scenario B (org events): identical shape -> 1 jobs",
+      "status": "PASS",
+      "eventId": "evt_mu4ndl7e_388",
+      "jobs": 1
+    },
+    {
+      "group": "construction",
+      "label": "job kind is a known notification kind",
+      "status": "PASS",
+      "kind": "task_moved",
+      "templateKey": "task_moved"
+    },
+    {
+      "group": "construction",
+      "label": "idempotencyKey on ONE sampled job: non-empty deterministic-looking composite (four parts: eventId + correlation-looking segment + kind + external) - NOT idempotency-semantics evidence",
+      "status": "PASS",
+      "idempotencyKey": "evt_mu4ndjnf_387+direct-mu4ndky0-216+task_moved+external",
+      "scope": "one sampled job; composite shape observation only"
+    },
+    {
+      "group": "construction",
+      "label": "batchWindowSec = 60 on the sampled job: stored configuration, NOT proven batching behavior",
+      "status": "PASS",
+      "batchWindowSec": 60,
+      "scope": "stored config on one sampled job"
+    },
+    {
+      "group": "construction",
+      "label": "params allowlist-respecting (ND-7): [taskName,newStart,summaryHe] within [taskName,newStart,summaryHe]",
+      "status": "PASS",
+      "params": {
+        "taskName": "zz-qa-D1",
+        "newStart": "2027-03-03T09:45:00+02:00",
+        "summaryHe": "אפקט דומינו: 1 משימות תלויות יזוזו (zz-qa-D2)"
+      }
+    },
+    {
+      "group": "split",
+      "label": "stored external target INTENT exists for the subscriber-channel group: 1 - NOT fanout/delivery evidence",
+      "status": "PASS",
+      "external": [
+        {
+          "channel": "whatsapp",
+          "address": "+972521100001",
+          "recipientLabel": "לקוח - מפיק ראשי (ערוץ)"
+        }
+      ],
+      "total": 1,
+      "scope": "stored intent only; sandbox providers are log-only"
+    },
+    {
+      "group": "split",
+      "label": "target split is explicit per target (channel/address typed, no implicit fanout)",
+      "status": "PASS",
+      "sample": [
+        {
+          "channel": "whatsapp",
+          "address": "+972521100001",
+          "recipientLabel": "לקוח - מפיק ראשי (ערוץ)"
+        }
+      ]
+    },
+    {
+      "group": "isolation",
+      "label": "point check: org B admin reading org A event graph -> 404 (no cross-tenant existence leak)",
+      "status": "PASS",
+      "httpStatus": 404,
+      "scope": "point-only, not an isolation matrix"
+    },
+    {
+      "group": "isolation",
+      "label": "point check: org B admin reading org A notification jobs -> 404",
+      "status": "PASS",
+      "httpStatus": 404,
+      "scope": "point-only, not an isolation matrix"
+    },
+    {
+      "group": "isolation",
+      "label": "point check: org A jobs reference only org A event; org B jobs only org B event (disjoint)",
+      "status": "PASS",
+      "scope": "point-only"
+    },
+    {
+      "group": "isolation",
+      "label": "point check: job id sets disjoint across tenants",
+      "status": "PASS",
+      "scope": "point-only"
+    },
+    {
+      "group": "surface",
+      "label": "UNTESTED: DispatchRecord lifecycle (sent/failed/attempts/provider receipts), batching behavior, idempotency semantics, durability/recovery - NO HTTP surface; sandbox providers are log-only on staging",
+      "status": "NOTE",
+      "untested": [
+        "batching",
+        "idempotency",
+        "provider delivery/retry/receipt",
+        "durability/recovery"
+      ],
+      "gap": "provider-level lifecycle evidence needs a read-only deliveries endpoint or server-log capture - flagged to TL, not a test failure",
+      "adapters": "twilio/whatsapp-cloud/webpush sandbox adapters never invent creds; nothing leaves the process"
+    },
+    {
+      "group": "cleanup",
+      "label": "both orgs: sacrificial events deleted",
+      "status": "PASS",
+      "a": 200,
+      "b": 200
+    },
+    {
+      "group": "cleanup",
+      "label": "leftover sweep: zero zz-qa- events in both orgs",
+      "status": "PASS",
+      "a": [],
+      "b": []
+    }
+  ]
+}
