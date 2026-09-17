@@ -1,0 +1,14 @@
+import puppeteer from 'puppeteer-core';
+const b = await puppeteer.launch({ executablePath: '/usr/bin/google-chrome', args: ['--no-sandbox','--disable-gpu'] });
+const p = await b.newPage();
+await p.setViewport({ width: 390, height: 844 });
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+await p.goto('http://localhost:4173/?_=sa1#/tower?profile=camp&role=admin', { waitUntil: 'networkidle0' }); await sleep(1500);
+await p.screenshot({ path: '../qa/parity/sa-picker-390.png' });
+await p.evaluate(() => [...document.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'מעבר להתחזות בדיקה')?.click());
+await sleep(1800);
+await p.screenshot({ path: '../qa/parity/sa-badge-390.png' });
+await p.evaluate(() => [...document.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'חזרה לזהות האמיתית')?.click());
+await sleep(1800);
+await p.screenshot({ path: '../qa/parity/sa-returned-390.png' });
+await b.close(); console.log('done');

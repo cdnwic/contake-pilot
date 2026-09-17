@@ -1,0 +1,275 @@
+{
+  "version": "2.0",
+  "date": "2026-09-17",
+  "additiveOnly": true,
+  "provenance": "v1.4 (27, canonical repo) + v1.5 additions (18, verified pkg) + v1.19 user.update-settings + v1.19-addendum-2 notifications.deliveries.read + v1.6 additions (3, verified pkg, channel.optout admin=deny corrected)",
+  "note": "Matrix Adjudication v1.0 (parent-relayed 2026-09-17 03:38, pending QA confirmation): content.delete fm=deny per canonical artifacts/matrix/matrix.v1.5.additions.json @ 56ce68db (independently verified vs origin/main 23364c1d; delivered docs/ copy 16b4b1b0 fm=propose is the archived pre-correction byte set). committed=50 cells; enforced=48 - user.update-settings and notifications.deliveries.read are contract-committed but implementation-pending (routes do not exist in main/remediation); they enter enforcement with their implementing PRs.",
+  "roles": [
+    "admin",
+    "field_manager",
+    "focus_worker"
+  ],
+  "matrix": {
+    "branch.archive": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "branch.create": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "branch.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "branch.update": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "change.approve": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "change.reject": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "channel.optout": {
+      "admin": "deny",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "scope": "system",
+      "note": "Machine-principal-only (system-inbound webhook actor). No user-facing route exists; any user-role invocation is deny. Audit entity: external_party (before/after consent), subscriber_channel, or optout_suppression (durable record keyed (channel, address), inbound correlation)."
+    },
+    "constraint.lock": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "constraint.unlock": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "content.ack": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "scope"
+    },
+    "content.attach": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "content.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "content.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "content.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "scope"
+    },
+    "content.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "dependency.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "dependency.delete": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "domino.apply": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "domino.compute": {
+      "admin": "allow",
+      "field_manager": "allow",
+      "focus_worker": "deny"
+    },
+    "event.create": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "event.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "event.publish": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "event.update": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "notifications.deliveries.read": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "scope": "org",
+      "status": "pending-implementation"
+    },
+    "notify.send.targeted": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "org.matrix.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "report.correct": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "report.list": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "report.mark_read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "report.resolve": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "report.status.create": {
+      "admin": "allow",
+      "field_manager": "allow",
+      "focus_worker": "allow"
+    },
+    "resource.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "resource.delete": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "resource.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "stakeholder.create": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "stakeholder.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "stakeholder.link": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "stakeholder.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "stakeholder.update": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "task.advance": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "task.assign": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "task.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "task.delete": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "task.move": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "task.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "user.update-settings": {
+      "admin": "allow",
+      "field_manager": "allow",
+      "focus_worker": "allow",
+      "scope": "self",
+      "status": "pending-implementation"
+    },
+    "whitelist.approve": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.invite": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.list": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.reject": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    }
+  },
+  "enforcedCount": 48,
+  "committedCount": 50,
+  "supersededCandidates": [
+    "matrix.v2.candidate-v1-superseded-20260917.json (content.delete fm=propose; preserved per founder preservation directive)"
+  ]
+}

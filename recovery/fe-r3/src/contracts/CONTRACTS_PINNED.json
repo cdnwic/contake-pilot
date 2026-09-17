@@ -1,0 +1,9 @@
+{
+  "pinned_version": "1.18",
+  "pinned_at": "2026-09-14T13:36:00+03:00",
+  "contracts.v1.ts": "4c6629a788b33e604b75ff69a3f9ea5882225221d4a5d2e1bfe25e1ab0c9e761",
+  "supersedes": {
+    "1.17": "ff050fad498a48d91c94bdd4e71843ea24fdf5d4e2ee530d7d641610bbbbf9ea"
+  },
+  "note": "additive: whitelist onboarding (section 15), 4 whitelist.* actions, audit entity whitelist_entry, whitelist.updated frame; camp pilot pre-seeded approved, zero behavior change"
+}

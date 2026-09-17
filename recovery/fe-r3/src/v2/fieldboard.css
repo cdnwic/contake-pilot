@@ -1,0 +1,7 @@
+
+/* React mount node must not break body-level flex/grid contexts */
+#root { display: contents; }
+/* builder dock clears the global tab bar on phone */
+@media (max-width: 1099px) {
+  .dock { bottom: calc(60px + env(safe-area-inset-bottom)); padding-bottom: var(--space-3); }
+}

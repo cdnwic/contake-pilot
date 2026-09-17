@@ -1,0 +1,3 @@
+
+/* React mount node must not break the body's column flex */
+#root { display: contents; }

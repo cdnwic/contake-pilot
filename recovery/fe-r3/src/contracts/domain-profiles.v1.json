@@ -1,0 +1,165 @@
+{
+  "version": "1.0",
+  "date": "2026-09-11",
+  "note": "G0 seed fixtures. Profile = labels + catalog + rules + notification templates. Zero schema change between verticals. Shape defined by contracts DomainProfile; QA owns fixture expansion.",
+  "profiles": [
+    {
+      "id": "camp",
+      "displayNameHe": "קייטנה",
+      "labels": {
+        "event": "יום קייטנה", "task": "פעילות",
+        "resource": {"person": "מדריך", "equipment": "ציוד", "location": "מתקן", "group": "חוג"},
+        "role": {"admin": "מנהל קייטנה", "field_manager": "רכז משמרת", "focus_worker": "מדריך"}
+      },
+      "catalog": [
+        {"resourceKind": "person", "name": "מדריך", "exclusive": true},
+        {"resourceKind": "equipment", "name": "אוטובוס", "exclusive": true},
+        {"resourceKind": "equipment", "name": "ערכת עזרה ראשונה", "exclusive": true},
+        {"resourceKind": "location", "name": "בריכה", "exclusive": true},
+        {"resourceKind": "location", "name": "חדר ספורט", "exclusive": true},
+        {"resourceKind": "group", "name": "חוג", "exclusive": false, "capacity": 30}
+      ],
+      "taskTemplates": [
+        {"name": "ארוחת בוקר", "durationMin": 45, "defaultAssigneeKinds": ["group", "location"]},
+        {"name": "פעילות חוג", "durationMin": 60, "defaultAssigneeKinds": ["person", "group", "location"]},
+        {"name": "טיול", "durationMin": 240, "defaultAssigneeKinds": ["person", "group", "equipment"]}
+      ],
+      "rules": {"maxShiftMin": 120, "workingWindow": {"startHHMM": "07:30", "endHHMM": "16:30"}, "externalStakeholderLabel": "הורים"},
+      "notificationTemplates": {
+        "task_delayed": "שלום, {{taskName}} נדחה ויתחיל ב-{{newStart}}. איסוף כרגיל.",
+        "task_moved": "שלום, {{taskName}} הוזז ל-{{newStart}}.",
+        "task_cancelled": "שלום, {{taskName}} בוטל. פרטים אצל מנהל הקייטנה.",
+        "change_needs_approval": "ממתין לאישורך: {{summaryHe}}"
+      }
+    },
+    {
+      "id": "event-production",
+      "displayNameHe": "הפקת אירוע",
+      "labels": {
+        "event": "אירוע", "task": "משימת הפקה",
+        "resource": {"person": "איש צוות", "equipment": "ציוד", "location": "מתחם", "group": "צוות"},
+        "role": {"admin": "מפיק ראשי", "field_manager": "מנהל במה", "focus_worker": "איש צוות"}
+      },
+      "catalog": [
+        {"resourceKind": "person", "name": "טכנאי", "exclusive": true},
+        {"resourceKind": "equipment", "name": "מערכת הגברה", "exclusive": true},
+        {"resourceKind": "location", "name": "במה ראשית", "exclusive": true},
+        {"resourceKind": "group", "name": "צוות הקמה", "exclusive": false}
+      ],
+      "taskTemplates": [
+        {"name": "הקמה", "durationMin": 180, "defaultAssigneeKinds": ["group", "equipment", "location"]},
+        {"name": "סאונד-צ'ק", "durationMin": 60, "defaultAssigneeKinds": ["person", "equipment", "location"]}
+      ],
+      "rules": {"maxShiftMin": 90, "workingWindow": {"startHHMM": "06:00", "endHHMM": "23:59"}, "externalStakeholderLabel": "לקוחות"},
+      "notificationTemplates": {
+        "task_delayed": "עדכון: {{taskName}} נדחה ל-{{newStart}}.",
+        "task_moved": "עדכון: {{taskName}} הוזז ל-{{newStart}}.",
+        "task_cancelled": "עדכון: {{taskName}} בוטל.",
+        "change_needs_approval": "ממתין לאישורך: {{summaryHe}}"
+      }
+    },
+    {
+      "id": "film-shoot",
+      "displayNameHe": "יום צילום",
+      "labels": {
+        "event": "יום צילום", "task": "סצנה",
+        "resource": {"person": "איש צוות", "equipment": "ציוד צילום", "location": "לוקיישן", "group": "מחלקה"},
+        "role": {"admin": "מנהל הפקה", "field_manager": "עוזר במאי", "focus_worker": "איש צוות"}
+      },
+      "catalog": [
+        {"resourceKind": "person", "name": "צוות תאורה", "exclusive": true},
+        {"resourceKind": "equipment", "name": "מצלמה A", "exclusive": true},
+        {"resourceKind": "location", "name": "לוקיישן 1", "exclusive": true},
+        {"resourceKind": "group", "name": "מחלקת סאונד", "exclusive": false}
+      ],
+      "taskTemplates": [
+        {"name": "סצנה", "durationMin": 90, "defaultAssigneeKinds": ["person", "equipment", "location"]},
+        {"name": "העברת לוקיישן", "durationMin": 45, "defaultAssigneeKinds": ["group", "equipment"]}
+      ],
+      "rules": {"maxShiftMin": 60, "workingWindow": {"startHHMM": "06:00", "endHHMM": "22:00"}, "externalStakeholderLabel": "לקוחות"},
+      "notificationTemplates": {
+        "task_delayed": "עדכון צילום: {{taskName}} נדחה ל-{{newStart}}.",
+        "task_moved": "עדכון צילום: {{taskName}} הוזז ל-{{newStart}}.",
+        "task_cancelled": "עדכון צילום: {{taskName}} בוטל.",
+        "change_needs_approval": "ממתין לאישורך: {{summaryHe}}"
+      }
+    },
+    {
+      "id": "conference",
+      "displayNameHe": "כנס",
+      "labels": {
+        "event": "כנס", "task": "מושב",
+        "resource": {"person": "מפעיל", "equipment": "ציוד", "location": "אולם", "group": "משתתפים"},
+        "role": {"admin": "מנהל כנס", "field_manager": "אחראי אולם", "focus_worker": "מפעיל"}
+      },
+      "catalog": [
+        {"resourceKind": "person", "name": "טכנאי אולם", "exclusive": true},
+        {"resourceKind": "equipment", "name": "מקרן", "exclusive": true},
+        {"resourceKind": "location", "name": "אולם מרכזי", "exclusive": true},
+        {"resourceKind": "group", "name": "מסלול משתתפים", "exclusive": false, "capacity": 200}
+      ],
+      "taskTemplates": [
+        {"name": "הרצאת פlenary", "durationMin": 60, "defaultAssigneeKinds": ["location", "equipment", "person"]},
+        {"name": "הפסקה", "durationMin": 30, "defaultAssigneeKinds": ["group"]}
+      ],
+      "rules": {"maxShiftMin": 45, "workingWindow": {"startHHMM": "08:00", "endHHMM": "20:00"}, "externalStakeholderLabel": "משתתפים"},
+      "notificationTemplates": {
+        "task_delayed": "עדכון כנס: {{taskName}} נדחה ל-{{newStart}}.",
+        "task_moved": "עדכון כנס: {{taskName}} הוזז ל-{{newStart}}.",
+        "task_cancelled": "עדכון כנס: {{taskName}} בוטל.",
+        "change_needs_approval": "ממתין לאישורך: {{summaryHe}}"
+      }
+    },
+    {
+      "id": "logistics",
+      "displayNameHe": "לוגיסטיקה והקמות",
+      "labels": {
+        "event": "פרויקט הקמה", "task": "משימת הקמה",
+        "resource": {"person": "עובד", "equipment": "כלי/רכב", "location": "אתר", "group": "צוות"},
+        "role": {"admin": "מנהל פרויקט", "field_manager": "מנהל אתר", "focus_worker": "עובד"}
+      },
+      "catalog": [
+        {"resourceKind": "person", "name": "רכבן", "exclusive": true},
+        {"resourceKind": "equipment", "name": "משאית", "exclusive": true},
+        {"resourceKind": "location", "name": "אתר A", "exclusive": false},
+        {"resourceKind": "group", "name": "צוות הקמה", "exclusive": false}
+      ],
+      "taskTemplates": [
+        {"name": "הובלה", "durationMin": 120, "defaultAssigneeKinds": ["person", "equipment"]},
+        {"name": "הקמה באתר", "durationMin": 240, "defaultAssigneeKinds": ["group", "equipment", "location"]}
+      ],
+      "rules": {"maxShiftMin": 180, "workingWindow": {"startHHMM": "06:00", "endHHMM": "20:00"}, "externalStakeholderLabel": "לקוחות"},
+      "notificationTemplates": {
+        "task_delayed": "עדכון לוגיסטי: {{taskName}} נדחה ל-{{newStart}}.",
+        "task_moved": "עדכון לוגיסטי: {{taskName}} הוזז ל-{{newStart}}.",
+        "task_cancelled": "עדכון לוגיסטי: {{taskName}} בוטל.",
+        "change_needs_approval": "ממתין לאישורך: {{summaryHe}}"
+      }
+    },
+    {
+      "id": "after-school",
+      "displayNameHe": "רשת חוגים",
+      "labels": {
+        "event": "יום פעילות", "task": "חוג",
+        "resource": {"person": "מדריך", "equipment": "ציוד", "location": "כיתה", "group": "קבוצה"},
+        "role": {"admin": "מנהל רשת", "field_manager": "רכז סניף", "focus_worker": "מדריך"}
+      },
+      "catalog": [
+        {"resourceKind": "person", "name": "מדריך", "exclusive": true},
+        {"resourceKind": "equipment", "name": "ערכת חוג", "exclusive": true},
+        {"resourceKind": "location", "name": "כיתה", "exclusive": true},
+        {"resourceKind": "group", "name": "קבוצת חוג", "exclusive": false, "capacity": 25}
+      ],
+      "taskTemplates": [
+        {"name": "חוג", "durationMin": 60, "defaultAssigneeKinds": ["person", "group", "location"]}
+      ],
+      "rules": {"maxShiftMin": 60, "workingWindow": {"startHHMM": "14:00", "endHHMM": "19:00"}, "externalStakeholderLabel": "הורים"},
+      "notificationTemplates": {
+        "task_delayed": "שלום, {{taskName}} נדחה ויתחיל ב-{{newStart}}.",
+        "task_moved": "שלום, {{taskName}} הוזז ל-{{newStart}}.",
+        "task_cancelled": "שלום, {{taskName}} בוטל היום.",
+        "change_needs_approval": "ממתין לאישורך: {{summaryHe}}"
+      }
+    }
+  ]
+}
