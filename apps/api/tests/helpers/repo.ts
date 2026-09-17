@@ -50,3 +50,53 @@ export async function makeTestBackend(): Promise<{ repo: GraphRepository; otpSto
   }
   return { repo: MemoryGraphRepository.seeded(seedDemo()), otpStore: memoryOtpState() };
 }
+
+/** Whitelist-PG gate (harness lane): one fault-injection / observation point
+ *  for the auth_audit channel on BOTH adapters. The shared whitelist suites
+ *  drive audit failures and pauses through this hook and read outcomes through
+ *  the returned store:
+ *  - memory: wraps otpStore.appendAuthAudit (the repo's committed-write sink
+ *    AND the route-level appendWhitelistAudit both flow through it);
+ *  - postgres: intercepts INSERT INTO auth_audit at the connectable layer, so
+ *    BOTH the PG OTP store's appends and the PG repo's in-tx committed insert
+ *    are seen - the adapter's real write path is exercised, never bypassed.
+ *  A paused hook holds the PGlite serialization chain, so a racing admin
+ *  mutation queues exactly as it would behind the open registration tx.
+ *  Assertions in the carried suites are unchanged. */
+export type AuditHook = (
+  entry: { phone: string; kind: string; detail?: unknown },
+  real: () => Promise<unknown>,
+) => unknown;
+
+export interface TestBackend {
+  repo: GraphRepository;
+  otpStore: OtpStateStore;
+  setAuditHook: (hook?: AuditHook) => void;
+}
+
+export async function makeTestBackendFrom(data: SeedData): Promise<TestBackend> {
+  if (REPO_IMPL === 'postgres') {
+    let hook: AuditHook | undefined;
+    const raw = await freshPglite();
+    const wrapped = {
+      query: (text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[]; affectedRows?: number }> => {
+        if (hook && /^\s*INSERT\s+INTO\s+auth_audit/i.test(text)) {
+          const entry = { phone: String(params?.[0]), kind: String(params?.[1]), detail: params?.[2] ?? undefined };
+          return Promise.resolve(hook(entry, () => raw.query(text, params))) as Promise<{ rows: Record<string, unknown>[]; affectedRows?: number }>;
+        }
+        return raw.query(text, params);
+      },
+    };
+    const conn = pgliteConnectable(wrapped);
+    const repo = await PostgresGraphRepository.create(conn);
+    await applySeed(repo, data);
+    const otpStore = await createPgOtpState(conn);
+    return { repo, otpStore, setAuditHook: h => { hook = h; } };
+  }
+  const repo = MemoryGraphRepository.seeded(data);
+  const otpStore = memoryOtpState();
+  let hook: AuditHook | undefined;
+  const realAppend = otpStore.appendAuthAudit.bind(otpStore);
+  otpStore.appendAuthAudit = e => (hook ? Promise.resolve(hook(e, () => realAppend(e))) as Promise<void> : realAppend(e));
+  return { repo, otpStore, setAuditHook: h => { hook = h; } };
+}
