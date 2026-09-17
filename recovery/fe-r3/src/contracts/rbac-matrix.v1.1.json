@@ -1,0 +1,45 @@
+{
+  "version": "1.0",
+  "date": "2026-09-11",
+  "normativeSource": "contake_rbac_spec.md (delivered to product owner 2026-09-11)",
+  "roles": ["admin", "field_manager", "focus_worker"],
+  "impactClasses": {
+    "S0": "local — own task only, no external recipients",
+    "S1": "site — other tasks in same site",
+    "S2": "cross-site or shared exclusive resource",
+    "S3": "external stakeholders (group subscribers: parents/clients/suppliers)"
+  },
+  "approvalRule": "apply authority = impactClass x role, enforced server-side only. Decision values: allow | scope | propose | deny. 'scope' = allow within own site scope only; 'propose' = becomes ChangeRequest pending_review.",
+  "matrix": {
+    "event.create":    {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "event.update":    {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "event.delete":    {"admin": "allow", "field_manager": "deny",    "focus_worker": "deny"},
+    "event.publish":   {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "task.create":     {"admin": "allow", "field_manager": "scope",   "focus_worker": "deny"},
+    "task.update":     {"admin": "allow", "field_manager": "scope",   "focus_worker": "deny"},
+    "task.move":       {"admin": "allow", "field_manager": "scope",   "focus_worker": "deny"},
+    "task.delete":     {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "task.assign":     {"admin": "allow", "field_manager": "scope",   "focus_worker": "deny"},
+    "resource.create": {"admin": "allow", "field_manager": "scope",   "focus_worker": "deny"},
+    "resource.update": {"admin": "allow", "field_manager": "scope",   "focus_worker": "deny"},
+    "resource.delete": {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "dependency.create": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "dependency.delete": {"admin": "allow", "field_manager": "scope", "focus_worker": "deny"},
+    "constraint.lock":   {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "constraint.unlock": {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "domino.compute":  {"admin": "allow", "field_manager": "allow",   "focus_worker": "deny"},
+    "domino.apply":    {"admin": "allow", "field_manager": "propose", "focus_worker": "deny"},
+    "change.approve":  {"admin": "allow", "field_manager": "deny",    "focus_worker": "deny"},
+    "change.reject":   {"admin": "allow", "field_manager": "deny",    "focus_worker": "deny"},
+    "report.status.create": {"admin": "allow", "field_manager": "allow", "focus_worker": "allow"},
+    "notify.send.targeted": {"admin": "allow", "field_manager": "deny",  "focus_worker": "deny"}
+  },
+  "autoEscalation": "Any allow/scope whose computed impact >= S1 for field_manager, or >= S3 for admin when external recipients are included, routes through ChangeRequest regardless of the base cell. focus_worker never receives the full graph (data minimization).",
+  "changeRequestRules": {
+    "stateMachine": "proposed -> pending_review -> approved(applied) | rejected",
+    "editPolicy": "A pending ChangeRequest cannot be edited. Proposer withdraws and resubmits (new id). Locked decision, per QA charter AC-RBAC-5 option.",
+    "selfApproval": "Forbidden for cross-scope changes; admin-only approve.",
+    "staleBase": "Approve on a moved base graph version => 409 stale, re-propose. Never force-apply."
+  },
+  "denyByDefault": "Any action x role combination not listed is denied (403), including unknown actions."
+}

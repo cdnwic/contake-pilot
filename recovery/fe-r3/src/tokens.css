@@ -1,0 +1,131 @@
+/* ============================================================
+   Contake Design Language — "The Board" (הלוח)
+   tokens.css v0.1 — implementation-ready design tokens
+   Day Board (light, default) + Night Board (dark, opt-in)
+   Hebrew-native RTL: use CSS logical properties only.
+   ============================================================ */
+
+:root {
+  /* ---- Typography ---- */
+  --font-sans: 'Heebo', 'Assistant', 'Rubik', 'Noto Sans Hebrew', sans-serif;
+  --font-mono: 'IBM Plex Mono', 'JetBrains Mono', ui-monospace, monospace;
+
+  --text-micro: 0.75rem;    /* 12 — labels, chips */
+  --text-small: 0.8125rem;  /* 13 — secondary rows */
+  --text-dense: 0.875rem;   /* 14 — Tower body */
+  --text-body:  1rem;       /* 16 — base (Hebrew floor) */
+  --text-lead:  1.125rem;   /* 18 — Focus secondary */
+  --text-title: 1.25rem;    /* 20 — section title */
+  --text-head:  1.75rem;    /* 28 — page head */
+  --text-clock: 2.5rem;     /* 40 — event clock (Tower) */
+  --text-focus-clock: 3.5rem; /* 56 — Focus Mode clock */
+
+  --leading-tight: 1.3;
+  --leading-body: 1.6;      /* Hebrew needs air; never below 1.5 */
+  /* NEVER letter-spacing on Hebrew. Latin-only micro labels: 0.04em */
+
+  /* ---- Spacing (4px base) ---- */
+  --space-1: 0.25rem; --space-2: 0.5rem; --space-3: 0.75rem;
+  --space-4: 1rem;    --space-6: 1.5rem; --space-8: 2rem; --space-12: 3rem;
+
+  /* ---- Shape ---- */
+  --radius-sm: 2px;   /* chips, rows */
+  --radius-md: 4px;   /* cards */
+  --radius-dot: 9999px; /* status dots only */
+  --border-hairline: 1px;
+  --border-rule: 2px;   /* "binding edge" top rule on cards */
+
+  /* ---- Density ---- */
+  --row-tower: 44px;        /* Control Tower row height */
+  --target-min: 48px;       /* any interactive element */
+  --target-field: 64px;     /* Focus Mode primary buttons (gloves/sunlight) */
+
+  /* ---- Motion ---- */
+  --dur-state: 120ms;       /* hover, press, color state */
+  --dur-layout: 240ms;      /* rail shifts, expand/collapse */
+  --dur-flash: 600ms;       /* status-change flash, fires once */
+  --ease-out: cubic-bezier(0.2, 0, 0.1, 1);
+  /* No springs, no bounce. prefers-reduced-motion: all → 0ms */
+
+  /* ---- Elevation: paper does not glow ---- */
+  --shadow-overlay: 0 2px 8px rgb(23 21 15 / 0.18);
+  /* resting UI: NO shadow. Overlays only, always with 1px border. */
+
+  /* ---- Semantic status (hues constant across themes) ---- */
+  /* Color = state. Never decorative. */
+  --status-ok:   #15803D;  --status-ok-ink:   #0F5C2E;
+  --status-risk: #B45309;  --status-risk-ink: #8A4307;
+  --status-slip: #B91C1C;  --status-slip-ink: #8F1616;
+  --status-off:  #6B6759;  /* inactive/neutral — info is gray, not blue */
+}
+
+/* ============ DAY BOARD (default; sunlight-safe) ============ */
+:root, [data-theme="day"] {
+  color-scheme: light;
+  --paper:        #F7F5F0;  /* page — warm paper */
+  --paper-raised: #FFFFFF;  /* cards */
+  --paper-sunk:   #EFEDE6;  /* wells, zebra, track */
+  --ink:          #17150F;  /* primary text, heavy rules */
+  --ink-2:        #55524A;  /* secondary text */
+  --ink-3:        #8A867B;  /* timestamps, metadata (AA on paper) */
+  --line:         #D9D5C9;  /* hairlines */
+  --line-strong:  #17150F;  /* 2px binding edges */
+  --action:       #1D4ED8;  /* "blue pen" — links + primary action only */
+  --action-hover: #1E40AF;
+  --action-ink:   #FFFFFF;
+  --status-ok-bg:   #E4F2E8;
+  --status-risk-bg: #F8ECD9;
+  --status-slip-bg: #F9E3E1;
+  --focus-ring: 2px solid var(--action);
+}
+
+/* ============ NIGHT BOARD (opt-in: night shoots, dark venues) ============ */
+[data-theme="night"] {
+  color-scheme: dark;
+  --paper:        #12110D;  /* warm near-black, not slate */
+  --paper-raised: #1A1913;
+  --paper-sunk:   #0C0B08;
+  --ink:          #F2EFE6;
+  --ink-2:        #B3AFA1;
+  --ink-3:        #7C7869;
+  --line:         #2E2C22;
+  --line-strong:  #F2EFE6;
+  --action:       #8FB4FF;
+  --action-hover: #B0C8FF;
+  --action-ink:   #0E1526;
+  --status-ok:   #4ADE80;  --status-ok-bg:   #14271A;
+  --status-risk: #FFB400;  --status-risk-bg: #2B2210; /* telemetry amber */
+  --status-slip: #FF6B5E;  --status-slip-bg: #2E1512;
+  --status-off:  #7C7869;
+  --shadow-overlay: 0 2px 8px rgb(0 0 0 / 0.5);
+  --focus-ring: 2px solid var(--action);
+}
+
+/* ---- Vertical identity stripes (folder-tab markers only;
+        NEVER interactive accents, NEVER status) ---- */
+[data-vertical="camp"]       { --vertical-tab: #E8590C; } /* hi-vis orange   */
+[data-vertical="event"]      { --vertical-tab: #C2255C; } /* stage magenta   */
+[data-vertical="film"]       { --vertical-tab: #E9B949; } /* gaffer yellow   */
+[data-vertical="logistics"]  { --vertical-tab: #1971C2; } /* truck blue      */
+[data-vertical="education"]  { --vertical-tab: #087F5B; } /* classroom green */
+
+/* ---- Baseline element rules ---- */
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+  background: var(--paper);
+  color: var(--ink);
+}
+.tnum, time, .clock, .data {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  direction: ltr;            /* times and counters stay LTR everywhere */
+  unicode-bidi: isolate;
+}
+[dir="rtl"] * { letter-spacing: 0; }  /* guard: no tracking on Hebrew */
+:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }
+}

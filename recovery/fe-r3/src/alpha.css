@@ -1,0 +1,4 @@
+/* Super Admin test-impersonation marker (Alpha feature 2026-09-17; new UI, not RC regression) */
+.impersonation-banner{display:flex;align-items:center;gap:var(--space-3);background:#FFF4D6;border-block-end:2px solid #B45309;color:#17150F;padding:var(--space-2) var(--space-4);font-size:var(--text-dense)}
+.impersonation-banner b{background:#B45309;color:#fff;border-radius:var(--radius-sm);padding:2px 8px}
+.impersonation-banner .btn{margin-inline-start:auto;min-height:36px}

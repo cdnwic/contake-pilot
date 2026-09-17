@@ -1,0 +1,9 @@
+/* Self-hosted fonts (design review: no CDN dependency). Heebo variable files per weight, IBM Plex Mono latin. */
+@font-face { font-family: 'Heebo'; font-style: normal; font-weight: 400; font-display: swap; src: url('/fonts/Heebo-400-hebrew.woff2') format('woff2'); unicode-range: U+0590-05FF, U+FB1D-FB4F; }
+@font-face { font-family: 'Heebo'; font-style: normal; font-weight: 500; font-display: swap; src: url('/fonts/Heebo-500-hebrew.woff2') format('woff2'); unicode-range: U+0590-05FF, U+FB1D-FB4F; }
+@font-face { font-family: 'Heebo'; font-style: normal; font-weight: 700; font-display: swap; src: url('/fonts/Heebo-700-hebrew.woff2') format('woff2'); unicode-range: U+0590-05FF, U+FB1D-FB4F; }
+@font-face { font-family: 'Heebo'; font-style: normal; font-weight: 400; font-display: swap; src: url('/fonts/Heebo-400-latin.woff2') format('woff2'); }
+@font-face { font-family: 'Heebo'; font-style: normal; font-weight: 500; font-display: swap; src: url('/fonts/Heebo-500-latin.woff2') format('woff2'); }
+@font-face { font-family: 'Heebo'; font-style: normal; font-weight: 700; font-display: swap; src: url('/fonts/Heebo-700-latin.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url('/fonts/IBMPlexMono-400-latin.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 500; font-display: swap; src: url('/fonts/IBMPlexMono-500-latin.woff2') format('woff2'); }
