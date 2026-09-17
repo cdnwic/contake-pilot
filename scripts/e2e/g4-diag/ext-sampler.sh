@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# G4 diagnostic external sampler v3 (controller). 1s JSONL series for the
+# G4 diagnostic external sampler (controller v4 family). 1s JSONL series for the
 # dedicated diagnostic process group: per-process PID/PPID/state/cumulative
 # CPU jiffies/RSS/threads/fds/socket-fds/wchan + birth/death events; system
 # memory/load/PSI/OOM counter/cgroup limits. Events: sampler-start,
@@ -12,10 +12,12 @@ PGID_T="${1:-}"; OUT="${2:-}"; CAP="${3:-600}"
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 if [ -z "$PGID_T" ] || ! [[ "$PGID_T" =~ ^[0-9]+$ ]] || [ "$PGID_T" -lt 100 ] || [ "$PGID_T" = "$SELF_PGID" ] || [ "$PGID_T" = "$PPID" ]; then
   echo "{\"ts\":\"$(date -Iseconds)\",\"ev\":\"abort-bad-pgid\",\"given\":\"$PGID_T\",\"self_pgid\":$SELF_PGID}" >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
   exit 2
 fi
 T0=$(date +%s)
 jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" --argjson selfpid $$ --argjson selfpgid "$SELF_PGID" --argjson cap "$CAP" '{ts:$ts,ev:"sampler-start",target_pgid:$pgid,self_pid:$selfpid,self_pgid:$selfpgid,cap_s:$cap}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
 EMPTY=0
 declare -A SEEN=()
 sysline() {
@@ -36,6 +38,7 @@ sample() {
     EMPTY=$((EMPTY+1))
     if [ "$EMPTY" -ge 10 ]; then
       jq -nc --arg ts "$ts" --argjson el "$((now-T0))" '{ts:$ts,ev:"target-exit",elapsed_s:$el,note:"10 consecutive empty samples"}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
       return 1
     fi
     return 0
@@ -51,6 +54,7 @@ sample() {
     if [ -z "${SEEN[$pid]:-}" ]; then
       SEEN[$pid]=1
       jq -nc --arg ts "$ts" --argjson pid "$pid" --argjson ppid "${ppid:-0}" --arg cmd "${comm:-?}" '{ts:$ts,ev:"proc-birth",pid:$pid,ppid:$ppid,comm:$cmd}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
     fi
     pline=$(jq -nc --argjson pid "$pid" --argjson ppid "${ppid:-0}" --arg st "${stat:-?}" --arg state "${state:-?}" --argjson pcpu "${pcpu:-0}" --argjson rss "${rss:-0}" --argjson nlwp "${nlwp:-0}" --arg cmd "${comm:-?}" --argjson fds "${fds:-0}" --argjson socks "${socks:-0}" --argjson utime "${uj:-0}" --argjson stime "${sj:-0}" --arg wchan "${wch:-0}" --argjson arr "$pline" '$arr + [{pid:$pid,ppid:$ppid,stat:$st,state:$state,pcpu:$pcpu,rss_kb:$rss,threads:$nlwp,comm:$cmd,fds:$fds,sock_fds:$socks,utime_jiffies_cum:$utime,stime_jiffies_cum:$stime,wchan:$wchan}]')
   done
@@ -58,15 +62,18 @@ sample() {
     if [ -n "${SEEN[$pid]:-}" ] && ! [[ " $pids " =~ " $pid " ]]; then
       SEEN[$pid]=""
       jq -nc --arg ts "$ts" --argjson pid "$pid" '{ts:$ts,ev:"proc-death",pid:$pid}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
     fi
   done
   jq -nc --arg ts "$ts" --argjson el "$((now-T0))" --argjson pgid "$PGID_T" --argjson sys "$(sysline)" --argjson procs "$pline" '{ts:$ts,ev:"sample",elapsed_s:$el,pgid:$pgid,sys:$sys,procs:$procs}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
   return 0
 }
 residue_check() {
   local left
   left=$(pgrep -g "$PGID_T" 2>/dev/null | wc -l)
   jq -nc --arg ts "$(date -Iseconds)" --argjson n "$left" --argjson pgid "$PGID_T" '{ts:$ts,ev:"residue-check",target_pgid:$pgid,members_remaining:$n}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
   [ "$left" -eq 0 ]
 }
 while sample; do
@@ -83,19 +90,23 @@ while sample; do
       done
       jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" '{ts:$ts,ev:"sigterm-sent",target_pgid:$pgid}'
     } >> "$OUT" 2>&1
+    sync -f "$OUT" 2>/dev/null || sync
     kill -TERM -"$PGID_T" 2>/dev/null
     sleep 10
     if pgrep -g "$PGID_T" >/dev/null 2>&1; then
       jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" '{ts:$ts,ev:"sigkill-sent",target_pgid:$pgid}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
       kill -KILL -"$PGID_T" 2>/dev/null
       sleep 2
     fi
     residue_check || true
     jq -nc --arg ts "$(date -Iseconds)" '{ts:$ts,ev:"sampler-done",reason:"cap"}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
     exit 0
   fi
   sleep 1
 done
 residue_check || true
 jq -nc --arg ts "$(date -Iseconds)" '{ts:$ts,ev:"sampler-done",reason:"target-exit"}' >> "$OUT"
+  sync -f "$OUT" 2>/dev/null || sync
 exit 0

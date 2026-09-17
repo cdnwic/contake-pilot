@@ -6,7 +6,16 @@
  *  their cross-domain skew (fake-timer detection), CPU/RSS, event-loop
  *  utilization + delay, active handle/request TYPES, timer details, and
  *  caller-supplied socket-room / client / http-connection / PGlite data. */
-import { appendFileSync } from 'node:fs';
+import { openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
+
+/** append + fsync one line (durable before return; diagnostics only). */
+const writeLine = (path: string | undefined, line: string): void => {
+  if (!path) return;
+  try {
+    const f = openSync(path, 'a');
+    try { writeSync(f, line); fsyncSync(f); } finally { closeSync(f); }
+  } catch { /* diagnostics never disturb the harness */ }
+};
 import { performance, monitorEventLoopDelay, type EventLoopDelayMonitor } from 'node:perf_hooks';
 
 const OUT = process.env['G4_DIAG_LOG'];
@@ -73,9 +82,9 @@ export function probe(label: string, extra: Record<string, unknown> = {}): void 
       },
       ...extra,
     };
-    appendFileSync(OUT, JSON.stringify(rec) + '\n');
+    writeLine(OUT, JSON.stringify(rec) + '\n');
     const mirror = EXT_LOG ? MIRROR_EVENTS[label] : undefined;
-    if (mirror) appendFileSync(EXT_LOG as string, JSON.stringify({ ts: rec.wallIso, ev: mirror, pid: process.pid, label }) + '\n');
+    if (mirror) writeLine(EXT_LOG, JSON.stringify({ ts: rec.wallIso, ev: mirror, pid: process.pid, label }) + '\n');
   } catch { /* diagnostics never disturb the harness */ }
 }
 
