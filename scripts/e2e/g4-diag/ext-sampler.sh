@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# G4 diagnostic external sampler (controller v7 family). 1s JSONL series for the
+# G4 diagnostic external sampler (controller v8 family). 1s JSONL series for the
 # dedicated diagnostic process group: per-process PID/PPID/state/cumulative
 # CPU jiffies/RSS/threads/fds/socket-fds/wchan + birth/death events; system
 # memory/load/PSI/OOM counter/cgroup limits. Events: sampler-start,
@@ -26,6 +26,20 @@ verify_identity() {
   [ "$(ps -o sid= -p "$vpid" 2>/dev/null | tr -d ' ')" = "$vsid" ] || return 1
   [ "$(sed 's/^.*) //' "/proc/$vpid/stat" 2>/dev/null | awk '{print $20}')" = "$vticks" ] || return 1
   return 0
+}
+verify_members_sid() {
+  # v8 fallback: the sentinel leader may legitimately die on TERM while
+  # TERM-resistant members survive. Verify EVERY remaining group member is in
+  # the bound session before a group KILL.
+  [ -n "$IDENTITY_FILE" ] && [ -f "$IDENTITY_FILE" ] || return 1
+  local vsid m any=0
+  vsid=$(jq -r '.sid // empty' "$IDENTITY_FILE")
+  [[ "$vsid" =~ ^[0-9]+$ ]] || return 1
+  for m in $(pgrep -g "$PGID_T" 2>/dev/null); do
+    any=1
+    [ "$(ps -o sid= -p "$m" 2>/dev/null | tr -d ' ')" = "$vsid" ] || return 1
+  done
+  [ "$any" = "1" ]
 }
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 if [ -z "$PGID_T" ] || ! [[ "$PGID_T" =~ ^[0-9]+$ ]] || [ "$PGID_T" -lt 100 ] || [ "$PGID_T" = "$SELF_PGID" ] || [ "$PGID_T" = "$PPID" ]; then
@@ -118,8 +132,8 @@ while sample; do
     kill -TERM -"$PGID_T" 2>/dev/null
     tw=0; while pgrep -g "$PGID_T" >/dev/null 2>&1 && [ $tw -lt 10 ]; do sleep 1; tw=$((tw+1)); done
     if pgrep -g "$PGID_T" >/dev/null 2>&1; then
-      if [ -n "$IDENTITY_FILE" ] && ! verify_identity; then
-        jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" '{ts:$ts,ev:"identity-refuse",target_pgid:$pgid,reason:"identity mismatch before KILL; no signal sent"}' >> "$OUT"
+      if [ -n "$IDENTITY_FILE" ] && ! verify_identity && ! verify_members_sid; then
+        jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" '{ts:$ts,ev:"identity-refuse",target_pgid:$pgid,reason:"identity mismatch before KILL (leader and member sid checks failed); no signal sent"}' >> "$OUT"
         sync -f "$OUT" 2>/dev/null || sync
         exit 3
       fi

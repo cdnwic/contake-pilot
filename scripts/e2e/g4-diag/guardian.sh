@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guardian v7: alive BEFORE the sentinel exists (two-ack design).
+# Guardian v8: alive BEFORE the sentinel exists (two-ack design).
 #  ack1 (guardian-armed.json): deadline validated and armed - the controller
 #    records launch-intent and creates the sentinel only after ack1.
 #  bind window: waits for the pre-exec identity.json until the absolute
@@ -144,6 +144,38 @@ while true; do
     fi
     if ! verify_target; then
       if pgrep -g "$BPGID" >/dev/null 2>&1; then
+        if [ ! -d "/proc/$BPID" ]; then
+          # post-exec orphan fallback: bound leader dead, group members remain.
+          # sid-verify every member against the bound session, then TERM->KILL.
+          ok=1
+          for p in $(pgrep -g "$BPGID" 2>/dev/null); do
+            [ "$(ps -o sid= -p "$p" 2>/dev/null | tr -d ' ')" = "$BSID" ] || { ok=0; break; }
+          done
+          if [ "$ok" = "1" ]; then
+            gev residue-sweep --arg reason "bound leader dead; sid-verified leaderless group" --argjson pgid "$BPGID"
+            gev term-sent --argjson target_pgid "$BPGID" --arg via residue-sweep
+            kill -TERM -"$BPGID" 2>/dev/null
+            i=0
+            while pgrep -g "$BPGID" >/dev/null 2>&1 && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
+            if pgrep -g "$BPGID" >/dev/null 2>&1; then
+              ok=1
+              for p in $(pgrep -g "$BPGID" 2>/dev/null); do
+                [ "$(ps -o sid= -p "$p" 2>/dev/null | tr -d ' ')" = "$BSID" ] || { ok=0; break; }
+              done
+              if [ "$ok" = "1" ]; then
+                gev kill-sent --argjson target_pgid "$BPGID" --arg via residue-sweep
+                kill -KILL -"$BPGID" 2>/dev/null
+                sleep 2
+              else
+                gev identity-refuse --arg reason "sid changed during sweep; KILL withheld"
+                exit 4
+              fi
+            fi
+            LEFT=$(pgrep -g "$BPGID" 2>/dev/null | wc -l)
+            gev residue --argjson members_remaining "$LEFT" --arg via residue-sweep
+            exit 0
+          fi
+        fi
         gev identity-refuse --arg reason "identity mismatch at enforce time with group members present; NO signal sent" --argjson pgid "$BPGID"
         exit 4
       fi
@@ -170,6 +202,20 @@ while true; do
         gev kill-sent --argjson target_pgid "$BPGID"
         kill -KILL -"$BPGID" 2>/dev/null
         sleep 2
+      elif [ ! -d "/proc/$BPID" ]; then
+        # v8: leader died on TERM while members ignore it; sid-verify members
+        ok=1
+        for p in $(pgrep -g "$BPGID" 2>/dev/null); do
+          [ "$(ps -o sid= -p "$p" 2>/dev/null | tr -d ' ')" = "$BSID" ] || { ok=0; break; }
+        done
+        if [ "$ok" = "1" ]; then
+          gev kill-sent --argjson target_pgid "$BPGID" --arg via sid-verified-members
+          kill -KILL -"$BPGID" 2>/dev/null
+          sleep 2
+        else
+          gev identity-refuse --arg reason "leader dead after TERM with sid mismatch among members; KILL withheld"
+          exit 4
+        fi
       else
         gev identity-refuse --arg reason "identity changed after TERM wait; KILL withheld"
         exit 4

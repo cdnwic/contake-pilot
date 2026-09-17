@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# Controller v7 (QA spec): guardian alive BEFORE sentinel creation (two-ack).
-# Order: preflight -> unique run dir -> deadline.json (absolute deadline,
-# sentinel token, atomic+fsync+dir-fsync) -> guardian launch -> ack1
-# (guardian-armed.json verified) -> launch-intent.json (fsynced) -> setsid
-# BLOCKED sentinel (gate derives from the SAME absolute deadline + margin)
-# -> EXIT/INT/TERM/HUP cleanup armed -> identity.json persisted immediately
-# (pre-exec) -> guardian ack2 (bound identity, content verified) -> atomic
-# release -> sentinel execs experiment -> sampler -> bounded reap.
-# Reaping: bounded wait distinguishes xpid-reaped from xpid-absent. Normal
-# completion requires residue 0: any residue -> nonzero exit, never success.
-# Identity binding (pid/pgid/sid/start-ticks/sentinel) precedes every signal;
-# mismatch -> loud refusal, no signal. Truthful status: experiment-outcome
-# separate from cleanup-complete; cap -> 124; signals -> 128+n; residue -> 98.
-# experiment.log is BEST-EFFORT; fsynced JSONL streams are authoritative.
+# Controller v8 (QA spec): guardian-first two-ack launch; sentinel is the
+# STABLE session/group leader for the whole experiment (never execs). After
+# release the sentinel runs the command as a same-group child, durably
+# records command RC (command-rc.json), drains descendants for a bounded
+# time, and stays alive reporting residue if any remain. Controller main
+# path: poll for the durable RC record or sentinel death -> bounded drain
+# window -> ACTIVELY clean valid-identity residue (TERM -> bounded wait ->
+# KILL, identity re-verified before each signal) -> bounded reap
+# (xpid-reaped vs xpid-absent). SUCCESS REQUIRES ALL: command RC 0, sampler
+# normal exit, stable sentinel reaped, residue zero. Any residue => nonzero
+# exit, never success. Cap => 124; signals => 128+n. experiment-outcome is
+# separate from cleanup-complete. experiment.log is BEST-EFFORT; fsynced
+# JSONL streams are authoritative.
 # Test hooks (default off): CTRL_PHASE_SLEEP, CTRL_RUN_BASE, CTRL_ACK_TIMEOUT,
-# GUARDIAN_GRACE_S, SENTINEL_MARGIN_S, CTRL_TEST_PGID_POISON.
+# GUARDIAN_GRACE_S, SENTINEL_MARGIN_S, SENTINEL_DRAIN_S, CTRL_TEST_PGID_POISON.
 # usage: controller.sh --label N --cap S --workdir D -- <cmd...>
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -32,6 +31,7 @@ CLEANUP_MARGIN=90
 BASE="${CTRL_RUN_BASE:-/tmp}"
 ACK_TIMEOUT="${CTRL_ACK_TIMEOUT:-15}"
 PHASE_SLEEP="${CTRL_PHASE_SLEEP:-0}"
+DRAIN="${SENTINEL_DRAIN_S:-5}"
 
 refuse() { echo "PREFLIGHT REFUSE: $1" >&2; exit 2; }
 [ -n "$LABEL" ] && [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || refuse "bad label"
@@ -62,7 +62,6 @@ fi
 ev controller-start --argjson pid $$ --argjson cap "$CAP" --arg lbl "$LABEL" --arg cmd "$*" \
   --arg stdout_stream best-effort --argjson authoritative '["events.jsonl","guardian.jsonl","ext.jsonl"]'
 
-# --- absolute deadline + sentinel token ------------------------------------
 phase 1
 SENTINEL=$(cat /proc/sys/kernel/random/uuid)
 DEADLINE=$(( $(date +%s) + CAP ))
@@ -102,20 +101,57 @@ reap_xpid() { # bounded reap: distinguishes reaped from absent
   return 1
 }
 
+group_left() { pgrep -g "$XPGID" 2>/dev/null | wc -l; }
+
+active_clean_group() { # identity-verified TERM -> bounded wait -> KILL; $1=context
+  local i
+  if verify_identity; then
+    ev term-sent --argjson pgid "$XPGID" --arg context "$1"
+    kill -TERM -"$XPGID" 2>/dev/null
+    i=0
+    while [ "$(group_left)" != "0" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); done
+    if [ "$(group_left)" != "0" ]; then
+      if verify_identity; then
+        ev kill-sent --argjson pgid "$XPGID" --arg context "$1"
+        kill -KILL -"$XPGID" 2>/dev/null; sleep 1
+      elif [ ! -d "/proc/$XPID" ]; then
+        # v8: leader died on TERM while members ignore it; sid-verify members
+        local ok=1 p
+        for p in $(pgrep -g "$XPGID" 2>/dev/null); do
+          [ "$(ps -o sid= -p "$p" 2>/dev/null | tr -d ' ')" = "$XPGID" ] || { ok=0; break; }
+        done
+        if [ "$ok" = "1" ]; then
+          ev kill-sent --argjson pgid "$XPGID" --arg context "$1-sid-verified-leaderless"
+          kill -KILL -"$XPGID" 2>/dev/null; sleep 1
+        else
+          ev identity-refuse --arg context "$1" --arg reason "leader dead after TERM with sid mismatch; KILL withheld"
+        fi
+      else
+        ev identity-refuse --arg context "$1" --arg reason "identity changed after TERM wait; KILL withheld"
+      fi
+    fi
+  elif [ "$IDENTITY_PUBLISHED" = "1" ] && [ ! -d "/proc/$XPID" ] && [ "$(group_left)" != "0" ]; then
+    # sentinel dead but group members remain: sid-verify each member against
+    # the bound session, then kill the group (post-exec orphan fallback)
+    local ok=1 p
+    for p in $(pgrep -g "$XPGID" 2>/dev/null); do
+      [ "$(ps -o sid= -p "$p" 2>/dev/null | tr -d ' ')" = "$XPGID" ] || { ok=0; break; }
+    done
+    if [ "$ok" = "1" ]; then
+      ev kill-sent --argjson pgid "$XPGID" --arg context "$1-sid-verified-leaderless"
+      kill -KILL -"$XPGID" 2>/dev/null; sleep 1
+    else
+      ev identity-refuse --arg context "$1" --arg reason "leaderless group with sid mismatch; no signal sent"
+    fi
+  else
+    ev identity-refuse --arg context "$1" --arg reason "identity mismatch; no signal sent"
+  fi
+}
+
 kill_reap_sentinel() {
   local left
   if [ "$IDENTITY_PUBLISHED" = "1" ]; then
-    if verify_identity; then
-      ev term-sent --argjson pgid "$XPGID"
-      kill -TERM -"$XPGID" 2>/dev/null
-      local i=0
-      while pgrep -g "$XPGID" >/dev/null 2>&1 && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
-      if pgrep -g "$XPGID" >/dev/null 2>&1; then
-        verify_identity && { ev kill-sent --argjson pgid "$XPGID"; kill -KILL -"$XPGID" 2>/dev/null; sleep 2; }
-      fi
-    else
-      ev identity-refuse --arg context cleanup --arg reason "identity mismatch; no signal sent"
-    fi
+    active_clean_group cleanup
     reap_xpid || true
   elif [ -n "$XPID" ] && [ -d "/proc/$XPID" ]; then
     local cpgid ccmd
@@ -130,7 +166,7 @@ kill_reap_sentinel() {
       ev identity-refuse --arg context pre-identity-cleanup --arg reason "child identity uncertain; no signal sent"
     fi
   fi
-  left=$([ -n "$XPGID" ] && pgrep -g "$XPGID" 2>/dev/null | wc -l || echo 0)
+  left=$([ -n "$XPGID" ] && group_left || echo 0)
   ev cleanup-complete --argjson residue "${left:-0}"
 }
 
@@ -187,7 +223,6 @@ while true; do
 done
 ev guardian-armed --argjson guardian_pid "$GPID"
 
-# --- launch intent (fsynced) ------------------------------------------------
 phase launch-intent
 jq -nc --arg ts "$(date -Iseconds)" --arg sentinel "$SENTINEL" --arg cmd "$*" --argjson cpid $$ \
   '{ts:$ts,sentinel:$sentinel,intended_cmd:$cmd,controller_pid:$cpid}' > "$RUN/launch-intent.json.tmp" \
@@ -195,9 +230,8 @@ jq -nc --arg ts "$(date -Iseconds)" --arg sentinel "$SENTINEL" --arg cmd "$*" --
   && mv "$RUN/launch-intent.json.tmp" "$RUN/launch-intent.json" && fsync_dir || { ev write-failure --arg file launch-intent; exit 2; }
 ev launch-intent-recorded
 
-# --- blocked sentinel (gate derives from deadline + margin) -----------------
 phase child-created
-SENTINEL_MARGIN_S="${SENTINEL_MARGIN_S:-15}" setsid "$HERE/sentinel-launch.sh" "$RUN" -- "$@" &
+SENTINEL_MARGIN_S="${SENTINEL_MARGIN_S:-15}" SENTINEL_DRAIN_S="$DRAIN" setsid "$HERE/sentinel-launch.sh" "$RUN" -- "$@" &
 XPID=$!
 trap 'exit_cleanup' EXIT
 trap 'signal_cleanup term 15' TERM; trap 'signal_cleanup int 2' INT; trap 'signal_cleanup hup 1' HUP
@@ -224,7 +258,6 @@ jq -nc --argjson pid "$XPID" --argjson pgid "$XPGID" --argjson sid "$XSID" --arg
 IDENTITY_PUBLISHED=1
 ev identity-published --argjson pid "$XPID" --argjson pgid "$XPGID" --argjson sid "$XSID" --argjson ticks "$XTICKS"
 
-# --- ack2: bound identity permits release ------------------------------------
 phase identity-published
 i=0
 while true; do
@@ -246,21 +279,59 @@ ev sentinel-released
 "$HERE/ext-sampler.sh" "$XPGID" "$RUN/ext.jsonl" "$CAP" "$RUN" "$IDENTITY_FILE" "$SENTINEL" &
 SPID=$!
 
-wait "$XPID"; RC=$?
-echo "$RC" > "$RUN/exitcode"; sync -f "$RUN/exitcode" 2>/dev/null || true
-ev experiment-exited --argjson rc "$RC"
-wait "$SPID" 2>/dev/null
-LEFT=$(pgrep -g "$XPGID" 2>/dev/null | wc -l)
-if [ "$LEFT" != "0" ]; then
-  OUTCOME=residue-left; EXIT_CODE=98
-elif [ -f "$RUN/cap-fired" ]; then
+# --- completion: poll durable command RC record or sentinel death -----------
+RC=""
+while true; do
+  if [ -f "$RUN/command-rc.json" ] && jq -e . "$RUN/command-rc.json" >/dev/null 2>&1; then
+    RC=$(jq -r '.rc' "$RUN/command-rc.json")
+    break
+  fi
+  if ! kill -0 "$XPID" 2>/dev/null; then
+    wait "$XPID" 2>/dev/null
+    ev xpid-reaped --argjson pid "$XPID" --arg phase completion-poll
+    if [ -f "$RUN/command-rc.json" ] && jq -e . "$RUN/command-rc.json" >/dev/null 2>&1; then
+      RC=$(jq -r '.rc' "$RUN/command-rc.json")
+    else
+      RC=""
+    fi
+    break
+  fi
+  sleep 0.5
+done
+[ -n "$RC" ] && ev experiment-exited --argjson rc "$RC" || ev experiment-exited --arg rc missing --arg note "sentinel died without durable RC record"
+
+# --- bounded drain window, then ACTIVE residue cleanup -----------------------
+i=0
+while kill -0 "$XPID" 2>/dev/null && [ $i -lt $(( (DRAIN + 3) * 2 )) ]; do sleep 0.5; i=$((i+1)); done
+HAD_RESIDUE=0
+grep -q '"ev":"sentinel-residue"' "$EVLOG" 2>/dev/null && HAD_RESIDUE=1
+if kill -0 "$XPID" 2>/dev/null || [ "$(group_left)" != "0" ]; then
+  [ "$HAD_RESIDUE" = "0" ] && { HAD_RESIDUE=1; ev residue-observed --arg source controller-poll; }
+  ev residue-clean-start
+  active_clean_group residue-clean
+  reap_xpid || true
+fi
+if kill -0 "$XPID" 2>/dev/null; then :; else wait "$XPID" 2>/dev/null; fi
+wait "$SPID" 2>/dev/null; SPRC=$?
+LEFT=$(group_left)
+
+if [ -f "$RUN/cap-fired" ]; then
   OUTCOME=cap-killed; EXIT_CODE=124
+elif [ "$LEFT" != "0" ]; then
+  OUTCOME=residue-left; EXIT_CODE=98
+elif [ "$HAD_RESIDUE" = "1" ]; then
+  OUTCOME=residue-cleaned; EXIT_CODE=98
+elif [ -z "$RC" ]; then
+  OUTCOME=interrupted; EXIT_CODE=97
+elif [ "$SPRC" != "0" ]; then
+  OUTCOME=sampler-lost; EXIT_CODE=97
 elif [ "$RC" -eq 0 ]; then
   OUTCOME=success; EXIT_CODE=0
+  ev sentinel-reaped-stable --argjson pid "$XPID"
 else
   OUTCOME=failed; EXIT_CODE=$RC; [ "$EXIT_CODE" -gt 125 ] && EXIT_CODE=1; [ "$EXIT_CODE" -eq 0 ] && EXIT_CODE=1
 fi
-ev experiment-outcome --arg outcome "$OUTCOME" --argjson rc "$RC"
+ev experiment-outcome --arg outcome "$OUTCOME" --argjson rc "${RC:--1}" --argjson sampler_rc "$SPRC"
 ev cleanup-complete --argjson residue "$LEFT"
 CLEANED=1
 trap - EXIT INT TERM HUP
