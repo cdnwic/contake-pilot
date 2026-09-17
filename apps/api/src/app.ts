@@ -12,6 +12,7 @@ import { appEvents } from './services/events.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
 import { AuthService } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
+import { ReportClientIdConflictError } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
 import { auditDenied, type DenialMeta, audit, deviceClassOf } from './services/audit.js';
 import type { AuditEntityType, Branch, ContentItem, ContentItemVersion, ExternalParty, OptoutSuppression, StatusToken, TaskContentRole, TaskResourceLink } from '@contake/core';
@@ -1005,12 +1006,45 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (!body.taskId || !body.status || !body.clientReportId || !body.clientTimestamp) {
       fail(400, 'BAD_REQUEST', 'חסרים taskId / status / clientReportId / clientTimestamp');
     }
-    const existing = await repo.getReportByClientId(body.clientReportId);
-    if (existing) return { report: existing, deduped: true };
+    // v1.20.2 (QA QM3 2026-09-17): task resolution, same-org binding and
+    // per-role scope authorization run BEFORE any idempotent replay, so a
+    // clientReportId can never become a cross-tenant read oracle.
     const task = await repo.getTask(body.taskId);
     if (!task) fail(404, 'NOT_FOUND', 'המשימה לא נמצאה');
     const snapshot = await repo.snapshot(task.eventId);
     if (!snapshot || snapshot.event.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'המשימה לא נמצאה');
+    // All statuses: FM is limited to in-scope sites (matching the list route),
+    // FW to their own assignment; admin passes on same-org binding above.
+    if (user.role === 'field_manager' && !taskInScope(user, task.eventId, task.siteId)) {
+      fail(403, 'FORBIDDEN', 'לא ניתן לדווח על משימה מחוץ לתחום', {
+        reason: 'scope_violation', action: 'report.status.create', entityType: 'task', entityId: task.id, eventId: task.eventId,
+      });
+    }
+    if (user.role === 'focus_worker' && (!user.linkedResourceId || !task.assigneeResourceIds.includes(user.linkedResourceId))) {
+      fail(403, 'FORBIDDEN', 'לא ניתן לדווח על משימה שלא משובצת אליך', {
+        reason: 'scope_violation', action: 'report.status.create', entityType: 'task', entityId: task.id, eventId: task.eventId,
+      });
+    }
+    // Tenant/actor-safe idempotency: an exact same-actor replay returns the
+    // existing report with no effects; any other collision (changed
+    // task/payload, different actor, different org) is a 409 with a conflict
+    // audit in the ATTEMPTING org and no leak of the stored row.
+    const conflictAudit = () => audit(repo, {
+      orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
+      action: 'report.status.create', entityType: 'task', entityId: task.id,
+      after: { outcome: 'conflict', reason: 'client_report_id_taken' }, deviceClass: deviceClassOf(ua(req)),
+    });
+    const replayOrConflict = async (existing: StatusReport): Promise<{ report: StatusReport; deduped: true }> => {
+      const samePayload = existing.taskId === task.id && existing.status === body.status
+        && (existing.delayMin ?? undefined) === (body.delayMin ?? undefined)
+        && (existing.noteHe ?? undefined) === (body.noteHe ?? undefined)
+        && existing.clientTimestamp === body.clientTimestamp;
+      if (existing.reportedBy === user.userId && samePayload) return { report: existing, deduped: true };
+      await conflictAudit();
+      return fail(409, 'REPORT_CONFLICT', 'כבר קיים דיווח עם מזהה זה');
+    };
+    const existing = await repo.getReportByClientId(body.clientReportId);
+    if (existing) return replayOrConflict(existing);
 
     const report: StatusReport = {
       id: newId('rep'),
@@ -1040,7 +1074,9 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       }
       delayed = { change, domino, decision };
     }
-    const outcome = await withAuditSafety(repo, async () => {
+    let outcome: { report: StatusReport; applied?: { domino: DominoResult }; changeRequest?: ChangeRequest };
+    try {
+    outcome = await withAuditSafety(repo, async () => {
       await repo.createReport(report);
       await audit(repo, {
         orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
@@ -1084,6 +1120,15 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       });
       return { report, changeRequest: cr };
     });
+    } catch (e) {
+      // Durable-uniqueness race: another request won this clientReportId
+      // mid-transaction; our tx rolled back fully - resolve against the winner.
+      if (e instanceof ReportClientIdConflictError) {
+        const winner = await repo.getReportByClientId(body.clientReportId!);
+        if (winner) return replayOrConflict(winner);
+      }
+      throw e;
+    }
     // TL pinned semantic: a report-originated escalated CR mirrors proposeMutation —
     // admins see change.pending in realtime AND get the admin-only approval-needed job.
     if ('changeRequest' in outcome) {

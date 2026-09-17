@@ -26,6 +26,13 @@ export interface ChannelRecord {
 }
 
 /** Storage contract (architecture §2: Postgres/Prisma later, behind THIS interface). */
+/** Durable idempotency backstop (QA QM3 2026-09-17): clientReportId is unique
+ *  across the reports table; adapters raise this on a uniqueness race so the
+ *  route can resolve replay-or-conflict against the winner row. */
+export class ReportClientIdConflictError extends Error {
+  constructor() { super('REPORT_CLIENT_ID_CONFLICT'); this.name = 'ReportClientIdConflictError'; }
+}
+
 export interface GraphRepository {
   // users & channels
   createUser(u: UserRecord): Promise<UserRecord>;

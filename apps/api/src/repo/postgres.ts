@@ -6,6 +6,7 @@ import type {
   WhitelistEntry, WhitelistStatus, AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
+import { ReportClientIdConflictError } from './graph-repository.js';
 import type { DispatchStateStore } from '../services/dispatch.js';
 import type { AuthAuditEntry, OtpCodeEntry, OtpStateStore, OtpVerifyState } from '../auth.js';
 
@@ -87,7 +88,7 @@ CREATE INDEX IF NOT EXISTS branches_org ON branches(org_id);
 CREATE INDEX IF NOT EXISTS tasks_event_id ON tasks(event_id);
 CREATE INDEX IF NOT EXISTS resources_event_id ON resources(event_id);
 CREATE INDEX IF NOT EXISTS channels_address ON channels(address);
-CREATE INDEX IF NOT EXISTS reports_client_report_id ON reports(client_report_id);
+CREATE UNIQUE INDEX IF NOT EXISTS reports_client_report_id_unique ON reports(client_report_id);
 CREATE INDEX IF NOT EXISTS notification_jobs_idem ON notification_jobs(idempotency_key);
 CREATE INDEX IF NOT EXISTS audit_log_org_id ON audit_log(org_id);
 CREATE INDEX IF NOT EXISTS change_requests_event_id ON change_requests(event_id);
@@ -470,7 +471,13 @@ export class PostgresGraphRepository implements GraphRepository {
     await this.q(
       `INSERT INTO reports(id, task_id, client_report_id, data) VALUES($1,$2,$3,$4)
        ON CONFLICT (id) DO UPDATE SET task_id=EXCLUDED.task_id, client_report_id=EXCLUDED.client_report_id, data=EXCLUDED.data`,
-      [r.id, r.taskId, r.clientReportId ?? null, JSON.stringify(r)]);
+      [r.id, r.taskId, r.clientReportId ?? null, JSON.stringify(r)]).catch((e: unknown) => {
+      const code = (e as { code?: string }).code;
+      if (code === '23505' || (e instanceof Error && /duplicate key/i.test(e.message))) {
+        throw new ReportClientIdConflictError();
+      }
+      throw e;
+    });
     return r;
   }
   async getReportByClientId(clientReportId: string): Promise<StatusReport | undefined> {

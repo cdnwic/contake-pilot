@@ -30,19 +30,20 @@ const report = (token: string, clientReportId: string, status = 'done', extra: R
   });
 
 describe('M3-QA-2 edge probes: Focus offline queue (server side)', () => {
-  it('duplicate clientReportId with DIVERGENT content is treated as a dup of the first, not silently accepted', async () => {
+  it('duplicate clientReportId with DIVERGENT content is a 409 conflict (QA QM3 2026-09-17), first write untouched', async () => {
     const w1 = await otpLogin('+972500000001');
     const first = await report(w1, 'cr-1', 'done');
     expect(first.statusCode).toBe(200);
-    const firstId = first.json().report.id as string;
     const dup = await report(w1, 'cr-1', 'delayed', { delayMin: 45, noteHe: 'תוכן שונה לגמרי' });
-    expect(dup.statusCode).toBe(200);
-    expect(dup.json().deduped).toBe(true);
-    expect(dup.json().report.id).toBe(firstId);
+    // QA QM3 supersedes the M3-QA-2 dedup-on-divergence semantic: a changed
+    // payload under the same clientReportId is a conflict, never a silent dup.
+    expect(dup.statusCode).toBe(409);
     const stored = (await repo.listReports('e1')).filter(r => r.clientReportId === 'cr-1');
     expect(stored.length).toBe(1);
     expect(stored[0]!.status).toBe('done'); // first write wins; divergent retry has zero effect
     expect(stored[0]!.clientTimestamp).toBe('2026-09-14T14:30:00+03:00');
+    const conflict = (await repo.listAudit('org-1')).filter(r => r.action === 'report.status.create' && r.afterJson?.includes('client_report_id_taken'));
+    expect(conflict.length).toBe(1);
   });
 
   it('expired/invalid token -> 401; after OTP re-auth the queued report syncs exactly once', async () => {
