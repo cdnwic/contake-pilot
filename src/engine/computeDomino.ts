@@ -1,7 +1,7 @@
 import type {
   Conflict, DominoResult, DomainProfile, GraphSnapshot, ID, Impact, ImpactClass,
   ProposedChange, TaskNode,
-} from '../contracts/contake-core-contracts.v1.1';
+} from '../contracts/contracts.v1';
 import { topoSort } from './graph/dag';
 import { hhmmToMin, parseInstant, renderInstant, wallMinutes } from './time';
 

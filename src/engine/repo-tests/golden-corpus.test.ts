@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { computeDomino } from '../computeDomino';
 import { getProfile } from '../../profiles/profiles';
 import { assertScenario, scenarios } from './fixtures/golden-corpus.v1.1';
-import type { GraphSnapshot, TaskNode } from '../../contracts/contake-core-contracts.v1.1';
+import type { GraphSnapshot, TaskNode } from '../../contracts/contracts.v1';
 
 /** QA golden corpus v1.1 — the executable acceptance standard for computeDomino.
  *  Fixtures are QA-owned; a failure here is a Sev-1 class bug, never a fixture edit. */

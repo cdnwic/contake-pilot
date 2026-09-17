@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { DomainProfile } from '../contracts/contake-core-contracts.v1.1';
+import type { DomainProfile } from '../contracts/contracts.v1';
 import profilesJson from './profiles.v1.json' with { type: 'json' };
 
 /** Domain profiles (drop-in fixtures, QA-approved v1.1). Validated at load:

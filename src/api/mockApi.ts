@@ -54,6 +54,7 @@ export const FOCUS_LINKED: Record<string, { userId: string; resourceId: string; 
   conference: { userId: 'u-omer', resourceId: 'c-omer', display: 'עומר · מפעיל טכני' },
   logistics: { userId: 'u-haim', resourceId: 'l-haim', display: 'חיים · מוביל' },
   'after-school': { userId: 'u-avi2', resourceId: 'u-avi', display: 'אבי · מדריך ג׳ודו' },
+  education: { userId: 'u-asnat', resourceId: 't-asnat', display: 'אסנת · מורה למתמטיקה' },
 };
 
 function stateOf(profileId: string): ProfileState {

@@ -27,3 +27,8 @@ explicit, logged, QA-verified layer — never an edit to the recovered snapshot.
 - QA evidence: vitest 23/23 incl. repo golden corpus (G1 flagship, lock-mid-chain, film cross-domain) + dag.
 - status: awaiting independent QA verification (parent 11:43:47: local 23/23 is not independently verified
   until QA compares normalized source and reruns tests).
+
+## Preserved-candidates binding (QA stop-ship correction 5, 2026-09-17)
+- preserved-candidates/MANIFEST.sha256 added: 14 entries (13 candidates + README), manifest sha256 b175c1a3630dae8bd93e92ccfc8e0445bb693ea0dfc6d232dcef7879a4875166
+- Transferred archive r3-preserved-candidates-v2.tar.gz sha256 086b8f0bb2d9acedfad3e064444cd89b54b0857b6e28f741acc708a4e765183c (manifest included)
+- QA-verified checkpoint root a371df46f49f1ea8095eded68bf2bd72a8e54760 remains reachable as this branch's root commit.

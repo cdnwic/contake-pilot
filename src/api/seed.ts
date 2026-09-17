@@ -4,10 +4,15 @@
  * (pinned); the day graphs below are workstream fixtures, extensible by QA.
  * Times are event-local ISO with offset (Asia/Jerusalem = UTC+3 in Aug/Sep 2026).
  */
-import type { DependencyEdge, DomainProfile, GraphSnapshot, ResourceNode, TaskNode } from '../contracts/contake-core-contracts.v1';
-import profilePack from '../contracts/domain-profiles.v1.json';
+import type { DependencyEdge, GraphSnapshot, ResourceNode, TaskNode } from '../contracts/contake-core-contracts.v1';
+import type { DomainProfile } from '../contracts/contracts.v1';
+import { listProfiles } from '../profiles/profiles';
 
-export const PROFILES: DomainProfile[] = (profilePack as unknown as { profiles: DomainProfile[] }).profiles;
+// Runtime profile selection runs on the canonical 7-profile parity layer (src/profiles/,
+// byte-identical to profiles.v1.json @ origin/main 23364c1d). The recovered 6-profile snapshot
+// src/contracts/domain-profiles.v1.json is PRESERVED UNTOUCHED as recovery evidence
+// (R3-DIVERGENCE-LEDGER row 1; sha pinned by src/profiles/profiles-parity.test.ts).
+export const PROFILES: DomainProfile[] = listProfiles();
 
 const TZ = 'Asia/Jerusalem';
 const D = '2026-08-12';
@@ -227,6 +232,35 @@ export function seedAfterSchool(): GraphSnapshot {
   };
 }
 
+
+/* ---------------- education (canonical parity layer, authored-new fixture 2026-09-17) ----------------
+ * Vocabulary/labels/catalog from canonical profiles.v1.json @ origin/main 23364c1d (education entry);
+ * day graph is a new deterministic mock fixture, not recovered content. */
+export function seedEducation(): GraphSnapshot {
+  const ev = 'ev-school';
+  const resources: ResourceNode[] = [
+    res('t-asnat', ev, 'person', 'אסנת · מורה למתמטיקה', true),
+    res('t-david', ev, 'person', 'דוד · מורה למדעים', true),
+    res('t-ravit', ev, 'person', 'רוית · מורה לספורט', true),
+    res('t-comp2', ev, 'location', 'חדר מחשבים 2', true),
+    res('t-gym', ev, 'location', 'אולם ספורט', true),
+    res('t-lib', ev, 'location', 'ספרייה', true),
+    res('t-h1', ev, 'group', 'כיתה ח׳1', false, { capacity: 28, subscriberChannelIds: ['ch-grade-h1'] }),
+    res('t-h2', ev, 'group', 'כיתה ח׳2', false, { capacity: 26, subscriberChannelIds: ['ch-grade-h2'] }),
+  ];
+  const tasks: TaskNode[] = [
+    task('s1', ev, 'site-main', 'שיעור מתמטיקה · ח׳1', '08:00', 45, ['t-asnat', 't-h1', 't-comp2']),
+    task('s2', ev, 'site-main', 'שיעור מתמטיקה · ח׳2', '09:00', 45, ['t-asnat', 't-h2', 't-comp2']),
+    task('s3', ev, 'site-main', 'מבחן מדעים · ח׳1', '10:00', 90, ['t-david', 't-h1', 't-comp2']),
+    task('s4', ev, 'site-main', 'שיעור ספורט · ח׳2', '08:00', 45, ['t-ravit', 't-h2', 't-gym']),
+    task('s5', ev, 'site-main', 'שיעור ספרייה · ח׳1', '11:45', 45, ['t-asnat', 't-h1', 't-lib'], { locked: true }),
+  ];
+  return {
+    event: { id: ev, kind: 'event', orgId: 'org-ilanot', domainProfileId: 'education', name: 'בית ספר ״אילנות״ · יום לימודים', date: D, timezone: TZ, siteIds: ['site-main'], status: 'published', version: 1 },
+    tasks, resources, dependencies: [dep('s-d1', 's2', 's1'), dep('s-d2', 's3', 's2'), dep('s-d3', 's5', 's3')],
+  };
+}
+
 export const SEEDERS: Record<string, () => GraphSnapshot> = {
   camp: seedCamp,
   'event-production': seedEventProduction,
@@ -234,6 +268,7 @@ export const SEEDERS: Record<string, () => GraphSnapshot> = {
   conference: seedConference,
   logistics: seedLogistics,
   'after-school': seedAfterSchool,
+  education: seedEducation,
 };
 
 /** Subscriber channels (mock): label + reach count + channel, per group channel id. */
@@ -249,6 +284,8 @@ export const SUBSCRIBER_CHANNELS: Record<string, SubscriberChannel> = {
   'ch-cust-s': { id: 'ch-cust-s', label: 'לקוח — דרום (חלון מסירה)', count: 1, channel: 'sms' },
   'ch-judo-kids': { id: 'ch-judo-kids', label: 'הורי ג׳ודו ילדים', count: 22, channel: 'whatsapp' },
   'ch-judo-teens': { id: 'ch-judo-teens', label: 'הורי ג׳ודו נוער', count: 18, channel: 'whatsapp' },
+  'ch-grade-h1': { id: 'ch-grade-h1', label: 'הורי כיתה ח׳1', count: 26, channel: 'whatsapp' },
+  'ch-grade-h2': { id: 'ch-grade-h2', label: 'הורי כיתה ח׳2', count: 24, channel: 'whatsapp' },
   'ch-drama-kids': { id: 'ch-drama-kids', label: 'הורי דרמה ילדים', count: 16, channel: 'whatsapp' },
 };
 

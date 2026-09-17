@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { DependencyEdge } from '../../contracts/contake-core-contracts.v1.1';
+import type { DependencyEdge } from '../../contracts/contracts.v1';
 import { CycleError, assertAcyclic, topoSort, transitiveDependents, wouldCreateCycle } from '../graph/dag';
 
 const edge = (id: string, from: string, to: string): DependencyEdge =>

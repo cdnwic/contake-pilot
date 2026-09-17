@@ -1,4 +1,4 @@
-import type { DependencyEdge, ID } from '../../contracts/contake-core-contracts.v1.1';
+import type { DependencyEdge, ID } from '../../contracts/contracts.v1';
 
 /** Hebrew-named cycle error, per QA AC-GRAPH-1: any path that would create a
  *  cycle is rejected naming the cycle members. */

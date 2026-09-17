@@ -169,3 +169,28 @@ Logged per controlled-rebuild ruling; no runtime impact. tsc back to EXIT 0.
   console smoke clean on index/focus/login.
 - Manifest regenerated non-circular: R3-MANIFEST.sha256 (src+public, 75 files, sum in R3-MANIFEST.sum);
   R3-MANIFEST-ROOT.sha256 (root configs/docs/harnesses).
+
+## 2026-09-17 11:56 — QA stop-ship corrections v2 (verdict 11:51: engine/golden/DAG PASS, recovery PENDING)
+1. IMPORTS: engine/DAG/golden/profile type imports retargeted from historical contake-core-contracts.v1.1
+   to byte-canonical src/contracts/contracts.v1.ts (sha 4c6629a7… = packages/core/src/contracts.v1.ts @a32d1c0):
+   src/engine/computeDomino.ts, src/engine/graph/dag.ts, src/profiles/profiles.ts,
+   src/engine/repo-tests/{golden-corpus.test,dag.test}.ts, repo-tests/fixtures/golden-corpus.v1.1.ts (REWRITE-FIX ×6).
+   Old-app files intentionally keep v1.1 (recovered shell, out of QA correction scope).
+2. PARITY LAYER WIRED INTO RUNTIME: seed.ts PROFILES now = listProfiles() (canonical 7-profile layer);
+   recovered domain-profiles.v1.json untouched (sha-pinned). seedEducation() authored-new fixture in canonical
+   school vocabulary (בית ספר/שיעור/מורה/כיתה; working window 08:00-16:00, maxShift 90 per canonical rules);
+   registered in SEEDERS; FOCUS_LINKED + 2 subscriber channels added (mockApi REWRITE-FIX).
+   New src/api/education-runtime.test.ts (3 tests): runtime list = 7, acyclic valid seed, full
+   state→principal→report→domino path incl. s2 cascade move, s5 locked, AC-FR-2 exactly-once. 29/29.
+3. FONTS: 16 refs satisfied with 8 OFL-licensed woff2 (Heebo v28 variable, IBM Plex Mono v20) in
+   public/fonts/ + LICENSES.md (source URLs + shas); styles.css (RC capture) unmodified.
+   New smoke-assets.mjs: status+MIME+body+wOF2-magic validation of 3 entries, 7 bundles, 8 fonts,
+   favicon, sw-push — PASS.
+4. SECURITY: SECURITY-DISPOSITION.md — 5 audit findings all devDep toolchain (vite 5.4.21/vitest 2.1.9,
+   top of major lines; fixes need majors = separate TL decision); static dist runtime exposes no
+   vite/vitest/esbuild; raw audit in qa/logs/npm-audit-r3.json.
+5. preserved-candidates/MANIFEST.sha256 (14 entries); archive hash + manifest hash bound into
+   R3-DIVERGENCE-LEDGER.md.
+GATES after clean npm ci (log qa/logs/npm-ci-r3.log): tsc EXIT 0; vitest 29/29 (5 files); build EXIT 0
+(dist/fonts 9 files); console smoke clean ×3; asset smoke PASS. Test fix logged: education test
+uses beforeStart!==afterStart (Impact has impactClass, no 'kind').

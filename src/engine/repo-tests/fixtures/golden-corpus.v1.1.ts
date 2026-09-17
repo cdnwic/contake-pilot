@@ -9,7 +9,7 @@
 import type {
   GraphSnapshot, TaskNode, ResourceNode, DependencyEdge,
   ProposedChange, DomainProfile, DominoResult, Impact,
-} from '../../../contracts/contake-core-contracts.v1.1';
+} from '../../../contracts/contracts.v1';
 
 const T = 'Asia/Jerusalem';
 const D = '2026-09-14'; // a Monday

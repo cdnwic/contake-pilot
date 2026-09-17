@@ -73,3 +73,16 @@ views/Tower.tsx	VERBATIM	r2.1 views/Tower.tsx	e6c02449cee8
 src/profiles/profiles-parity.test.ts	authored-new	parity QA evidence per TL profiles-divergence ruling v1.0 (parent 11:43): pins recovered 6-profile snapshot sha + canonical 7-profile parity layer sha
 R3-DIVERGENCE-LEDGER.md	authored-new	divergence ledger rows: domain-profiles (6-recovered/7-canonical, parity-align) + computeDomino (stale-recovered/canonical-adopt)
 qa/logs/{tsc,vitest,vite-build,smoke-console}-r3.log	authored-new	raw gate logs for independent QA rerun/comparison (tsc 0, vitest 26/26, build 0, smoke clean x3)
+src/api/education-runtime.test.ts	authored-new	QA correction 2: education vertical end-to-end through mock runtime (29/29)
+src/api/seed.ts	REWRITE	QA correction 2: PROFILES wired to canonical 7-profile parity layer; seedEducation authored-new fixture; recovered domain-profiles.v1.json untouched
+src/api/mockApi.ts	REWRITE-FIX	QA correction 2: FOCUS_LINKED education entry
+src/engine/computeDomino.ts	REWRITE-FIX	QA correction 1: type imports → byte-canonical contracts.v1.ts
+src/engine/graph/dag.ts	REWRITE-FIX	QA correction 1: type imports → byte-canonical contracts.v1.ts
+src/profiles/profiles.ts	REWRITE-FIX	QA correction 1: type imports → byte-canonical contracts.v1.ts
+src/engine/repo-tests/golden-corpus.test.ts	REWRITE-FIX	QA correction 1: type imports → byte-canonical contracts.v1.ts
+src/engine/repo-tests/dag.test.ts	REWRITE-FIX	QA correction 1: type imports → byte-canonical contracts.v1.ts
+src/engine/repo-tests/fixtures/golden-corpus.v1.1.ts	REWRITE-FIX	QA correction 1: type imports → byte-canonical contracts.v1.ts
+public/fonts/	authored-new	QA correction 3: 8 OFL-licensed woff2 (Heebo v28, IBM Plex Mono v20) + LICENSES.md; satisfies 16 RC-capture css refs
+smoke-assets.mjs	authored-new	QA correction 3b: asset status/MIME/body/wOF2-magic smoke — PASS
+SECURITY-DISPOSITION.md	authored-new	QA correction 4: devDep-only audit disposition; vite/vitest never exposed at runtime
+preserved-candidates/MANIFEST.sha256	authored-new	QA correction 5: 14-entry manifest, hash bound into R3-DIVERGENCE-LEDGER.md
