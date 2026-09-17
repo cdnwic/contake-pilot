@@ -1,0 +1,75 @@
+file	status	origin	sha256-12
+App.tsx	VERBATIM	r2.1 App.tsx	ea9d44a9eb98
+fonts.css	VERBATIM	r2.1 fonts.css	da95a67aad51
+hooks.ts	VERBATIM	r2.1 hooks.ts	a0492bb93cba
+main.tsx	VERBATIM	r2.1 main.tsx	c57aced1c769
+state.ts	VERBATIM	r2.1 state.ts	1d32bf5c6f64
+styles.css	REWRITE	derived: r2.1 styles.css	80d131f10994
+tokens.css	VERBATIM	r2.1 tokens.css	5aeda0f3fae7
+ui.tsx	REWRITE	derived: r2.1 ui.tsx	43f6d2655525
+vite-env.d.ts	REWRITE	authored new (r3)	65996936fbb0
+notify/center.ts	REWRITE	derived: r2.1 notify/center.ts	2010bfdaf1c9
+notify/dispatcher.ts	REWRITE	derived: r2.1 notify/dispatcher.ts	b11fe8a8479c
+v2/Focus.tsx	VERBATIM	r2.1 v2/Focus.tsx	7d571b75f860
+v2/Tower.tsx	REWRITE	derived: r2.1 views/Tower.tsx	f57b9c6f4ca6
+v2/components.tsx	REWRITE	authored new (r3)	7c8463b6937c
+v2/fieldboard.css	VERBATIM	r2.1 v2/fieldboard.css	9a95f0d47c84
+v2/flags.ts	VERBATIM	r2.1 v2/flags.ts	ba078fed370c
+v2/focus-main.tsx	REWRITE	authored new (r3)	b8f367bfa55f
+v2/focus.css	VERBATIM	r2.1 v2/focus.css	3f0844e31c15
+v2/main.tsx	REWRITE	derived: r2.1 focus/main.tsx	8ab6e7c367ae
+v2/mock.ts	VERBATIM	r2.1 v2/mock.ts	a6c1766845a2
+v2/sound.ts	VERBATIM	r2.1 v2/sound.ts	11394e0a2e4e
+v2/live/api.ts	REWRITE	authored new (r3)	7bba11343458
+v2/live/dispatcher.ts	REWRITE	derived: r2.1 notify/dispatcher.ts	09b072ac8d96
+v2/live/graphMerge.ts	REWRITE	authored new (r3)	ab03b3a75018
+v2/live/http.ts	VERBATIM	r2.1 v2/live/http.ts	1b8e27738085
+v2/live/mapChanges.ts	REWRITE	authored new (r3)	2820256c1254
+v2/live/mapGraph.ts	REWRITE	authored new (r3)	dc977799cc04
+v2/live/mapNotifs.ts	REWRITE	authored new (r3)	f9d1f3a09a57
+v2/live/push.ts	VERBATIM	r2.1 v2/live/push.ts	e87697391fff
+v2/live/realtime.ts	REWRITE	derived: r2.1 realtime.ts	06fa07af1adf
+v2/live/session.ts	REWRITE	derived: r2.1 api/session.ts	87db845f8ea3
+v2/live/towerData.ts	REWRITE	authored new (r3)	23e340baaed5
+v2/live/__tests__/r3-hermetic.test.ts	REWRITE	authored new (r3)	e3156c5b67a4
+focus/main.tsx	VERBATIM	r2.1 focus/main.tsx	d7601b79339a
+profiles/profiles.ts	REWRITE	derived: r2.1 profiles/profiles.ts	7f74d05e9ba1
+profiles/profiles.v1.json	VERBATIM(repo)	repo@a32d1c0 profiles/profiles.v1.json	6716b5aa621f
+api/client.ts	REWRITE	derived: r2.1 api/client.ts	02df8a9070c9
+api/liveApi.ts	REWRITE	derived: r2.1 api/liveApi.ts	79f62cf9ec0a
+api/mockApi.ts	REWRITE	derived: r2.1 api/mockApi.ts	1d74416ed0ce
+api/offlineQueue.ts	VERBATIM	r2.1 api/offlineQueue.ts	3cd84a493b40
+api/push.ts	REWRITE	derived: r2.1 api/push.ts	3311e69ae397
+api/seed.ts	REWRITE	derived: r2.1 api/seed.ts	9a2e6b27d13b
+api/session.ts	REWRITE	derived: r2.1 api/session.ts	8681248e57f2
+engine/computeDomino.ts	REWRITE	derived: r2.1 domino/computeDomino.ts	1c401167bf29
+engine/time.ts	VERBATIM(repo)	repo@a32d1c0 domino/time.ts	99661535b838
+engine/graph/dag.ts	REWRITE	derived: r2.1 graph/dag.ts	47f570f0d627
+engine/repo-tests/dag.test.ts	REWRITE	authored new (r3)	44084709f6b2
+engine/repo-tests/golden-corpus.test.ts	REWRITE	authored new (r3)	194874f8061a
+engine/repo-tests/fixtures/golden-corpus.v1.1.ts	REWRITE	authored new (r3)	8595a9b69b28
+contracts/CONTRACTS_PINNED.json	REWRITE	authored new (r3)	4921051ac903
+contracts/contake-core-contracts.v1.1.ts	VERBATIM	r2.1 contracts/contake-core-contracts.v1.1.ts	c3cb324a8223
+contracts/contake-core-contracts.v1.10.ts	VERBATIM	r2.1 contracts/contake-core-contracts.v1.10.ts	017adfcefe34
+contracts/contake-core-contracts.v1.2.ts	REWRITE	authored new (r3)	2dd9e804fc06
+contracts/contake-core-contracts.v1.ts	VERBATIM	r2.1 contracts/contake-core-contracts.v1.ts	63256776feb7
+contracts/contracts.v1.ts	VERBATIM(repo)	repo@a32d1c0 contracts.v1.ts	4c6629a788b3
+contracts/contracts.v2.ts	REWRITE	authored new (r3)	df0845b30479
+contracts/domain-profiles.v1.json	VERBATIM	r2.1 contracts/domain-profiles.v1.json	4e9b1d48c9e1
+contracts/matrix.v1.json	VERBATIM(repo)	repo@a32d1c0 rbac/matrix.v1.json	37c7380c7d41
+contracts/matrix.v2.candidate-v1-superseded-20260917.json	REWRITE	authored new (r3)	02ca26c45175
+contracts/matrix.v2.candidate-v2-superseded-20260917.json	REWRITE	authored new (r3)	cf3c39b0594c
+contracts/matrix.v2.json	REWRITE	authored new (r3)	f75e08db7682
+contracts/old-compat.d.ts	REWRITE	authored new (r3)	8f29d4b2b787
+contracts/rbac-matrix.v1.1.json	VERBATIM	r2.1 contracts/rbac-matrix.v1.1.json	9bf300c67f74
+login/main.tsx	REWRITE	derived: r2.1 focus/main.tsx	9c61cdc38d22
+views/Approvals.tsx	REWRITE	derived: r2.1 views/Approvals.tsx	5575edaafd0f
+views/Builder.tsx	VERBATIM	r2.1 views/Builder.tsx	8d88b1b9c7da
+views/Incidents.tsx	REWRITE	derived: r2.1 views/Incidents.tsx	44daacb8b5a0
+views/NotifyCenter.tsx	REWRITE	derived: r2.1 views/NotifyCenter.tsx	573a0ff1130b
+views/Settings.tsx	VERBATIM	r2.1 views/Settings.tsx	eee7129156c8
+views/Sync.tsx	REWRITE	derived: r2.1 views/Sync.tsx	a90691ffdd04
+views/Tower.tsx	VERBATIM	r2.1 views/Tower.tsx	e6c02449cee8
+src/profiles/profiles-parity.test.ts	authored-new	parity QA evidence per TL profiles-divergence ruling v1.0 (parent 11:43): pins recovered 6-profile snapshot sha + canonical 7-profile parity layer sha
+R3-DIVERGENCE-LEDGER.md	authored-new	divergence ledger rows: domain-profiles (6-recovered/7-canonical, parity-align) + computeDomino (stale-recovered/canonical-adopt)
+qa/logs/{tsc,vitest,vite-build,smoke-console}-r3.log	authored-new	raw gate logs for independent QA rerun/comparison (tsc 0, vitest 26/26, build 0, smoke clean x3)

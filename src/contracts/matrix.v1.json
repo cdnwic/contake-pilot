@@ -1,0 +1,167 @@
+{
+  "version": "1.4",
+  "date": "2026-09-14",
+  "normativeSource": "contake_rbac_spec.md (delivered to product owner 2026-09-11)",
+  "roles": [
+    "admin",
+    "field_manager",
+    "focus_worker"
+  ],
+  "impactClasses": {
+    "S0": "local — own task only, no external recipients",
+    "S1": "site — other tasks in same site",
+    "S2": "cross-site or shared exclusive resource",
+    "S3": "external stakeholders (group subscribers: parents/clients/suppliers)"
+  },
+  "approvalRule": "apply authority = impactClass x role, enforced server-side only. Decision values: allow | scope | propose | deny. 'scope' = allow within own site scope only; 'propose' = becomes ChangeRequest pending_review.",
+  "matrix": {
+    "event.create": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "event.update": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "event.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "event.publish": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "task.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "task.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "task.move": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "task.delete": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "task.assign": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "resource.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "resource.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "resource.delete": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "dependency.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "dependency.delete": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "constraint.lock": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "constraint.unlock": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "domino.compute": {
+      "admin": "allow",
+      "field_manager": "allow",
+      "focus_worker": "deny"
+    },
+    "domino.apply": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "change.approve": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "change.reject": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "report.status.create": {
+      "admin": "allow",
+      "field_manager": "allow",
+      "focus_worker": "allow"
+    },
+    "notify.send.targeted": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "report.resolve": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "whitelist.invite": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.list": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.approve": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "whitelist.reject": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    }
+  },
+  "autoEscalation": "field_manager: any computed impact >= S1 on an APPLYING mutation routes through ChangeRequest. admin: always allow including S3 (מנהל-על שליטה מלאה) — R1 resolved: no role above admin, so admin S3 cannot deadlock. EXEMPTION: domino.compute is a dry-run preview — it never mutates and NEVER creates a ChangeRequest, whatever impact class it computes; it stays allow + scope-checked (field_manager: own sites only). focus_worker never receives the full graph (data minimization).",
+  "changeRequestRules": {
+    "stateMachine": "proposed -> pending_review -> approved(applied) | rejected",
+    "editPolicy": "A pending ChangeRequest cannot be edited. Proposer withdraws and resubmits (new id). Locked decision, per QA charter AC-RBAC-5 option.",
+    "selfApproval": "Forbidden for cross-scope changes; admin-only approve.",
+    "staleBase": "Approve on a moved base graph version => 409 stale, re-propose. Never force-apply."
+  },
+  "denyByDefault": "Any action x role combination not listed is denied (403), including unknown actions.",
+  "reportApplyRule": {
+    "rule": "report.status.create auto-applies the reporter's OWN task delay when computed impact is S0 and the task is unlocked. Anything above S0, or a locked task, becomes ChangeRequest pending_review.",
+    "never": "A report is never a back-door task.move on another user's task or above S0 impact. (QA C2)"
+  },
+  "migrationNote": "v1.2 -> v1.3 (2026-09-14): additive row 'report.resolve' (POST /v1/reports/:id/resolve). Pure handled-state on StatusReport: no graph effect, no effect on spawned CRs. admin=allow; field_manager=scope (own sites); focus_worker=deny. No existing cell changed. v1.3 -> v1.4 (2026-09-15): additive rows whitelist.invite/list/approve/reject (contracts v1.18 §15). admin=allow; field_manager/focus_worker=deny. No existing cell changed."
+}

@@ -1,0 +1,327 @@
+{
+  "version": "2.0",
+  "date": "2026-09-17",
+  "additiveOnly": true,
+  "provenance": "v1.4 (27, canonical repo) + v1.5 additions (18, verified pkg) + v1.19 user.update-settings + v1.19-addendum-2 notifications.deliveries.read + v1.6 additions (3, verified pkg, channel.optout admin=deny corrected)",
+  "note": "QA correction to Matrix Adjudication v1.0 (parent-relayed 2026-09-17 03:39): canonical main RUNTIME currently enforces the 27 v1.4 rows only. pending-remediation (v1.5 18 + v1.6 3 = 21 rows incl. content.delete fm=deny per canonical 56ce68db) target 48 enforced at the remediation head; committed universe = 50 with user.update-settings + notifications.deliveries.read pending-implementation and NOT exposed as functional UI permissions.",
+  "roles": [
+    "admin",
+    "field_manager",
+    "focus_worker"
+  ],
+  "matrix": {
+    "branch.archive": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "branch.create": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "branch.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "branch.update": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "change.approve": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "change.reject": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "channel.optout": {
+      "admin": "deny",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "scope": "system",
+      "note": "Machine-principal-only (system-inbound webhook actor). No user-facing route exists; any user-role invocation is deny. Audit entity: external_party (before/after consent), subscriber_channel, or optout_suppression (durable record keyed (channel, address), inbound correlation).",
+      "status": "pending-remediation"
+    },
+    "constraint.lock": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "constraint.unlock": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "content.ack": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "scope",
+      "status": "pending-remediation"
+    },
+    "content.attach": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "content.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "content.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "content.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "scope",
+      "status": "pending-remediation"
+    },
+    "content.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "dependency.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "dependency.delete": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "domino.apply": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "domino.compute": {
+      "admin": "allow",
+      "field_manager": "allow",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "event.create": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "event.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "event.publish": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "event.update": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "notifications.deliveries.read": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "scope": "org",
+      "status": "pending-implementation"
+    },
+    "notify.send.targeted": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "org.matrix.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "report.correct": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "report.list": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "report.mark_read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "report.resolve": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "report.status.create": {
+      "admin": "allow",
+      "field_manager": "allow",
+      "focus_worker": "allow",
+      "status": "enforced"
+    },
+    "resource.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "resource.delete": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "resource.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "stakeholder.create": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "stakeholder.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "stakeholder.link": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "stakeholder.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "stakeholder.update": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "task.advance": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "pending-remediation"
+    },
+    "task.assign": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "task.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "task.delete": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "task.move": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "task.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "user.update-settings": {
+      "admin": "allow",
+      "field_manager": "allow",
+      "focus_worker": "allow",
+      "scope": "self",
+      "status": "pending-implementation"
+    },
+    "whitelist.approve": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "whitelist.invite": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "whitelist.list": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "enforced"
+    },
+    "whitelist.reject": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "status": "enforced"
+    }
+  },
+  "supersededCandidates": [
+    "matrix.v2.candidate-v1-superseded-20260917.json (content.delete fm=propose; preserved per founder preservation directive)"
+  ],
+  "counts": {
+    "runtimeEnforcedOnCurrentMain": 27,
+    "pendingRemediationTarget": 48,
+    "committedUniverse": 50,
+    "relabelRule": "48 stays 'pending-remediation' even if PR #4 merges; relabel to enforced only after exact-head execution proof + post-merge boot/runtime verification (QA controlling caveat, binding 2026-09-17 03:40)."
+  }
+}
