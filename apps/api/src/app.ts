@@ -9,11 +9,17 @@ import {
   rawDecision, renderInstant, computeDomino, wouldCreateCycle, PROFILES_VERSION,
 } from '@contake/core';
 import { appEvents } from './services/events.js';
+import { createDispatcher, memoryDispatchState, type MessageProvider } from './services/dispatch.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
-import { AuthService } from './auth.js';
+import { AuthService, toPrincipal } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
 import { auditDenied, type DenialMeta, audit, deviceClassOf } from './services/audit.js';
+import { randomUUID } from 'node:crypto';
+import {
+  SUPERADMIN_SANDBOX_ORG, SUPERADMIN_SANDBOX_SITE,
+  ensureSuperAdminSandbox, sandboxEventId, sandboxResourceId,
+} from './services/superadmin.js';
 import type { AuditEntityType, Branch, ContentItem, ExternalParty, StatusToken, TaskContentRole, TaskResourceLink } from '@contake/core';
 import { buildApprovalNeededJob, recordJobs } from './services/notify.js';
 
@@ -62,7 +68,19 @@ export function filteredGraph(snapshot: GraphSnapshot, user: UserRecord): GraphS
 }
 
 export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInstance {
+
+
   const app = Fastify({ logger: false });
+
+  // G2: app-level shared dispatch state + inbound-only dispatcher so the §25
+  // webhook's STOP path flows through the existing handleInboundStop (ND-5)
+  // and its suppression is visible to send-side dispatchers sharing the store.
+  const dispatchState = memoryDispatchState();
+  const inertProvider = (name: 'whatsapp' | 'sms'): MessageProvider => ({
+    name, send: () => Promise.resolve({ ok: false as const, retryable: false, error: 'inbound-only dispatcher' }),
+  });
+  const inboundDispatch = createDispatcher({ repo, providers: { whatsapp: inertProvider('whatsapp'), sms: inertProvider('sms') }, state: dispatchState });
+  app.decorate('dispatchState', dispatchState);
 
   // Pre-publish deploy-prep: CORS is opt-in via CORS_ORIGIN (comma-separated
   // allowed origins). Env absent -> no CORS headers at all (same-origin only),
@@ -468,6 +486,105 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
   app.get('/v1/profiles', () => ({ version: PROFILES_VERSION, profiles: listProfiles() }));
 
   // ---------- events ----------
+  // ---- Super Admin: server-authorized test impersonation (audited, sandbox-scoped) ----
+  // Who am I right now: the durable source of truth for identity markers.
+  app.get('/v1/whoami', async (req) => {
+    const user = await me(req);
+    return {
+      principal: toPrincipal(user),
+      orgId: user.orgId,
+      isSuperAdmin: user.isSuperAdmin === true,
+      impersonationOf: user.impersonationOf ?? null,
+      sandbox: user.orgId === SUPERADMIN_SANDBOX_ORG,
+    };
+  });
+
+  // Switch to a test profile. Super Admin only; the caller keeps their real
+  // identity (this endpoint only mints a separate sandbox identity), every
+  // switch is audited, and the synthetic identity lives ONLY in the sandbox
+  // tenant so it cannot affect real users or production data.
+  app.post('/v1/admin/impersonations', async (req) => {
+    const user = await me(req);
+    if (user.isSuperAdmin !== true) {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'identity.impersonate.start',
+        entityType: 'user', entityId: user.userId, eventId: 'pending',
+      });
+    }
+    const body = (req.body ?? {}) as { role?: string; domainProfileId?: string };
+    const role = body.role;
+    if (role !== 'admin' && role !== 'field_manager' && role !== 'focus_worker') {
+      fail(400, 'BAD_REQUEST', 'חסר role חוקי');
+    }
+    const profileId = body.domainProfileId ?? 'camp';
+    if (!listProfiles().some(p => p.id === profileId)) fail(400, 'BAD_REQUEST', 'פרופיל לא קיים');
+    await ensureSuperAdminSandbox(repo, profileId);
+    const evId = sandboxEventId(profileId);
+    const sandboxUser: UserRecord = {
+      userId: `sa-imp-${randomUUID()}`,
+      orgId: SUPERADMIN_SANDBOX_ORG,
+      name: `Test ${role} (${profileId})`,
+      role,
+      scopes: role === 'admin' ? []
+        : role === 'field_manager' ? [{ eventId: evId, siteId: SUPERADMIN_SANDBOX_SITE }]
+        : [{ eventId: evId }],
+      ...(role === 'focus_worker' ? { linkedResourceId: sandboxResourceId(profileId) } : {}),
+      active: true,
+      impersonationOf: user.userId,
+    };
+    await repo.createUser(sandboxUser);
+    await audit(repo, {
+      orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: 'admin',
+      action: 'identity.impersonate.start', entityType: 'user', entityId: sandboxUser.userId,
+      after: {
+        by: user.userId, byPhone: user.phone ?? null, targetRole: role,
+        domainProfileId: profileId, sandboxOrg: SUPERADMIN_SANDBOX_ORG, sandboxEventId: evId,
+      },
+    });
+    return {
+      token: auth.issueToken(sandboxUser.userId),
+      principal: toPrincipal(sandboxUser),
+      impersonation: {
+        by: user.userId, marked: true,
+        sandboxOrg: SUPERADMIN_SANDBOX_ORG, sandboxEventId: evId,
+      },
+    };
+  });
+
+  // End a test-impersonation session: self-stop from the sandbox identity, or
+  // Super Admin stopping a specific sandbox identity. Deactivation kills the
+  // token immediately (authenticate() re-reads active on every request).
+  app.post('/v1/admin/impersonations/stop', async (req) => {
+    const actor = await me(req);
+    const body = (req.body ?? {}) as { userId?: string };
+    let target: UserRecord | undefined;
+    if (actor.impersonationOf !== undefined) {
+      target = actor; // a sandbox identity may only stop itself
+    } else if (actor.isSuperAdmin === true && body.userId !== undefined) {
+      target = await repo.getUser(body.userId);
+    } else {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'identity.impersonate.stop',
+        entityType: 'user', entityId: actor.userId, eventId: 'pending',
+      });
+    }
+    if (!target || target.impersonationOf === undefined || !target.active) {
+      fail(404, 'NOT_FOUND', 'ההתחזות לא נמצאה');
+    }
+    await repo.updateUser(target.userId, { active: false });
+    const impersonator = await repo.getUser(target.impersonationOf);
+    await audit(repo, {
+      orgId: impersonator?.orgId ?? actor.orgId, eventId: 'pending',
+      actorUserId: actor.userId, role: actor.role,
+      action: 'identity.impersonate.stop', entityType: 'user', entityId: target.userId,
+      after: {
+        stoppedBy: actor.userId, impersonatorUserId: target.impersonationOf,
+        targetRole: target.role, sandboxOrg: SUPERADMIN_SANDBOX_ORG,
+      },
+    });
+    return { stopped: true };
+  });
+
   app.get('/v1/events', async (req) => {
     const user = await me(req);
     let events = await repo.listEvents(user.orgId);
@@ -1622,10 +1739,15 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       return { handled: 1 };
     }
     const ch = await repo.findChannelByAddress(body.from);
+    // G2: every remaining STOP path goes through the dispatcher's existing
+    // handleInboundStop (ND-5): modelled channel -> optedOut=true; unmodelled
+    // staff number -> suppression in the shared DispatchStateStore, blocking
+    // subsequent sends by send-side dispatchers that share the store.
+    await inboundDispatch.handleInboundStop(body.from);
     if (ch && !ch.optedOut) {
-      await repo.updateChannel(ch.id, { optedOut: true }); // ND-5 semantics, as the existing STOP handler
       await audit(repo, { orgId: ch.orgId, eventId: 'pending', actorUserId: 'system-inbound', role: 'admin',
         action: 'push.unsubscribe', entityType: 'notification', entityId: ch.id,
+        before: { optedOut: false },
         after: { optedOut: true, via: 'inbound_webhook', channel: body.channel ?? null } });
     }
     return { handled: 1 };

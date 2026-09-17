@@ -255,7 +255,10 @@ export type Action =
   | 'report.list' | 'report.mark_read'
   | 'stakeholder.create' | 'stakeholder.update' | 'stakeholder.delete' | 'stakeholder.link' | 'stakeholder.read'
   | 'branch.create' | 'branch.update' | 'branch.archive' | 'branch.read'
-  | 'org.matrix.read';
+  | 'org.matrix.read'
+  // v1.20.2-superadmin (additive): audited super-admin test impersonation.
+  // Server-authorized only; every switch writes one of these to audit_log.
+  | 'identity.impersonate.start' | 'identity.impersonate.stop';
 
 export interface Scope { eventId: ID; siteId?: ID; }
 

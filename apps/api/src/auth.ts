@@ -77,6 +77,15 @@ export function memoryOtpState(): OtpStateStore {
   };
 }
 
+/** Super Admin phone allowlist (server-side, env-overridable for ops). The
+ *  verified pilot-owner phone enrolls directly as the real Super Admin
+ *  identity on first OTP login. Frontend state can never set this. */
+export const SUPER_ADMIN_PHONES: readonly string[] = (process.env['CONTAKE_SUPER_ADMIN_PHONES'] ?? '+972587700852')
+  .split(',').map(p => p.trim()).filter(Boolean);
+
+/** The pilot tenant a super admin enrolls into. */
+export const SUPER_ADMIN_HOME_ORG = 'org-1';
+
 export class AuthService {
   constructor(
     private readonly repo: GraphRepository,
@@ -167,9 +176,33 @@ export class AuthService {
     if (!entry || entry.exp < this.now() || entry.code !== code) return null;
     await this.otpStore.deleteCode(phone);
     await this.otpStore.resetVerifyState(phone);
-    const user = await this.repo.findUserByPhone(phone);
+    let user = await this.repo.findUserByPhone(phone);
+    if (SUPER_ADMIN_PHONES.includes(phone)) user = await this.ensureSuperAdmin(phone, user);
     if (!user || !user.active) return null;
     return { token: this.issueToken(user.userId), principal: toPrincipal(user) };
+  }
+
+  /** Super Admin enrollment: the allowlisted phone IS the credential-level
+   *  identity. First login creates the real pilot-tenant admin record;
+   *  later logins upgrade a pre-existing record. Idempotent. */
+  async ensureSuperAdmin(phone: string, existing?: UserRecord): Promise<UserRecord | undefined> {
+    if (existing) {
+      if (existing.isSuperAdmin !== true) {
+        return this.repo.updateUser(existing.userId, { isSuperAdmin: true });
+      }
+      return existing;
+    }
+    const user: UserRecord = {
+      userId: `u-superadmin-${phone.replace(/\D/g, '')}`,
+      orgId: SUPER_ADMIN_HOME_ORG,
+      name: 'חיים ויכנין',
+      role: 'admin',
+      scopes: [],
+      phone,
+      active: true,
+      isSuperAdmin: true,
+    };
+    return this.repo.createUser(user);
   }
 
   /** v1.18 §15 + QA integrity gate: the public whitelist surface (check /
@@ -198,7 +231,8 @@ export class AuthService {
     const entry = await this.repo.getWhitelistEntry(phone);
     if (!entry) return { status: 'unknown' };
     if (entry.status !== 'approved') return { status: entry.status };
-    const user = await this.repo.findUserByPhone(phone);
+    let user = await this.repo.findUserByPhone(phone);
+    if (SUPER_ADMIN_PHONES.includes(phone)) user = await this.ensureSuperAdmin(phone, user);
     if (!user || !user.active) return { status: 'unknown' };
     return { token: this.issueToken(user.userId), principal: toPrincipal(user) };
   }
