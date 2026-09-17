@@ -149,7 +149,15 @@ export function createDispatcher(input: {
   const targetAddress = (t: NotificationTarget): string => t.address;
   const isOptedOut = async (t: NotificationTarget): Promise<boolean> => {
     if (await state.isSuppressed(t.address)) return true;
-    return (await repo.findChannelByAddress(t.address))?.optedOut === true;
+    if ((await repo.findChannelByAddress(t.address))?.optedOut === true) return true;
+    // v1.20.2 §25.1ב: durable optout_suppression suppresses sends on the channel.
+    // Global-ambiguous rows (orgId NULL) suppress across every tenant (approved
+    // regulatorily-safe over-block, v2.1 #6). in_app/web_push ride user-owned
+    // surfaces, not STOP-governed external channels.
+    if (t.channel === 'whatsapp' || t.channel === 'sms') {
+      if (await repo.findActiveSuppression(t.channel, t.address)) return true;
+    }
+    return false;
   };
 
   const sendOne = async (t: NotificationTarget, body: string, pushPayload?: PushPayload): Promise<{ ok: boolean; provider?: 'whatsapp' | 'sms' | 'web_push'; error?: string }> => {

@@ -1,6 +1,6 @@
 import type {
-  AuditLogEntry, Branch, ChangeRequest, ContentAck, ContentItem, DependencyEdge, EventNode,
-  ExternalParty, GraphSnapshot, ID, NotificationJob, Principal, PushSubscription, ReportReadState,
+  AuditLogEntry, Branch, ChangeRequest, ContentAck, ContentItem, ContentItemVersion, DependencyEdge, EventNode,
+  ExternalParty, GraphSnapshot, ID, IdempotencyRecord, NotificationJob, OptoutSuppression, Principal, PushSubscription, ReportReadState,
   ResourceNode, Role, StatusReport, StatusToken, TaskNode, TaskResourceLink,
   WhitelistEntry, WhitelistStatus,
 } from '@contake/core';
@@ -161,13 +161,20 @@ export interface GraphRepository {
   createContentItem(c: ContentItem): Promise<ContentItem>;
   getContentItem(id: ID): Promise<ContentItem | undefined>;
   updateContentItem(id: ID, patch: Partial<ContentItem>): Promise<ContentItem | undefined>;
+  /** v1.20.2 CAS head advance: returns undefined when current version !== expectedVersion. */
+  casUpdateContentItem(id: ID, expectedVersion: number, patch: Partial<ContentItem>): Promise<ContentItem | undefined | 'conflict'>;
   deleteContentItem(id: ID): Promise<boolean>;
   listContentItems(orgId: ID): Promise<ContentItem[]>;
+  // v1.20.2 immutable content versions (never deleted)
+  createContentVersion(v: ContentItemVersion): Promise<ContentItemVersion>;
+  listContentVersions(contentId: ID): Promise<ContentItemVersion[]>;
+  getContentVersion(contentId: ID, contentVersionId: ID): Promise<ContentItemVersion | undefined>;
   attachTaskContent(l: TaskResourceLink): Promise<TaskResourceLink>;
   detachTaskContent(taskId: ID, contentId: ID): Promise<boolean>;
   listTaskContent(taskId: ID): Promise<TaskResourceLink[]>;
-  createContentAck(a: ContentAck): Promise<ContentAck>;
-  getContentAck(clientAckId: string): Promise<ContentAck | undefined>;
+  createContentAck(a: ContentAck & { orgId: ID }): Promise<ContentAck>;
+  /** v1.20.2: ack dedupe is isolated per org+actor (was global on clientAckId). */
+  getContentAck(orgId: ID, userId: ID, clientAckId: string): Promise<ContentAck | undefined>;
   // v1.20 §22 stakeholders (+ §22 G6 status tokens)
   createExternalParty(p: ExternalParty): Promise<ExternalParty>;
   getExternalParty(id: ID): Promise<ExternalParty | undefined>;
@@ -176,7 +183,8 @@ export interface GraphRepository {
   listExternalParties(orgId: ID): Promise<ExternalParty[]>;
   createStatusToken(t: StatusToken): Promise<StatusToken>;
   getStatusToken(id: ID): Promise<StatusToken | undefined>;
-  getStatusTokenByToken(token: string): Promise<StatusToken | undefined>;
+  /** v1.20.2: lookup by HMAC hash (indexed column); plaintext never hits the repo. */
+  getStatusTokenByHash(tokenHash: string): Promise<StatusToken | undefined>;
   findExternalPartyByContactRef(value: string): Promise<ExternalParty | undefined>;
   updateStatusToken(id: ID, patch: Partial<StatusToken>): Promise<StatusToken | undefined>;
   // v1.20 §23 branches
@@ -186,7 +194,17 @@ export interface GraphRepository {
   listBranches(orgId: ID): Promise<Branch[]>;
   // v1.20 §24 report read state
   markReportRead(s: ReportReadState): Promise<ReportReadState>;
+  getReportReadState(reportId: ID, userId: ID): Promise<ReportReadState | undefined>;
   listReportReadStates(userId: ID): Promise<ReportReadState[]>;
+  // v1.20.2 opt-out suppressions (machine-principal writes; org-admin scoped removal)
+  createOptoutSuppression(x: OptoutSuppression): Promise<OptoutSuppression>;
+  /** active suppression for (channel, address): org-scoped for orgId OR global-ambiguous (orgId null). */
+  findActiveSuppression(channel: string, address: string, orgId?: ID): Promise<OptoutSuppression | undefined>;
+  listOptoutSuppressions(orgId?: ID): Promise<OptoutSuppression[]>;
+  removeOptoutSuppression(id: ID, by: ID, reason: string, at: string): Promise<OptoutSuppression | undefined>;
+  // v1.20.2 per-route idempotency records (same-tx write; PG UNIQUE enforced)
+  getIdempotencyRecord(orgId: ID, actorId: ID, route: string, clientMutationId: string): Promise<IdempotencyRecord | undefined>;
+  putIdempotencyRecord(r: IdempotencyRecord): Promise<IdempotencyRecord>;
 }
 
 export interface SeedData {

@@ -232,6 +232,8 @@ export interface DomainProfile {
 // ============================================================
 
 export type Role = 'admin' | 'field_manager' | 'focus_worker';
+/** v2.1 #12: machine principal for webhook-originated writes only. Every user route rejects it. */
+export type ActorRole = Role | 'system';
 
 /** Impact classes: approval requirement derives from impact, not role alone. */
 export type ImpactClass = 'S0' | 'S1' | 'S2' | 'S3';
@@ -255,7 +257,9 @@ export type Action =
   | 'report.list' | 'report.mark_read'
   | 'stakeholder.create' | 'stakeholder.update' | 'stakeholder.delete' | 'stakeholder.link' | 'stakeholder.read'
   | 'branch.create' | 'branch.update' | 'branch.archive' | 'branch.read'
-  | 'org.matrix.read';
+  | 'org.matrix.read'
+  | 'channel.optout'          // v1.20.2: machine-principal-only (system-inbound); user roles deny (matrix v1.6)
+  | 'task.advance' | 'report.correct'; // v1.21.2 §26
 
 export interface Scope { eventId: ID; siteId?: ID; }
 
@@ -446,14 +450,16 @@ export interface PushSubscription {
 export type AuditEntityType = NodeKind | 'user' | 'change_request' | 'notification' | 'dependency' | 'whitelist_entry' /* v1.18 */
   | 'push_subscription'        // v1.10
   | 'report'                  // v1.12 (report.resolve audits under its precise entity)
-  | 'content_item' | 'external_party' | 'status_token' | 'branch'; // v1.20
+  | 'content_item' | 'external_party' | 'status_token' | 'branch' // v1.20
+  | 'subscriber_channel' | 'optout_suppression' // v1.20.2 (STOP taxonomy)
+  | 'advance_proposal';       // v1.21.2 §26
 
 export interface AuditLogEntry {
   id: ID;
   orgId: ID;
   eventId: ID;
   actorUserId: ID;
-  role: Role;
+  role: ActorRole;
   action: Action;
   entityType: AuditEntityType;
   entityId: ID;
@@ -909,6 +915,25 @@ export interface ContentItem {
   createdBy: ID;
   createdAt: ISODateTime;
   version: number;            // content edit after publish = version++ (Focus always sees latest in open window)
+  // v1.20.2: delete = tombstone only (admin). Links + versions stay retrievable historically.
+  deletedAt?: ISODateTime;
+  deletedBy?: ID;
+}
+
+/** v1.20.2: every content version is an immutable row with its own id; the head
+ *  pointer advances by CAS on (contentId, expectedVersion). Versions are never
+ *  deleted (preservation directive). */
+export interface ContentItemVersion {
+  contentVersionId: ID;
+  contentId: ID;
+  version: number;
+  title: string;
+  body?: string;
+  url?: string;
+  checklistItems?: { id: ID; text: string; done: boolean }[];
+  meta?: Record<string, unknown>;
+  createdBy: ID;
+  createdAt: ISODateTime;
 }
 
 /** §20 task<->content link (Appendix A: role 'media' merged into 'link';
@@ -963,10 +988,46 @@ export interface StatusToken {
   id: ID;
   orgId: ID;
   externalPartyId: ID;
-  token: string;              // opaque access token used in GET /v1/public/status/:token
+  /** v1.20.2: HMAC-SHA256(token, pepper) only. Plaintext is never persisted;
+   *  it is returned exactly once at creation. Lookup = compute HMAC, compare
+   *  against this indexed column. */
+  tokenHash: string;
+  expiresAt: ISODateTime;     // default 72h from creation
   createdBy: ID;
   createdAt: ISODateTime;
   revokedAt?: ISODateTime;
+}
+
+/** v1.20.2 §25.1ב: durable opt-out suppression. Created only by the machine
+ *  principal (system-inbound) via channel.optout. orgId NULL marks the
+ *  deterministic ambiguous/multi-tenant rule: the (channel, address) pair is
+ *  suppressed across every tenant (regulatorily safe over-block, v2.1 #6).
+ *  The full address lives ONLY here (extended audit carries sha256(addr)[:12]+last4). */
+export interface OptoutSuppression {
+  id: ID;
+  channel: string;            // e.g. whatsapp | sms | in_app
+  address: string;            // normalized full address - admin/system access only
+  addressMasked: string;      // sha256(address)[:12] + last 4 digits
+  orgId: ID | null;           // null = global-ambiguous
+  createdAt: ISODateTime;
+  correlation: { from: string; channel: string; receivingAccount?: string; receivedAt: ISODateTime; bodyHash: string; providerEventId?: string };
+  removedAt?: ISODateTime;    // org-admin unsuppress of an org-scoped row only (reason + audit mandatory)
+  removedBy?: ID;
+  removeReason?: string;
+}
+
+/** v1.20.2 §26.3א: per-route dedupe record. Written in the SAME transaction as
+ *  the business write + audit; PG enforces UNIQUE on the key. Replay returns
+ *  the stored response verbatim with Idempotency-Replayed:true. */
+export interface IdempotencyRecord {
+  orgId: ID;
+  actorId: ID;
+  route: string;              // e.g. content.create
+  clientMutationId: string;
+  requestHash: string;        // sha256 of the normalized request body
+  statusCode: number;
+  responseBody: string;       // exact serialized response
+  createdAt: ISODateTime;
 }
 
 /** §23 org-level branch. Coexists with event-level siteIds; no domino impact. */

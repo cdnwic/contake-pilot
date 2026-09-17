@@ -1,4 +1,4 @@
-import type { Action, AuditEntityType, AuditLogEntry, ID, Role } from '@contake/core';
+import type { Action, ActorRole, AuditEntityType, AuditLogEntry, ID, Role } from '@contake/core';
 
 /** contracts v1.9: metadata attached to an ApiError at a mutating-endpoint authz
  *  deny site; the central error handler turns it into a standalone denied row.
@@ -24,7 +24,7 @@ export async function audit(
     orgId: ID;
     eventId: ID;
     actorUserId: ID;
-    role: Role;
+    role: ActorRole;
     action: Action;
     entityType: AuditEntityType;
     entityId: ID;

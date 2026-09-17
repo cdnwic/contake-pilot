@@ -1,5 +1,5 @@
 {
-  "version": "1.5",
+  "version": "1.6",
   "date": "2026-09-17",
   "normativeSource": "contake_rbac_spec.md (delivered to product owner 2026-09-11)",
   "roles": [
@@ -238,6 +238,21 @@
     "org.matrix.read": {
       "admin": "allow",
       "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "channel.optout": {
+      "admin": "deny",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "task.advance": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "report.correct": {
+      "admin": "allow",
+      "field_manager": "propose",
       "focus_worker": "deny"
     }
   },
