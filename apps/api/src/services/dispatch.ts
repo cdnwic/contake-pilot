@@ -303,6 +303,20 @@ export function createDispatcher(input: {
             },
           }
         : undefined;
+      // G2 race linearization fence (QA stop-ship 2026-09-17): the
+      // suppression decision for THIS send linearizes HERE, immediately
+      // before provider I/O. Contract: a send whose suppression decision
+      // linearized before the STOP commit may complete; after a STOP
+      // commits, NO later send decision begins - this fence re-consults the
+      // store so a STOP that lands between the batching-stage check and
+      // provider I/O still blocks the send.
+      if (await isOptedOut(t)) {
+        for (const p of entries) {
+          await state.markDispatched(p.key);
+          out.push(record({ jobId: p.job.id, idempotencyKey: p.key, address, status: 'suppressed_optout', attempts: 0 }));
+        }
+        continue;
+      }
       const res = await sendOne(t, body, pushPayload);
       for (const p of entries) {
         await state.markDispatched(p.key);

@@ -6,7 +6,8 @@ import { PostgresGraphRepository, pgDispatchState, createPgOtpState } from './re
 import type { GraphRepository } from './repo/graph-repository.js';
 import { applySeed, seedDemo } from './seed.js';
 import { createRealtime } from './realtime.js';
-import { createDispatcher, type DispatchStateStore, type MessageProvider } from './services/dispatch.js';
+import { assembleServer } from './server-assembly.js';
+import type { MessageProvider } from './services/dispatch.js';
 import { createTwilioProvider, twilioConfigFromEnv } from './services/twilio.js';
 import { createWhatsAppCloudProvider, whatsAppCloudConfigFromEnv } from './services/whatsapp-cloud.js';
 import { createLogPushProvider, createVapidPushProvider, vapidConfigFromEnv } from './services/webpush.js';
@@ -32,7 +33,7 @@ if (RBAC_MATRIX_VERSION !== PINNED_MATRIX_VERSION) {
 // PR-1: env-selected storage adapter. DATABASE_URL set -> Postgres (real
 // transactions, durable dispatch state); unset -> in-memory (test/dev default).
 let repo: GraphRepository;
-let dispatchState: DispatchStateStore | undefined;
+let serverPool: import('./repo/postgres.js').Queryable | undefined;
 let otpState: OtpStateStore | undefined;
 // CONTAKE_SEED=camp-demo loads the rich camp-day demo dataset (plan 3ח);
 // CONTAKE_SEED=all-demo loads camp + all six vertical seeds (Stage 1: one org
@@ -63,6 +64,7 @@ const allDemoSeeds = (): SeedData[] => {
 if (process.env['DATABASE_URL']) {
   const { Pool } = await import('pg');
   const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
+  serverPool = pool as unknown as import('./repo/postgres.js').Queryable;
   repo = await PostgresGraphRepository.create(pool);
   const seed = pickSeed();
   if ((await repo.listEvents(seed.orgId)).length === 0) {
@@ -77,7 +79,6 @@ if (process.env['DATABASE_URL']) {
   // v1.18 §15 camp protection: pilot phones pre-approved on every boot
   // (idempotent upsert on phone; zero camp behavior change).
   await ensureCampWhitelist(repo);
-  dispatchState = pgDispatchState(pool);
   otpState = await createPgOtpState(pool); // pilot-prep #4: shared OTP state
   console.log('Contake API: Postgres adapter (DATABASE_URL)');
 } else if (process.env['CONTAKE_SEED'] === 'all-demo') {
@@ -88,38 +89,39 @@ if (process.env['DATABASE_URL']) {
   repo = MemoryGraphRepository.seeded(pickSeed());
 }
 const auth = new AuthService(repo, undefined, undefined, otpState);
-// G2 stop-ship (2026-09-17): inject the ONE durable DispatchStateStore so the
-// inbound webhook's STOP suppressions land in the same store the send-side
-// dispatcher consults (previously buildApp kept a private in-memory store and
-// production STOPs never reached send-side; a restart also wiped them).
-const app = buildApp(repo, auth, { ...(dispatchState ? { dispatchState } : {}) });
 
+// Notification providers (secrets env-only, QA-M3-4). Precedence:
+// WhatsApp Cloud API (PR-2, Meta-native) > Twilio sandbox (M3) > log-sandbox.
+// SMS is PARKED per TL ruling: only wired when Twilio env exists (already
+// built at M3), otherwise log-sandbox. Nothing connects externally without env.
+const waCloudCfg = whatsAppCloudConfigFromEnv();
+const twilioCfg = twilioConfigFromEnv();
+const sandboxProvider = (name: 'whatsapp' | 'sms'): MessageProvider => ({
+  name,
+  send: (to, body) => { console.log(`[${name} sandbox] -> ${to}: ${body}`); return Promise.resolve({ ok: true, providerMessageId: `${name}-sandbox-${Date.now()}`, retryable: false }); },
+});
+const providers: { whatsapp: MessageProvider; sms: MessageProvider } = {
+  whatsapp: waCloudCfg
+    ? createWhatsAppCloudProvider(waCloudCfg)
+    : twilioCfg ? createTwilioProvider('whatsapp', twilioCfg) : sandboxProvider('whatsapp'),
+  sms: twilioCfg ? createTwilioProvider('sms', twilioCfg) : sandboxProvider('sms'),
+};
+// Web push (contracts v1.10): real VAPID only when keys are in env; otherwise
+// the log-only sandbox provider. No external account, no cost.
+const vapid = vapidConfigFromEnv();
+const pushProvider = vapid ? createVapidPushProvider(vapid) : createLogPushProvider();
+// G2 stop-ship (2026-09-17): THE server assembly creates exactly ONE
+// DispatchStateStore (pg when DATABASE_URL, memory otherwise) and injects the
+// SAME object into buildApp and the send-side dispatcher, unconditionally.
+const { app, dispatcher } = assembleServer({
+  repo, auth, providers, push: pushProvider,
+  ...(serverPool ? { pool: serverPool } : {}),
+});
 const port = Number(process.env['PORT'] ?? 3000);
 app.listen({ port, host: '0.0.0.0' }).then(() => {
   createRealtime(app.server, repo, auth);
-  // Notification providers (secrets env-only, QA-M3-4). Precedence:
-  // WhatsApp Cloud API (PR-2, Meta-native) > Twilio sandbox (M3) > log-sandbox.
-  // SMS is PARKED per TL ruling: only wired when Twilio env exists (already
-  // built at M3), otherwise log-sandbox. Nothing connects externally without env.
-  const waCloudCfg = whatsAppCloudConfigFromEnv();
-  const twilioCfg = twilioConfigFromEnv();
-  const sandbox = (name: 'whatsapp' | 'sms'): MessageProvider => ({
-    name,
-    send: (to, body) => { console.log(`[${name} sandbox] -> ${to}: ${body}`); return Promise.resolve({ ok: true, providerMessageId: `${name}-sandbox-${Date.now()}`, retryable: false }); },
-  });
-  const providers: { whatsapp: MessageProvider; sms: MessageProvider } = {
-    whatsapp: waCloudCfg
-      ? createWhatsAppCloudProvider(waCloudCfg)
-      : twilioCfg ? createTwilioProvider('whatsapp', twilioCfg) : sandbox('whatsapp'),
-    sms: twilioCfg ? createTwilioProvider('sms', twilioCfg) : sandbox('sms'),
-  };
   console.log(`Notification providers: whatsapp=${waCloudCfg ? 'whatsapp-cloud' : twilioCfg ? 'twilio' : 'log-sandbox'}, sms=${twilioCfg ? 'twilio' : 'log-sandbox (SMS parked)'}`);
-  // Web push (contracts v1.10): real VAPID only when keys are in env; otherwise
-  // the log-only sandbox provider. No external account, no cost.
-  const vapid = vapidConfigFromEnv();
-  const pushProvider = vapid ? createVapidPushProvider(vapid) : createLogPushProvider();
   console.log(`Web push: ${vapid ? 'VAPID (web-push)' : 'log-sandbox (no VAPID keys)'}`);
-  const dispatcher = createDispatcher({ repo, providers, push: pushProvider, ...(dispatchState ? { state: dispatchState } : {}) });
   const timer = setInterval(() => { void dispatcher.dispatchDue(); }, 5_000);
   timer.unref();
   console.log(`Contake API listening on :${port} (seeded demo org: camp + film-shoot; realtime + dispatch on)`);

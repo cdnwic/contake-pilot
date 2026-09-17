@@ -72,6 +72,15 @@ if (process.env['VITEST']) {
     probe('helperAA:closed', { instance: fp.instanceId });
     trace(fp, { op: 'close', resets: fp.resets, maxRssMB: fp.maxRssMB });
   });
+  v.afterAll(async () => {
+    const pools = realPgPools.splice(0);
+    if (!pools.length) return;
+    const errs: string[] = [];
+    for (const pool of pools) {
+      try { await pool.end(); } catch (e) { errs.push(String(e)); }
+    }
+    if (errs.length) throw new Error(`[realpg-harness] LOUD cleanup failure: ${errs.length}/${pools.length} pools failed to close: ${errs.join('; ')}`);
+  });
 }
 
 function currentFileId(): string {
@@ -120,6 +129,7 @@ export function getFileInstanceInfo(): { instanceId: string; fileId: string; res
 }
 
 export async function makeTestRepo(): Promise<GraphRepository> {
+  if (REPO_IMPL === 'realpg') return makeRealPgRepoFrom(seedDemo());
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
     await resetInstance(fp);
@@ -132,8 +142,58 @@ export async function makeTestRepo(): Promise<GraphRepository> {
   return MemoryGraphRepository.seeded(seedDemo());
 }
 
+/** G2 hermetic real-PostgreSQL lane (QA order, 2026-09-17): every repo
+ *  creation gets its OWN schema t<epoch36><rand4> on DATABASE_URL, pinned
+ *  per-connection via search_path (no suite ever touches schema public, so
+ *  concurrent/stale runs cannot bleed into each other); every pool is tracked
+ *  and closed in afterAll (loud on error); a lazy janitor drops only stale
+ *  t_* schemas older than 1h (crashed-run leftovers). */
+let realPgSchema: string | undefined;
+const realPgPools: import('pg').Pool[] = [];
+let realPgJanitorDone = false;
+
+async function realPgPool(schema?: string): Promise<import('pg').Pool> {
+  const { Pool } = await import('pg');
+  const url = process.env['DATABASE_URL'];
+  if (!url) throw new Error('realpg lane requires DATABASE_URL');
+  if (!realPgJanitorDone) {
+    realPgJanitorDone = true;
+    const admin = new Pool({ connectionString: url, max: 1 });
+    try {
+      const { rows } = await admin.query(`SELECT nspname FROM pg_namespace WHERE nspname ~ '^t[a-z0-9]+[0-9a-f]{4}$'`);
+      const now = Date.now();
+      for (const r of rows as { nspname: string }[]) {
+        const m = /^t([a-z0-9]+)[0-9a-f]{4}$/.exec(r.nspname);
+        if (!m) continue;
+        const epoch = parseInt(m[1]!, 36);
+        if (Number.isFinite(epoch) && now - epoch > 3_600_000) {
+          await admin.query(`DROP SCHEMA IF EXISTS "${r.nspname}" CASCADE`);
+        }
+      }
+    } finally {
+      await admin.end();
+    }
+  }
+  const pool = new Pool({ connectionString: url, max: 4, ...(schema ? { options: `-c search_path=${schema}` } : {}) });
+  realPgPools.push(pool);
+  return pool;
+}
+
 /** Same factory with an explicit seed (profile-parity builds custom graphs). */
+async function makeRealPgRepoFrom(data: SeedData): Promise<GraphRepository> {
+  const { randomBytes } = await import('node:crypto');
+  const schema = `t${Date.now().toString(36)}${randomBytes(2).toString('hex')}`;
+  realPgSchema = schema;
+  const admin = await realPgPool();
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = await realPgPool(schema);
+  const repo = await PostgresGraphRepository.create(pool as unknown as Connectable);
+  await applySeed(repo, data);
+  return repo;
+}
+
 export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository> {
+  if (REPO_IMPL === 'realpg') return makeRealPgRepoFrom(data);
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
     await resetInstance(fp);
@@ -149,6 +209,12 @@ export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository>
 /** Pilot-prep #4: repo + OTP store bound to the SAME adapter (one pglite in PG
  *  mode), mirroring the server's DATABASE_URL wiring. */
 export async function makeTestBackend(): Promise<{ repo: GraphRepository; otpStore: OtpStateStore }> {
+  if (REPO_IMPL === 'realpg') {
+    const repo = await makeRealPgRepoFrom(seedDemo());
+    const pool = await realPgPool(realPgSchema);
+    const otpStore = await createPgOtpState(pool as unknown as Connectable);
+    return { repo, otpStore };
+  }
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
     await resetInstance(fp);
@@ -188,6 +254,34 @@ export interface TestBackend {
 }
 
 export async function makeTestBackendFrom(data: SeedData): Promise<TestBackend> {
+  if (REPO_IMPL === 'realpg') {
+    // audit fault injection at the pool-query layer: intercepts INSERT INTO
+    // auth_audit with a BEGIN/COMMIT depth trace, mirroring the PGlite lane;
+    // both the PG OTP store's appends and the repo's in-tx insert are seen.
+    let hook: AuditHook | undefined;
+    let txDepth = 0;
+    const schema = `t${Date.now().toString(36)}${(await import('node:crypto')).randomBytes(2).toString('hex')}`;
+    realPgSchema = schema;
+    const admin = await realPgPool();
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = await realPgPool(schema);
+    const wrapped: Connectable = {
+      query: async (text: string, params?: unknown[]) => {
+        const tt = text.trim().toUpperCase();
+        if (tt === 'BEGIN') txDepth += 1;
+        else if (tt.startsWith('COMMIT') || tt.startsWith('ROLLBACK')) txDepth = Math.max(0, txDepth - 1);
+        if (hook && /^\s*INSERT\s+INTO\s+auth_audit/i.test(text)) {
+          const entry = { phone: String(params?.[0]), kind: String(params?.[1]), detail: params?.[2] ?? undefined };
+          return hook(entry, () => pool.query(text, params)) as Promise<{ rows: Record<string, unknown>[]; affectedRows?: number }>;
+        }
+        return pool.query(text, params) as Promise<{ rows: Record<string, unknown>[]; affectedRows?: number }>;
+      },
+    };
+    const repo = await PostgresGraphRepository.create(wrapped);
+    await applySeed(repo, data);
+    const otpStore = await createPgOtpState(wrapped);
+    return { repo, otpStore, setAuditHook: h => { hook = h; } };
+  }
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
     let hook: AuditHook | undefined;
@@ -233,9 +327,9 @@ export async function makeTestBackendFrom(data: SeedData): Promise<TestBackend> 
  *  (restart proof). */
 export async function makeLaneDispatchState(): Promise<DispatchStateStore> {
   if (REPO_IMPL === 'realpg') {
-    const { Pool } = await import('pg');
+    if (!realPgSchema) throw new Error('makeLaneDispatchState: call makeTestRepo/makeTestRepoFrom first (schema unknown)');
     const { pgDispatchState } = await import('../../src/repo/postgres.js');
-    return pgDispatchState(new Pool({ connectionString: process.env['DATABASE_URL'] }) as unknown as Connectable);
+    return pgDispatchState(await realPgPool(realPgSchema) as unknown as Connectable);
   }
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
@@ -244,4 +338,19 @@ export async function makeLaneDispatchState(): Promise<DispatchStateStore> {
   }
   const { memoryDispatchState } = await import('../../src/services/dispatch.js');
   return memoryDispatchState();
+}
+
+/** G2 server-assembly tests: a Queryable over the lane's real backend (the
+ *  SAME store makeTestRepo uses), for assembleServer's DATABASE_URL mode.
+ *  Memory lane: undefined (assemble in in-memory mode). */
+export async function makeLaneQueryable(): Promise<import('../../src/repo/postgres.js').Queryable | undefined> {
+  if (REPO_IMPL === 'realpg') {
+    if (!realPgSchema) throw new Error('makeLaneQueryable: call makeTestRepo first (schema unknown)');
+    return await realPgPool(realPgSchema) as unknown as import('../../src/repo/postgres.js').Queryable;
+  }
+  if (REPO_IMPL === 'postgres') {
+    const fp = await fileInstance();
+    return pgliteConnectable(fp.raw);
+  }
+  return undefined;
 }
