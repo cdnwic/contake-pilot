@@ -3,22 +3,16 @@
 import { describe, expect, it } from 'vitest';
 import { computeDomino, getProfile, parseInstant, renderInstant } from '@contake/core';
 import type { GraphRepository } from '../src/repo/graph-repository.js';
-import { MemoryGraphRepository } from '../src/repo/memory.js';
-import { PostgresGraphRepository, pgliteConnectable } from '../src/repo/postgres.js';
-import { applySeed } from '../src/seed.js';
 import {
   CAMP_DEMO_EVENT_ID, CAMP_DEMO_LATE_BUS_DELAY_MIN, CAMP_DEMO_LATE_BUS_TASK_ID, CAMP_DEMO_ORG_ID, campDemoSeed,
 } from '../src/demo/camp-demo.js';
-import { REPO_IMPL } from './helpers/repo.js';
-import { PGlite } from '@electric-sql/pglite';
+import { makeTestRepoFrom } from './helpers/repo.js';
 
+// Whitelist-PG gate: route through the helper's file-scoped PGlite lifecycle
+// (reset + production bootstrap + loud afterAll close) instead of an unclosed
+// fresh instance per test.
 async function makeCampDemoRepo(): Promise<GraphRepository> {
-  if (REPO_IMPL === 'postgres') {
-    const repo = await PostgresGraphRepository.create(pgliteConnectable(new PGlite()));
-    await applySeed(repo, campDemoSeed());
-    return repo;
-  }
-  return MemoryGraphRepository.seeded(campDemoSeed());
+  return makeTestRepoFrom(campDemoSeed());
 }
 
 describe('camp demo seed (plan 3ח)', () => {

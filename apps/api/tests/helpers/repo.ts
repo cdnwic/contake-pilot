@@ -1,27 +1,125 @@
 /** PR-1 dual-mode repo factory: REPO_IMPL=postgres runs every carried suite
  *  against the real Postgres adapter on a hermetic PGlite instance; anything
- *  else keeps the in-memory default. */
+ *  else keeps the in-memory default.
+ *
+ * Whitelist-PG gate v1.1 (QA harness controls, 2026-09-17): the PG lane uses
+ * ONE file-scoped PGlite instance with an explicit lifecycle instead of a
+ * fresh WASM boot per test (the per-test boot/close churn on the 2vCPU/2GB
+ * gate box pushed beforeEach past the 10s hook timeout mid/late suite):
+ *  - file-scoped instance, detectable instanceId + fileId, NO cross-file
+ *    singleton (vitest isolates modules per file; this module's state is
+ *    per-file by construction);
+ *  - before each reset the previous connectable is drained (its serialized
+ *    query chain is awaited), so no in-flight/fire-and-forget query crosses
+ *    a reset; afterAll closes the instance and FAILS LOUDLY on cleanup error;
+ *  - reset is an uninstrumented admin path on the RAW handle (outside every
+ *    fault hook and counter): DROP/CREATE SCHEMA, owner/grants/search_path
+ *    restored, then the PRODUCTION bootstrap (PostgresGraphRepository.create
+ *    DDL / createPgOtpState DDL) re-runs;
+ *  - audit fault injection (makeTestBackendFrom) intercepts INSERT INTO
+ *    auth_audit at the connectable layer with a BEGIN/COMMIT depth trace, so
+ *    round-4/round-7 injection is proven to fire INSIDE the real auth_audit
+ *    transaction; reset queries never pass the hook;
+ *  - PGlite is SINGLE-CONNECTION: cross-connection races are gate C's
+ *    real-PostgreSQL two-connection proof, not this lane's claim.
+ *  Set PG_HARNESS_TRACE=1 for lifecycle/query trace lines on stderr. */
 import { PGlite } from '@electric-sql/pglite';
 import type { GraphRepository } from '../../src/repo/graph-repository.js';
 import { MemoryGraphRepository } from '../../src/repo/memory.js';
-import { PostgresGraphRepository, pgliteConnectable, createPgOtpState } from '../../src/repo/postgres.js';
+import { PostgresGraphRepository, pgliteConnectable, createPgOtpState, type Connectable } from '../../src/repo/postgres.js';
 import { memoryOtpState, type OtpStateStore } from '../../src/auth.js';
 import { applySeed, seedDemo } from '../../src/seed.js';
 import type { SeedData } from '../../src/repo/graph-repository.js';
 
 export const REPO_IMPL = process.env['REPO_IMPL'] ?? 'memory';
 
-// PGlite instances are heavy (WASM); keep at most ONE live per test file.
-let live: PGlite | undefined;
-async function freshPglite(): Promise<PGlite> {
-  await live?.close().catch(() => undefined);
-  live = new PGlite();
-  return live;
+interface FilePglite {
+  raw: PGlite;
+  instanceId: string;
+  fileId: string;
+  resets: number;
+  maxRssMB: number;
+  lastConn?: Connectable;
+}
+let filePg: FilePglite | undefined;
+let instanceCounter = 0;
+
+const TRACE = process.env['PG_HARNESS_TRACE'] === '1';
+function trace(fp: FilePglite, rec: Record<string, unknown>): void {
+  const rssMB = Math.round(process.memoryUsage().rss / 1e6);
+  if (rssMB > fp.maxRssMB) fp.maxRssMB = rssMB;
+  if (TRACE) console.error('[pg-harness]', JSON.stringify({ instance: fp.instanceId, file: fp.fileId, rssMB, ...rec }));
+}
+
+let vitestExpect: { getState(): { testPath?: string } } | undefined;
+if (process.env['VITEST']) {
+  // dynamic: importing 'vitest' outside the runner throws at module init, and
+  // evidence scripts (tsx) import this helper without a runner.
+  const v = await import('vitest');
+  vitestExpect = v.expect;
+  v.afterAll(async () => {
+    const fp = filePg;
+    filePg = undefined;
+    if (!fp) return;
+    try {
+      await fp.raw.close();
+    } catch (e) {
+      throw new Error(`[pg-harness] LOUD cleanup failure: instance ${fp.instanceId} (${fp.fileId}) close: ${String(e)}`);
+    }
+    trace(fp, { op: 'close', resets: fp.resets, maxRssMB: fp.maxRssMB });
+  });
+}
+
+function currentFileId(): string {
+  try { return vitestExpect?.getState().testPath ?? 'unknown'; } catch { return 'unknown'; }
+}
+
+async function fileInstance(): Promise<FilePglite> {
+  if (filePg) return filePg;
+  const raw = new PGlite();
+  filePg = { raw, instanceId: `pgi-${process.pid}-${++instanceCounter}`, fileId: currentFileId(), resets: 0, maxRssMB: 0 };
+  trace(filePg, { op: 'boot' });
+  return filePg;
+}
+
+/** Uninstrumented admin reset on the RAW handle (never through a fault hook):
+ *  drains the previous connectable's serialized chain, drops/recreates the
+ *  schema, restores owner/grants/search_path. Production bootstrap (DDL via
+ *  PostgresGraphRepository.create / createPgOtpState) is invoked by the
+ *  factories right after. */
+async function resetInstance(fp: FilePglite): Promise<void> {
+  if (fp.resets > 0) {
+    if (fp.lastConn) {
+      const t0 = performance.now();
+      await fp.lastConn.query('SELECT 1'); // drain: chains behind any in-flight query
+      trace(fp, { op: 'drain', ms: Math.round((performance.now() - t0) * 10) / 10 });
+    }
+    const t0 = performance.now();
+    // DISCARD ALL first: clears session state a schema drop leaves behind
+    // (prepared statements, advisory locks, LISTEN channels, session GUCs).
+    await fp.raw.query('DISCARD ALL');
+    await fp.raw.query('DROP SCHEMA public CASCADE');
+    await fp.raw.query('CREATE SCHEMA public');
+    await fp.raw.query('ALTER SCHEMA public OWNER TO postgres');
+    await fp.raw.query('GRANT ALL ON SCHEMA public TO public');
+    await fp.raw.query('SET search_path TO public');
+    trace(fp, { op: 'reset', ms: Math.round((performance.now() - t0) * 10) / 10 });
+  }
+  fp.resets += 1;
+}
+
+/** Introspection for evidence/self-test scripts (read-only). */
+export function getFileInstanceInfo(): { instanceId: string; fileId: string; resets: number; maxRssMB: number } | undefined {
+  return filePg && { instanceId: filePg.instanceId, fileId: filePg.fileId, resets: filePg.resets, maxRssMB: filePg.maxRssMB };
 }
 
 export async function makeTestRepo(): Promise<GraphRepository> {
   if (REPO_IMPL === 'postgres') {
-    const repo = await PostgresGraphRepository.create(pgliteConnectable(await freshPglite()));
+    const fp = await fileInstance();
+    await resetInstance(fp);
+    const conn = pgliteConnectable(fp.raw);
+    fp.lastConn = conn;
+    const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, seedDemo());
     return repo;
   }
@@ -31,7 +129,11 @@ export async function makeTestRepo(): Promise<GraphRepository> {
 /** Same factory with an explicit seed (profile-parity builds custom graphs). */
 export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository> {
   if (REPO_IMPL === 'postgres') {
-    const repo = await PostgresGraphRepository.create(pgliteConnectable(await freshPglite()));
+    const fp = await fileInstance();
+    await resetInstance(fp);
+    const conn = pgliteConnectable(fp.raw);
+    fp.lastConn = conn;
+    const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, data);
     return repo;
   }
@@ -42,7 +144,10 @@ export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository>
  *  mode), mirroring the server's DATABASE_URL wiring. */
 export async function makeTestBackend(): Promise<{ repo: GraphRepository; otpStore: OtpStateStore }> {
   if (REPO_IMPL === 'postgres') {
-    const conn = pgliteConnectable(await freshPglite());
+    const fp = await fileInstance();
+    await resetInstance(fp);
+    const conn = pgliteConnectable(fp.raw);
+    fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, seedDemo());
     const otpStore = await createPgOtpState(conn);
@@ -60,8 +165,10 @@ export async function makeTestBackend(): Promise<{ repo: GraphRepository; otpSto
  *  - postgres: intercepts INSERT INTO auth_audit at the connectable layer, so
  *    BOTH the PG OTP store's appends and the PG repo's in-tx committed insert
  *    are seen - the adapter's real write path is exercised, never bypassed.
- *  A paused hook holds the PGlite serialization chain, so a racing admin
- *  mutation queues exactly as it would behind the open registration tx.
+ *    A BEGIN/COMMIT depth trace proves the injection fires INSIDE the real
+ *    auth_audit transaction; a paused hook holds the PGlite serialization
+ *    chain, so a racing admin mutation queues exactly as it would behind the
+ *    open registration tx. Reset queries never pass the hook or its counter.
  *  Assertions in the carried suites are unchanged. */
 export type AuditHook = (
   entry: { phone: string; kind: string; detail?: unknown },
@@ -76,18 +183,27 @@ export interface TestBackend {
 
 export async function makeTestBackendFrom(data: SeedData): Promise<TestBackend> {
   if (REPO_IMPL === 'postgres') {
+    const fp = await fileInstance();
     let hook: AuditHook | undefined;
-    const raw = await freshPglite();
+    let txDepth = 0;
+    let auditSeq = 0;
     const wrapped = {
       query: (text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[]; affectedRows?: number }> => {
+        const tt = text.trim().toUpperCase();
+        if (tt === 'BEGIN') txDepth += 1;
+        else if (tt.startsWith('COMMIT') || tt.startsWith('ROLLBACK')) txDepth = Math.max(0, txDepth - 1);
         if (hook && /^\s*INSERT\s+INTO\s+auth_audit/i.test(text)) {
+          auditSeq += 1;
+          trace(fp, { op: 'audit-insert', seq: auditSeq, inTx: txDepth > 0 });
           const entry = { phone: String(params?.[0]), kind: String(params?.[1]), detail: params?.[2] ?? undefined };
-          return Promise.resolve(hook(entry, () => raw.query(text, params))) as Promise<{ rows: Record<string, unknown>[]; affectedRows?: number }>;
+          return Promise.resolve(hook(entry, () => fp.raw.query(text, params))) as Promise<{ rows: Record<string, unknown>[]; affectedRows?: number }>;
         }
-        return raw.query(text, params);
+        return fp.raw.query(text, params);
       },
     };
     const conn = pgliteConnectable(wrapped);
+    await resetInstance(fp); // uninstrumented: raw handle, outside the hook/counters
+    fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, data);
     const otpStore = await createPgOtpState(conn);

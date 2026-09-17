@@ -96,7 +96,7 @@ describe('M3-QA-1: all-seven-profile API parity', () => {
     // (d) re-fakes to 23:30 itself for the quiet-hours assertions.
     vi.useFakeTimers({ now: new Date('2026-09-14T12:00:00+03:00').getTime(), toFake: ['Date'] });
   });
-  afterEach(() => { vi.useRealTimers(); });
+  afterEach(async () => { vi.useRealTimers(); await app.close(); }); // Whitelist-PG gate lifecycle: close app per test
 
   for (const pid of PROFILES) {
     it(`profile ${pid}: move -> domino S3, exact recipients, profile-rendered bodies, quiet-hours split`, async () => {
