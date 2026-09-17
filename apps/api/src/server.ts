@@ -5,6 +5,7 @@ import { MemoryGraphRepository } from './repo/memory.js';
 import { PostgresGraphRepository, pgDispatchState, createPgOtpState } from './repo/postgres.js';
 import type { GraphRepository } from './repo/graph-repository.js';
 import { applySeed, seedDemo } from './seed.js';
+import { resolveAuthSecret, resolveSeedMode } from './boot-config.js';
 import { createRealtime } from './realtime.js';
 import { createDispatcher, type DispatchStateStore, type MessageProvider } from './services/dispatch.js';
 import { createTwilioProvider, twilioConfigFromEnv } from './services/twilio.js';
@@ -34,13 +35,23 @@ if (RBAC_MATRIX_VERSION !== PINNED_MATRIX_VERSION) {
 let repo: GraphRepository;
 let dispatchState: DispatchStateStore | undefined;
 let otpState: OtpStateStore | undefined;
-// CONTAKE_SEED=camp-demo loads the rich camp-day demo dataset (plan 3ח);
-// CONTAKE_SEED=all-demo loads camp + all six vertical seeds (Stage 1: one org
-// per vertical, D = current Jerusalem date at boot; memory-mode re-seed makes
-// re-anchoring free - restart with a fresh D before a demo);
-// anything else (or unset) loads the compact QA demo seed.
+// Seed policy (fail-closed hotfix 2026-09-17): a demo seed is applied ONLY on
+// an explicit recognized CONTAKE_SEED value. UNSET or unrecognized means NO
+// SEED - production boots seed-free.
+//   CONTAKE_SEED=demo      compact QA demo seed
+//   CONTAKE_SEED=camp-demo rich camp-day demo dataset (plan 3ח)
+//   CONTAKE_SEED=all-demo  camp + all six vertical seeds (Stage 1: one org per
+//                          vertical, D = current Jerusalem date at boot; memory
+//                          mode only, re-anchoring free - restart fresh before a demo)
+// Auth secret policy: CONTAKE_AUTH_SECRET is REQUIRED (non-empty) whenever
+// DATABASE_URL is set; a postgres/production boot with it missing or empty
+// REFUSES to boot (resolveAuthSecret throws before any DB work). Memory/dev
+// uses an explicit non-deployable local constant.
 const jerusalemToday = (): string => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
-const pickSeed = () => (process.env['CONTAKE_SEED'] === 'camp-demo' ? campDemoSeed() : seedDemo());
+const seedMode = resolveSeedMode();
+// Fail-closed FIRST, before any DB/network work: a production-shaped boot
+// without a real secret dies here.
+const authSecret = resolveAuthSecret();
 const allDemoSeeds = (): SeedData[] => {
   const D = jerusalemToday();
   const verticals = [seedFilmShoot(D), seedEventProduction(D), seedEducation(D), seedAfterSchool(D), seedConference(D), seedLogistics(D)];
@@ -64,11 +75,13 @@ if (process.env['DATABASE_URL']) {
   const { Pool } = await import('pg');
   const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
   repo = await PostgresGraphRepository.create(pool);
-  const seed = pickSeed();
-  if ((await repo.listEvents(seed.orgId)).length === 0) {
+  const seed = seedMode === 'demo' ? seedDemo() : seedMode === 'camp-demo' ? campDemoSeed() : undefined;
+  if (seed && (await repo.listEvents(seed.orgId)).length === 0) {
     await applySeed(repo, seed);
-    console.log('Postgres: empty database, demo seed applied');
-  } else if (process.env['CONTAKE_SEED'] === 'camp-demo') {
+    console.log(`Postgres: empty database, ${seedMode} seed applied (explicit CONTAKE_SEED)`);
+  } else if (!seed) {
+    console.log('Postgres: CONTAKE_SEED unset/unrecognized - NO seed applied (production seed-free)');
+  } else if (seedMode === 'camp-demo') {
     // TL 2026-09-14: QA staging slice is additive-if-absent - the prod DB already
     // holds cd-ev1 (Chaim's live event), which this never touches.
     await ensureCampDemoStaging(repo);
@@ -80,14 +93,21 @@ if (process.env['DATABASE_URL']) {
   dispatchState = pgDispatchState(pool);
   otpState = await createPgOtpState(pool); // pilot-prep #4: shared OTP state
   console.log('Contake API: Postgres adapter (DATABASE_URL)');
-} else if (process.env['CONTAKE_SEED'] === 'all-demo') {
+} else if (seedMode === 'all-demo') {
   repo = new MemoryGraphRepository();
   for (const seed of allDemoSeeds()) await applySeed(repo, seed);
   console.log('Contake API: memory adapter, all-demo composite seed (camp + 6 verticals, D=' + jerusalemToday() + ')');
 } else {
-  repo = MemoryGraphRepository.seeded(pickSeed());
+  repo = new MemoryGraphRepository();
+  const seed = seedMode === 'demo' ? seedDemo() : seedMode === 'camp-demo' ? campDemoSeed() : undefined;
+  if (seed) {
+    await applySeed(repo, seed);
+    console.log(`Contake API: memory adapter, ${seedMode} seed applied (explicit CONTAKE_SEED)`);
+  } else {
+    console.log('Contake API: memory adapter, CONTAKE_SEED unset/unrecognized - NO seed (production seed-free)');
+  }
 }
-const auth = new AuthService(repo, undefined, undefined, otpState);
+const auth = new AuthService(repo, authSecret, undefined, otpState);
 const app = buildApp(repo, auth);
 
 const port = Number(process.env['PORT'] ?? 3000);
