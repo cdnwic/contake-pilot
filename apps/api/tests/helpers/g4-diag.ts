@@ -10,6 +10,14 @@ import { appendFileSync } from 'node:fs';
 import { performance, monitorEventLoopDelay, type EventLoopDelayMonitor } from 'node:perf_hooks';
 
 const OUT = process.env['G4_DIAG_LOG'];
+const EXT_LOG = process.env['G4_EXT_LOG'];
+const MIRROR_EVENTS: Record<string, string> = {
+  'beforeAll:entry': 'file-setup-start',
+  'L4:return': 'g4-return',
+  'afterAll:exit': 'file-teardown-end',
+  'helperAA:closed': 'pg-close',
+  'process:exit': 'worker-process-exit',
+};
 let seq = 0;
 let eld: EventLoopDelayMonitor | undefined;
 if (OUT) { try { eld = monitorEventLoopDelay(); eld.enable(); } catch { eld = undefined; } }
@@ -66,6 +74,8 @@ export function probe(label: string, extra: Record<string, unknown> = {}): void 
       ...extra,
     };
     appendFileSync(OUT, JSON.stringify(rec) + '\n');
+    const mirror = EXT_LOG ? MIRROR_EVENTS[label] : undefined;
+    if (mirror) appendFileSync(EXT_LOG as string, JSON.stringify({ ts: rec.wallIso, ev: mirror, pid: process.pid, label }) + '\n');
   } catch { /* diagnostics never disturb the harness */ }
 }
 
