@@ -1016,8 +1016,22 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (typeof body.clientReportId !== 'string' || body.clientReportId.trim() === '' || body.clientReportId.length > REPORT_CLIENT_ID_MAX) {
       fail(400, 'BAD_REQUEST', 'מזהה דיווח לא חוקי');
     }
-    if (typeof body.clientTimestamp !== 'string' || !Number.isFinite(Date.parse(body.clientTimestamp))) {
+    // v1.20.3 (QA QM5 2026-09-17): clientTimestamp must be an offset-bearing
+    // instant (parseInstant). V8's Date.parse accepts floating local/date-only
+    // and NORMALIZES invalid calendar days (2026-02-30 -> Mar 2), so the
+    // day-of-month is guarded against rollover before parsing.
+    if (typeof body.clientTimestamp !== 'string') {
       fail(400, 'BAD_REQUEST', 'חותמת זמן לא חוקית');
+    }
+    const tsDate = /^(\d{4})-(\d{2})-(\d{2})T/.exec(body.clientTimestamp);
+    const tsDayOk = tsDate
+      ? (() => { const y = +tsDate[1]!, mo = +tsDate[2]!, d = +tsDate[3]!;
+          return mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate(); })()
+      : false;
+    let tsOk = false;
+    if (tsDayOk) { try { parseInstant(body.clientTimestamp); tsOk = true; } catch { tsOk = false; } }
+    if (!tsOk) {
+      fail(400, 'BAD_REQUEST', 'חותמת זמן לא חוקית (נדרש ISO עם אזור זמן)');
     }
     if (body.noteHe !== undefined && (typeof body.noteHe !== 'string' || body.noteHe.length > REPORT_NOTE_MAX)) {
       fail(400, 'BAD_REQUEST', 'הערה ארוכה מדי');

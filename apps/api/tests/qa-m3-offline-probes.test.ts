@@ -26,14 +26,14 @@ describe('offline queue semantics (server side)', () => {
     expect(r2.json().deduped ?? (r2.json().report?.id === r1.json().report?.id)).toBeTruthy();
   });
   it('OQ-2: original clientTimestamp preserved on the report record', async () => {
-    const r = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(w1), payload: { taskId: 't7', status: 'ok', clientReportId: 'oq-2', clientTimestamp: '2026-09-14T06:30:00+03:00' } });
+    const r = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(w1), payload: { taskId: 't7', status: 'on_track', clientReportId: 'oq-2', clientTimestamp: '2026-09-14T06:30:00+03:00' } });
     const rep = r.json().report;
     console.log('OQ-2 clientTimestamp:', rep?.clientTimestamp, 'createdAt:', rep?.createdAt);
     expect(rep?.clientTimestamp).toBe('2026-09-14T06:30:00+03:00');
   });
   it('OQ-3: out-of-order queue replay — delayed(14:05) then ok(14:02) on same task: both recorded, order preserved by clientTimestamp', async () => {
     await app.inject({ method: 'POST', url: '/v1/reports', headers: H(w1), payload: { taskId: 't7', status: 'delayed', delayMin: 15, clientReportId: 'oq-3a', clientTimestamp: '2026-09-14T14:05:00+03:00' } });
-    const r2 = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(w1), payload: { taskId: 't7', status: 'ok', clientReportId: 'oq-3b', clientTimestamp: '2026-09-14T14:02:00+03:00' } });
+    const r2 = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(w1), payload: { taskId: 't7', status: 'on_track', clientReportId: 'oq-3b', clientTimestamp: '2026-09-14T14:02:00+03:00' } });
     console.log('OQ-3 second (older ts) accepted:', r2.statusCode, 'outcome:', JSON.stringify(r2.json()).slice(0, 150));
     expect(r2.statusCode).toBeLessThan(300);
   });

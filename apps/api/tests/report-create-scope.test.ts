@@ -180,9 +180,19 @@ describe('POST /v1/reports runtime request validation (QM4)', () => {
     await expectClean400('unknown status', { ...base, status: 'stuck' });
     await expectClean400('empty status', { ...base, status: '' });
   });
-  it('clientTimestamp must be a valid date', async () => {
+  it('clientTimestamp must be a valid offset-bearing instant (QA QM5)', async () => {
     await expectClean400('garbage ts', { ...base, clientTimestamp: 'not-a-date' });
     await expectClean400('numeric ts', { ...base, clientTimestamp: 12345 });
+    await expectClean400('date-only', { ...base, clientTimestamp: '2026-09-17' });
+    await expectClean400('floating local (no offset)', { ...base, clientTimestamp: '2026-09-17T10:00:00' });
+    await expectClean400('calendar rollover Feb 30', { ...base, clientTimestamp: '2026-02-30T10:00:00Z' });
+    await expectClean400('calendar rollover Apr 31', { ...base, clientTimestamp: '2026-04-31T10:00:00+03:00' });
+  });
+  it('valid offset-bearing instants accepted (Z and numeric offset)', async () => {
+    const t = await fm();
+    expect((await create(t, { taskId: 'ta1', status: 'on_track', clientReportId: 'v-ts-z', clientTimestamp: '2026-09-17T16:00:00Z' })).statusCode).toBe(200);
+    expect((await create(t, { taskId: 'ta1', status: 'on_track', clientReportId: 'v-ts-off', clientTimestamp: '2026-09-17T19:00:00+03:00' })).statusCode).toBe(200);
+    expect((await repo.listReports('e2')).length).toBe(2);
   });
   it('delayed requires finite positive integer delayMin (max 10080); delayMin rejected on other statuses', async () => {
     await expectClean400('delayed without delayMin', { ...base, status: 'delayed' });
