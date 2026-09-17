@@ -1990,6 +1990,12 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const reports: (StatusReport & { readAt?: string })[] = [];
     for (const e of events) {
       for (const r of await repo.listReports(e.id)) {
+        // v1.20.2 §21.1א (QA pre-adjudication 2026-09-17): list visibility is
+        // task/site-scoped, matching mark-read. Event-level admission alone
+        // leaked other-site reports to site-scoped FMs in multi-site events.
+        // An unresolvable task is fail-closed for every role.
+        const task = await repo.getTask(r.taskId);
+        if (!task || !taskInScope(user, e.id, task.siteId)) continue;
         if (status && r.status !== status) continue;
         const readAt = readAtByReport.get(r.id);
         if (unread === 'true' && readAt) continue;
