@@ -311,7 +311,16 @@ if kill -0 "$XPID" 2>/dev/null || [ "$(group_left)" != "0" ]; then
   active_clean_group residue-clean
   reap_xpid || true
 fi
-if kill -0 "$XPID" 2>/dev/null; then :; else wait "$XPID" 2>/dev/null; fi
+# Truthful sentinel-reaped marker on every RC/path (QA 2026-09-17): an
+# unconditional blocking wait on a live sentinel (identity-refuse path) would
+# change cleanup behavior, so the wait runs only when the sentinel has exited
+# (instant if already reaped) and the marker records the truthful state.
+if kill -0 "$XPID" 2>/dev/null; then
+  ev sentinel-reaped --arg path drain --arg state alive-unreaped --argjson command_rc "${RC:--1}"
+else
+  wait "$XPID" 2>/dev/null
+  ev sentinel-reaped --arg path drain --arg state reaped --argjson command_rc "${RC:--1}"
+fi
 wait "$SPID" 2>/dev/null; SPRC=$?
 LEFT=$(group_left)
 
