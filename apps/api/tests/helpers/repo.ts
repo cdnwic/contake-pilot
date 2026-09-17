@@ -28,6 +28,7 @@ import type { GraphRepository } from '../../src/repo/graph-repository.js';
 import { MemoryGraphRepository } from '../../src/repo/memory.js';
 import { PostgresGraphRepository, pgliteConnectable, createPgOtpState, type Connectable } from '../../src/repo/postgres.js';
 import { memoryOtpState, type OtpStateStore } from '../../src/auth.js';
+import type { DispatchStateStore } from '../../src/services/dispatch.js';
 import { probe } from './g4-diag.js';
 import { applySeed, seedDemo } from '../../src/seed.js';
 import type { SeedData } from '../../src/repo/graph-repository.js';
@@ -220,4 +221,27 @@ export async function makeTestBackendFrom(data: SeedData): Promise<TestBackend> 
   const realAppend = otpStore.appendAuthAudit.bind(otpStore);
   otpStore.appendAuthAudit = e => (hook ? Promise.resolve(hook(e, () => realAppend(e))) as Promise<void> : realAppend(e));
   return { repo, otpStore, setAuditHook: h => { hook = h; } };
+}
+
+/** G2 stop-ship (2026-09-17): a DispatchStateStore matching the current lane,
+ *  over the SAME durable backend the repo uses - this mirrors the server.ts
+ *  production composition (pgDispatchState injected into buildApp AND the
+ *  send-side dispatcher). memory lane: a plain shared in-memory store.
+ *  PGlite lane: over the file-scoped instance's serialized connectable.
+ *  realpg lane: a fresh Pool on DATABASE_URL (multi-connection proof).
+ *  `existing` lets a test mint a SECOND store over the same backend
+ *  (restart proof). */
+export async function makeLaneDispatchState(): Promise<DispatchStateStore> {
+  if (REPO_IMPL === 'realpg') {
+    const { Pool } = await import('pg');
+    const { pgDispatchState } = await import('../../src/repo/postgres.js');
+    return pgDispatchState(new Pool({ connectionString: process.env['DATABASE_URL'] }) as unknown as Connectable);
+  }
+  if (REPO_IMPL === 'postgres') {
+    const fp = await fileInstance();
+    const { pgDispatchState } = await import('../../src/repo/postgres.js');
+    return pgDispatchState(pgliteConnectable(fp.raw));
+  }
+  const { memoryDispatchState } = await import('../../src/services/dispatch.js');
+  return memoryDispatchState();
 }

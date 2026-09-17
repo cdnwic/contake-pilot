@@ -88,7 +88,11 @@ if (process.env['DATABASE_URL']) {
   repo = MemoryGraphRepository.seeded(pickSeed());
 }
 const auth = new AuthService(repo, undefined, undefined, otpState);
-const app = buildApp(repo, auth);
+// G2 stop-ship (2026-09-17): inject the ONE durable DispatchStateStore so the
+// inbound webhook's STOP suppressions land in the same store the send-side
+// dispatcher consults (previously buildApp kept a private in-memory store and
+// production STOPs never reached send-side; a restart also wiped them).
+const app = buildApp(repo, auth, { ...(dispatchState ? { dispatchState } : {}) });
 
 const port = Number(process.env['PORT'] ?? 3000);
 app.listen({ port, host: '0.0.0.0' }).then(() => {

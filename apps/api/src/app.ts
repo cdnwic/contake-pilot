@@ -9,7 +9,7 @@ import {
   rawDecision, renderInstant, computeDomino, wouldCreateCycle, PROFILES_VERSION,
 } from '@contake/core';
 import { appEvents } from './services/events.js';
-import { createDispatcher, memoryDispatchState, type MessageProvider } from './services/dispatch.js';
+import { createDispatcher, memoryDispatchState, type DispatchStateStore, type MessageProvider } from './services/dispatch.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
 import { AuthService } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
@@ -64,7 +64,13 @@ export function filteredGraph(snapshot: GraphSnapshot, user: UserRecord): GraphS
   };
 }
 
-export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInstance {
+export function buildApp(repo: GraphRepository, auth: AuthService, opts?: {
+  /** G2 stop-ship (2026-09-17): the inbound STOP path and every send-side
+   *  dispatcher MUST share ONE DispatchStateStore. Production (server.ts,
+   *  DATABASE_URL mode) injects its durable pgDispatchState here; tests may
+   *  inject their own; omitted falls back to a fresh in-memory store. */
+  dispatchState?: DispatchStateStore;
+}): FastifyInstance {
 
 
   const app = Fastify({ logger: false });
@@ -72,7 +78,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
   // G2: app-level shared dispatch state + inbound-only dispatcher so the §25
   // webhook's STOP path flows through the existing handleInboundStop (ND-5)
   // and its suppression is visible to send-side dispatchers sharing the store.
-  const dispatchState = memoryDispatchState();
+  const dispatchState = opts?.dispatchState ?? memoryDispatchState();
   const inertProvider = (name: 'whatsapp' | 'sms'): MessageProvider => ({
     name, send: () => Promise.resolve({ ok: false as const, retryable: false, error: 'inbound-only dispatcher' }),
   });
