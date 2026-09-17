@@ -10,19 +10,43 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import { buildApp } from '../src/app.js';
 import { AuthService } from '../src/auth.js';
-import { LOCAL_DEV_AUTH_SECRET, devOtpEnabled, resolveAuthSecret, resolveSeedMode } from '../src/boot-config.js';
+import { LOCAL_DEV_AUTH_SECRET, MIN_AUTH_SECRET_LENGTH, assertBootPolicy, devOtpEnabled, resolveAuthSecret, resolveSeedMode } from '../src/boot-config.js';
 import { makeTestRepo } from './helpers/repo.js';
 
 describe('resolveAuthSecret (fail-closed)', () => {
-  it('returns the configured secret when non-empty', () => {
-    expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: 's3cret', DATABASE_URL: 'postgres://x' })).toBe('s3cret');
-    expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: 's3cret' })).toBe('s3cret');
+  const STRONG = 'a'.repeat(MIN_AUTH_SECRET_LENGTH);
+  it('returns the configured secret when non-empty, trimmed, and strong enough', () => {
+    expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG, DATABASE_URL: 'postgres://x' })).toBe(STRONG);
+    expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: `  ${STRONG}  ` })).toBe(STRONG); // trimmed
+  });
+  it('REJECTS known fallback values even when explicitly configured', () => {
+    for (const bad of ['contake-dev-secret', LOCAL_DEV_AUTH_SECRET]) {
+      expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: bad })).toThrow(/fallback/);
+      expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: bad, DATABASE_URL: 'postgres://x' })).toThrow(/fallback/);
+    }
+  });
+  it('REJECTS secrets shorter than the minimum length', () => {
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'a'.repeat(MIN_AUTH_SECRET_LENGTH - 1) })).toThrow(/shorter/);
+  });
+  it('REQUIRES a secret for NODE_ENV=production even WITHOUT DATABASE_URL (adapter-independent)', () => {
+    expect(() => resolveAuthSecret({ NODE_ENV: 'production' })).toThrow(/CONTAKE_AUTH_SECRET/);
   });
   it('REFUSES postgres-shaped boot when the secret is missing', () => {
     expect(() => resolveAuthSecret({ DATABASE_URL: 'postgres://x' })).toThrow(/CONTAKE_AUTH_SECRET/);
   });
   it('REFUSES postgres-shaped boot when the secret is EMPTY', () => {
     expect(() => resolveAuthSecret({ DATABASE_URL: 'postgres://x', CONTAKE_AUTH_SECRET: '' })).toThrow(/CONTAKE_AUTH_SECRET/);
+  });
+  it('production-boot invariants (assertBootPolicy): no memory fallback, no test mode, no dev OTP, no seed', () => {
+    expect(() => assertBootPolicy({ NODE_ENV: 'production' })).toThrow(/DATABASE_URL/);
+    expect(() => assertBootPolicy({ NODE_ENV: 'production', DATABASE_URL: 'postgres://x', CONTAKE_TEST_MODE: 'true' })).toThrow(/CONTAKE_TEST_MODE/);
+    expect(() => assertBootPolicy({ NODE_ENV: 'production', DATABASE_URL: 'postgres://x', CONTAKE_DEV_OTP: 'true' })).toThrow(/CONTAKE_DEV_OTP/);
+    expect(() => assertBootPolicy({ NODE_ENV: 'production', DATABASE_URL: 'postgres://x', CONTAKE_SEED: 'camp-demo' })).toThrow(/CONTAKE_SEED/);
+    expect(() => assertBootPolicy({ NODE_ENV: 'production', DATABASE_URL: 'postgres://x' })).not.toThrow();
+    expect(() => assertBootPolicy({ CONTAKE_TEST_MODE: 'true', CONTAKE_SEED: 'camp-demo' })).not.toThrow(); // non-production: untouched
+  });
+  it('devOtpEnabled is closed in a production boot even for exact true', () => {
+    expect(devOtpEnabled({ CONTAKE_DEV_OTP: 'true', NODE_ENV: 'production' })).toBe(false);
   });
   it('memory/dev falls back to the explicit NON-DEPLOYABLE local constant (never env-adjacent)', () => {
     expect(resolveAuthSecret({})).toBe(LOCAL_DEV_AUTH_SECRET);

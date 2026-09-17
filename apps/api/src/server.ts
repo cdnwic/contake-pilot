@@ -5,7 +5,7 @@ import { MemoryGraphRepository } from './repo/memory.js';
 import { PostgresGraphRepository, pgDispatchState, createPgOtpState } from './repo/postgres.js';
 import type { GraphRepository } from './repo/graph-repository.js';
 import { applySeed, seedDemo } from './seed.js';
-import { resolveAuthSecret, resolveSeedMode } from './boot-config.js';
+import { assertBootPolicy, resolveAuthSecret, resolveSeedMode } from './boot-config.js';
 import { createRealtime } from './realtime.js';
 import { createDispatcher, type DispatchStateStore, type MessageProvider } from './services/dispatch.js';
 import { createTwilioProvider, twilioConfigFromEnv } from './services/twilio.js';
@@ -48,9 +48,10 @@ let otpState: OtpStateStore | undefined;
 // REFUSES to boot (resolveAuthSecret throws before any DB work). Memory/dev
 // uses an explicit non-deployable local constant.
 const jerusalemToday = (): string => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
+// Fail-closed FIRST, before any DB/network work: production invariants, then
+// the secret. A violating boot dies here.
+assertBootPolicy();
 const seedMode = resolveSeedMode();
-// Fail-closed FIRST, before any DB/network work: a production-shaped boot
-// without a real secret dies here.
 const authSecret = resolveAuthSecret();
 const allDemoSeeds = (): SeedData[] => {
   const D = jerusalemToday();
@@ -87,9 +88,11 @@ if (process.env['DATABASE_URL']) {
     await ensureCampDemoStaging(repo);
     console.log('Postgres: camp-demo QA staging slice ensured (additive-if-absent)');
   }
-  // v1.18 §15 camp protection: pilot phones pre-approved on every boot
-  // (idempotent upsert on phone; zero camp behavior change).
-  await ensureCampWhitelist(repo);
+  // v1.18 §15 camp protection: pilot phones pre-approved ONLY on the explicit
+  // camp-demo demo boot (fail-closed hotfix v2: never unconditional in a
+  // production-shaped boot; already-seeded public credentials are
+  // rotation/deletion work, not code).
+  if (seedMode === 'camp-demo') await ensureCampWhitelist(repo);
   dispatchState = pgDispatchState(pool);
   otpState = await createPgOtpState(pool); // pilot-prep #4: shared OTP state
   console.log('Contake API: Postgres adapter (DATABASE_URL)');
@@ -138,5 +141,5 @@ app.listen({ port, host: '0.0.0.0' }).then(() => {
   const dispatcher = createDispatcher({ repo, providers, push: pushProvider, ...(dispatchState ? { state: dispatchState } : {}) });
   const timer = setInterval(() => { void dispatcher.dispatchDue(); }, 5_000);
   timer.unref();
-  console.log(`Contake API listening on :${port} (seeded demo org: camp + film-shoot; realtime + dispatch on)`);
+  console.log(`Contake API listening on :${port} (seed: ${seedMode ?? 'none - production seed-free'}; realtime + dispatch on)`);
 });
