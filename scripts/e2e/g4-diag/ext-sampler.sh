@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# G4 diagnostic external sampler (controller v6 family). 1s JSONL series for the
+# G4 diagnostic external sampler (controller v7 family). 1s JSONL series for the
 # dedicated diagnostic process group: per-process PID/PPID/state/cumulative
 # CPU jiffies/RSS/threads/fds/socket-fds/wchan + birth/death events; system
 # memory/load/PSI/OOM counter/cgroup limits. Events: sampler-start,
