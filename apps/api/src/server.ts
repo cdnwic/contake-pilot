@@ -19,11 +19,12 @@ import { seedConference } from './seeds/conference.seed.js';
 import { seedLogistics } from './seeds/logistics.seed.js';
 import type { SeedData } from './repo/graph-repository.js';
 
-// Deploy pin check (contracts v1.18 / matrix v1.4): refuse boot on a wrong
-// pinned matrix drop-in. File-hash pinning happens at review/build time (the
-// pinned sha256 is checked against TL-published hashes before deploy); the
-// compiled runtime asserts the version marker of the actually-loaded matrix.
-const PINNED_MATRIX_VERSION = '1.4';
+// Deploy pin check (boot addendum 2026-09-17): the pinned matrix version is
+// single-sourced HERE. Boot fails loudly when the loaded matrix drop-in does
+// not match the pin. File-hash pinning happens at review/build time (the pinned
+// sha256 is checked against TL-published hashes before deploy); the compiled
+// runtime asserts the version marker of the actually-loaded matrix.
+export const PINNED_MATRIX_VERSION = '1.6';
 if (RBAC_MATRIX_VERSION !== PINNED_MATRIX_VERSION) {
   throw new Error(`RBAC matrix pin mismatch: expected v${PINNED_MATRIX_VERSION}, loaded v${RBAC_MATRIX_VERSION} - refusing to boot`);
 }

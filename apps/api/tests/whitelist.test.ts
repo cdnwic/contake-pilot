@@ -3,11 +3,12 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AuthService, hashPasswordPure, memoryOtpState, type OtpStateStore } from '../src/auth.js';
 import type { GraphRepository } from '../src/repo/graph-repository.js';
-import { makeTestRepoFrom } from './helpers/repo.js';
+import { makeTestBackendFrom, type AuditHook } from './helpers/repo.js';
 
 let app: FastifyInstance;
 let repo: GraphRepository;
 let otp: OtpStateStore;
+let setAuditHook: (hook?: AuditHook) => void;
 
 const H = (t: string) => ({ authorization: `Bearer ${t}` });
 const adminLogin = async (): Promise<string> => {
@@ -16,7 +17,10 @@ const adminLogin = async (): Promise<string> => {
 };
 
 beforeEach(async () => {
-  repo = await makeTestRepoFrom({
+  // Whitelist-PG gate (harness lane): bind repo + OTP/audit to the SAME adapter
+  // so observations and fault injection land on the channel the adapter really
+  // writes (memory store under memory, PG auth_audit under postgres).
+  const backend = await makeTestBackendFrom({
     orgId: 'org-1',
     users: [
       { userId: 'u-admin', orgId: 'org-1', name: 'מנהל', role: 'admin', scopes: [], email: 'admin@x.local', passwordHash: hashPasswordPure('admin123'), active: true },
@@ -25,7 +29,9 @@ beforeEach(async () => {
     ],
     channels: [], events: [], resources: [], tasks: [], dependencies: [],
   });
-  otp = memoryOtpState();
+  repo = backend.repo;
+  otp = backend.otpStore;
+  setAuditHook = backend.setAuditHook;
   app = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
 });
 afterEach(async () => { await app.close(); });
@@ -213,20 +219,19 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     const admin = await adminLogin();
     const phone = '+972500999050';
     await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
-    // Sink pauses on the committed append: registration holds the per-phone lock mid-commit
-    const flaky = memoryOtpState();
-    const orig = flaky.appendAuthAudit.bind(flaky);
+    // Audit channel pauses on the committed append: registration holds the
+    // per-phone lock (memory) / open tx (PG) mid-commit
     let calls = 0;
     let release!: () => void;
     let entered!: () => void;
     const gate = new Promise<void>(res => { release = res; });
     const enteredP = new Promise<void>(res => { entered = res; });
-    flaky.appendAuthAudit = (e: { phone: string; kind: string; detail?: unknown }) => {
+    setAuditHook((_e, real) => {
       calls += 1;
-      if (calls === 2) { entered(); return gate.then(() => orig(e)); } // paused, then REALLY appends
-      return orig(e);
-    };
-    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, flaky));
+      if (calls === 2) { entered(); return gate.then(() => real()); } // paused, then REALLY appends
+      return real();
+    });
+    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
     const regP = app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מועמד', requestedRole: 'field_manager' } });
     await enteredP; // registration is mid-commit, holding the repo lock
     const approveP = app2.inject({ method: 'POST', url: `/v1/whitelist/${phone}/approve`, headers: H(admin), payload: { role: 'field_manager' } });
@@ -241,7 +246,7 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     const entry = (await repo.getWhitelistEntry(phone))!;
     expect(entry.status).toBe('approved'); // the admin's LATER state is intact
     expect(entry.assignedRole).toBe('field_manager');
-    const rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    const rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
     expect(rows.filter(r => (r.detail as { reasonCode?: string }).reasonCode === 'committed')).toHaveLength(1);
     await app2.close();
   });
@@ -250,19 +255,17 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     const admin = await adminLogin();
     const phone = '+972500999051';
     await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
-    const flaky = memoryOtpState();
-    const orig = flaky.appendAuthAudit.bind(flaky);
     let calls = 0;
     let failGate!: (e: Error) => void;
     let entered!: () => void;
     const gate = new Promise<void>((res, rej) => { failGate = rej; });
     const enteredP = new Promise<void>(res => { entered = res; });
-    flaky.appendAuthAudit = (e: { phone: string; kind: string; detail?: unknown }) => {
+    setAuditHook((_e, real) => {
       calls += 1;
       if (calls === 2) { entered(); return gate; }
-      return orig(e);
-    };
-    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, flaky));
+      return real();
+    });
+    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
     const regP = app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מועמד', requestedRole: 'focus_worker' } });
     await enteredP; // mid-commit, lock held
     const reinviteP = app2.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
@@ -277,11 +280,11 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     const entry = (await repo.getWhitelistEntry(phone))!;
     expect(entry.status).toBe('invited'); // rolled back, then re-invited - the rollback never overwrote the admin's write
     // zero committed rows from the failed attempt; a fresh retry is unambiguous
-    let rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    let rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
     expect(rows.filter(r => (r.detail as { reasonCode?: string }).reasonCode === 'committed')).toHaveLength(0);
     const retry = await app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'מועמד', requestedRole: 'focus_worker' } });
     expect(retry.statusCode).toBe(200);
-    rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
     expect(rows.filter(r => (r.detail as { reasonCode?: string }).reasonCode === 'committed')).toHaveLength(1);
     await app2.close();
   });
@@ -314,33 +317,31 @@ describe('whitelist onboarding (v1.18 §15 / matrix v1.4)', () => {
     const admin = await adminLogin();
     const phone = '+972500999032';
     await app.inject({ method: 'POST', url: '/v1/whitelist', headers: H(admin), payload: { phone } });
-    // Store that fails only on its SECOND append (the committed write, mid-commit)
-    const flaky = memoryOtpState();
-    const orig = flaky.appendAuthAudit.bind(flaky);
+    // Audit channel fails only on its SECOND append (the committed write, mid-commit)
     let calls = 0;
     // QA round-6 contract: the double REJECTS asynchronously - the awaited
     // sink must catch it (rollback) with NO unhandled rejection escaping
-    flaky.appendAuthAudit = (e: { phone: string; kind: string; detail?: unknown }) => {
+    setAuditHook((_e, real) => {
       calls += 1;
-      return calls === 2 ? Promise.reject(new Error('auth_audit store down mid-commit')) : orig(e);
-    };
+      return calls === 2 ? Promise.reject(new Error('auth_audit store down mid-commit')) : real();
+    });
     const unhandled: unknown[] = [];
     const onRej = (r: unknown): void => { unhandled.push(r); };
     process.on('unhandledRejection', onRej);
-    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, flaky));
+    const app2 = buildApp(repo, new AuthService(repo, undefined, undefined, otp));
     // attempt 1: accepted row lands, upsert+committed pair fails -> rolled back
     const r1 = await app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'חדש', requestedRole: 'focus_worker' } });
     expect(r1.statusCode).toBe(500);
     expect((await repo.getWhitelistEntry(phone))!.status).toBe('invited'); // compensating rollback
     const detail = (r: { detail?: unknown }) => r.detail as { outcome?: string; reasonCode?: string };
-    let rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    let rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
     expect(rows.some(r => detail(r).outcome === 'accepted')).toBe(true); // request record survives
     expect(rows.some(r => detail(r).outcome === 'success')).toBe(false); // NO false success ledger
     // retry (healthy store): unambiguous - entry is invited again
     const r2 = await app2.inject({ method: 'POST', url: '/v1/auth/whitelist-register', payload: { phone, displayName: 'חדש', requestedRole: 'focus_worker' } });
     expect(r2.statusCode).toBe(200);
     expect((await repo.getWhitelistEntry(phone))!.status).toBe('pending_approval');
-    rows = (await flaky.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
+    rows = (await otp.listAuthAudit()).filter(r => r.phone === phone && r.kind === 'whitelist.register');
     expect(rows.filter(r => detail(r).reasonCode === 'committed')).toHaveLength(1); // exactly once
     await new Promise(r => setImmediate(r)); // let any stray rejection surface
     process.off('unhandledRejection', onRej);

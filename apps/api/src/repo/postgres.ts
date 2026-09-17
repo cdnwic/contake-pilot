@@ -1,8 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type {
-  AuditLogEntry, ChangeRequest, DependencyEdge, EventNode, GraphSnapshot, ID,
-  NotificationJob, PushSubscription, ResourceNode, StatusReport, TaskNode,
-  WhitelistEntry, WhitelistStatus,
+  AuditLogEntry, Branch, ChangeRequest, ContentAck, ContentItem, ContentItemVersion, DependencyEdge, EventNode,
+  ExternalParty, GraphSnapshot, ID, IdempotencyRecord, NotificationJob, OptoutSuppression, PushSubscription, ReportReadState,
+  ResourceNode, StatusReport, StatusToken, TaskNode, TaskResourceLink,
+  WhitelistEntry, WhitelistStatus, AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
 import type { DispatchStateStore } from '../services/dispatch.js';
@@ -64,6 +65,25 @@ CREATE TABLE IF NOT EXISTS whitelist_entries(phone text PRIMARY KEY, org_id text
 CREATE TABLE IF NOT EXISTS dispatch_sent_keys(key text PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS dispatch_batch_windows(address text PRIMARY KEY, closes_at_ms bigint NOT NULL);
 CREATE TABLE IF NOT EXISTS dispatch_suppressed(address text PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS content_items(id text PRIMARY KEY, org_id text NOT NULL, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS task_content_links(task_id text NOT NULL, content_id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY(task_id, content_id));
+CREATE TABLE IF NOT EXISTS content_acks(org_id text NOT NULL, user_id text NOT NULL, client_ack_id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY(org_id, user_id, client_ack_id));
+CREATE TABLE IF NOT EXISTS external_parties(id text PRIMARY KEY, org_id text NOT NULL, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS status_tokens(id text PRIMARY KEY, org_id text NOT NULL, token_hash text UNIQUE NOT NULL, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS branches(id text PRIMARY KEY, org_id text NOT NULL, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS report_read_states(report_id text NOT NULL, user_id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY(report_id, user_id));
+CREATE TABLE IF NOT EXISTS content_versions(id text PRIMARY KEY, content_id text NOT NULL, version integer NOT NULL, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS optout_suppressions(id text PRIMARY KEY, channel text NOT NULL, address text NOT NULL, org_id text, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS idempotency_records(org_id text NOT NULL, actor_id text NOT NULL, route text NOT NULL, client_mutation_id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY(org_id, actor_id, route, client_mutation_id));
+CREATE TABLE IF NOT EXISTS advance_proposals(id text PRIMARY KEY, event_id text NOT NULL, status text NOT NULL, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS advance_outbox(id text PRIMARY KEY, proposal_id text NOT NULL, status text NOT NULL, data jsonb NOT NULL);
+-- whitelist-PG gate: the PG REPO writes auth_audit (commitWhitelistRegistration),
+-- so the table must exist even when the OTP store is memory-backed. Mirrors the
+-- OTP DDL block (IF NOT EXISTS = idempotent when createPgOtpState also runs).
+CREATE TABLE IF NOT EXISTS auth_audit(seq bigserial PRIMARY KEY, phone text NOT NULL, kind text NOT NULL, data jsonb, created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS content_items_org ON content_items(org_id);
+CREATE INDEX IF NOT EXISTS external_parties_org ON external_parties(org_id);
+CREATE INDEX IF NOT EXISTS branches_org ON branches(org_id);
 CREATE INDEX IF NOT EXISTS tasks_event_id ON tasks(event_id);
 CREATE INDEX IF NOT EXISTS resources_event_id ON resources(event_id);
 CREATE INDEX IF NOT EXISTS channels_address ON channels(address);
@@ -185,6 +205,21 @@ export class PostgresGraphRepository implements GraphRepository {
        ON CONFLICT (phone) DO UPDATE SET org_id=$2, status=$3, data=$4`,
       [e.phone, e.orgId, e.status, JSON.stringify(e)]);
     return e;
+  }
+  /** QA 2026-09-17 (register exactly-one-winner): create-only invite.
+   *  Plain INSERT ... ON CONFLICT DO NOTHING - a concurrent winner's
+   *  committed row makes the loser's insert match zero rows; NO overwrite,
+   *  never a silent cross-org success (T2 defect class). Deterministic. */
+  async createWhitelistInvite(e: WhitelistEntry): Promise<{ outcome: 'created' | 'exists'; entry: WhitelistEntry }> {
+    const r = await this.q(
+      `INSERT INTO whitelist_entries(phone, org_id, status, data) VALUES($1,$2,$3,$4)
+       ON CONFLICT (phone) DO NOTHING RETURNING data`,
+      [e.phone, e.orgId, e.status, JSON.stringify(e)]);
+    const won = r.rows[0];
+    if (won) return { outcome: 'created', entry: won['data'] as WhitelistEntry };
+    const existing = await this.getWhitelistEntry(e.phone);
+    if (!existing) throw new Error('createWhitelistInvite: row vanished between insert and read');
+    return { outcome: 'exists', entry: existing };
   }
   async getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined> {
     const r = await this.q(`SELECT data FROM whitelist_entries WHERE phone=$1 LIMIT 1`, [phone]);
@@ -463,6 +498,75 @@ export class PostgresGraphRepository implements GraphRepository {
     });
   }
 
+  async correctReport(id: ID, expectedVersion: number, patch: { actualFinishAt: string; lastCorrection: { reason: string; at: string; by: ID } }): Promise<StatusReport | 'conflict' | undefined> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM reports WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as StatusReport | undefined;
+      if (!cur) return undefined;
+      if ((cur.version ?? 1) !== expectedVersion) return 'conflict';
+      const next: StatusReport = { ...cur, actualFinishAt: patch.actualFinishAt, version: (cur.version ?? 1) + 1, lastCorrection: patch.lastCorrection };
+      await c.query(`UPDATE reports SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+      return next;
+    });
+  }
+
+  // ---- advance proposals + outbox (v1.21.2 §26) --------------------------------
+  async createAdvanceProposal(p: AdvanceProposal): Promise<AdvanceProposal> {
+    await this.q(`INSERT INTO advance_proposals(id, event_id, status, data) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`, [p.proposalId, p.eventId, p.status, JSON.stringify(p)]);
+    return p;
+  }
+  async getAdvanceProposal(id: ID): Promise<AdvanceProposal | undefined> {
+    const r = await this.q(`SELECT data FROM advance_proposals WHERE id=$1`, [id]);
+    return r.rows[0]?.['data'] as AdvanceProposal | undefined;
+  }
+  async listAdvanceProposals(eventId: ID): Promise<AdvanceProposal[]> {
+    const r = await this.q(`SELECT data FROM advance_proposals WHERE event_id=$1`, [eventId]);
+    return r.rows.map(x => x['data'] as AdvanceProposal);
+  }
+  async updateAdvanceProposal(id: ID, patch: Partial<Pick<AdvanceProposal, 'status'>>): Promise<AdvanceProposal | undefined> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM advance_proposals WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as AdvanceProposal | undefined;
+      if (!cur) return undefined;
+      const next = { ...cur, ...patch, proposalId: cur.proposalId };
+      await c.query(`UPDATE advance_proposals SET status=$2, data=$3 WHERE id=$1`, [id, next.status, JSON.stringify(next)]);
+      return next;
+    });
+  }
+  async findOpenAdvanceProposal(eventId: ID, anchorTaskId: ID, actualFinishAt: string, graphVersion: number): Promise<AdvanceProposal | undefined> {
+    const r = await this.q(`SELECT data FROM advance_proposals WHERE event_id=$1 AND status='open'`, [eventId]);
+    return (r.rows.map(x => x['data'] as AdvanceProposal)).find(p =>
+      p.anchorTaskId === anchorTaskId && p.actualFinishAt === actualFinishAt && p.graphVersion === graphVersion);
+  }
+  async markProposalsStaleForReport(reportId: ID): Promise<ID[]> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM advance_proposals WHERE status='open' FOR UPDATE`);
+      const stale: ID[] = [];
+      for (const row of r.rows) {
+        const p = row['data'] as AdvanceProposal;
+        if (p.sourceReportId === reportId) {
+          const next = { ...p, status: 'stale' as const };
+          await c.query(`UPDATE advance_proposals SET status='stale', data=$2 WHERE id=$1`, [p.proposalId, JSON.stringify(next)]);
+          stale.push(p.proposalId);
+        }
+      }
+      return stale;
+    });
+  }
+  async createAdvanceOutbox(o: AdvanceOutbox): Promise<AdvanceOutbox> {
+    await this.q(`INSERT INTO advance_outbox(id, proposal_id, status, data) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`, [o.id, o.proposalId, o.status, JSON.stringify(o)]);
+    return o;
+  }
+  async listPendingAdvanceOutbox(): Promise<AdvanceOutbox[]> {
+    const r = await this.q(`SELECT data FROM advance_outbox WHERE status='pending'`);
+    return r.rows.map(x => x['data'] as AdvanceOutbox);
+  }
+  async markAdvanceOutboxMaterialized(id: ID): Promise<void> {
+    const r = await this.q(`SELECT data FROM advance_outbox WHERE id=$1`, [id]);
+    const cur = r.rows[0]?.['data'] as AdvanceOutbox | undefined;
+    if (cur) await this.q(`UPDATE advance_outbox SET status='materialized', data=$2 WHERE id=$1`, [id, JSON.stringify({ ...cur, status: 'materialized' })]);
+  }
+
   // ---- notification jobs --------------------------------------------------------
   async createNotificationJob(j: NotificationJob): Promise<NotificationJob> {
     await this.q(
@@ -546,6 +650,202 @@ export class PostgresGraphRepository implements GraphRepository {
   }
 
   // ---- audit (append-only) ------------------------------------------------------
+  // ---- v1.20 §20 content surface ----
+  async createContentItem(c: ContentItem): Promise<ContentItem> {
+    await this.q(`INSERT INTO content_items(id, org_id, data) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`, [c.id, c.orgId, JSON.stringify(c)]);
+    return c;
+  }
+  async getContentItem(id: ID): Promise<ContentItem | undefined> {
+    const r = await this.q(`SELECT data FROM content_items WHERE id=$1`, [id]);
+    return r.rows[0]?.['data'] as ContentItem | undefined;
+  }
+  async updateContentItem(id: ID, patch: Partial<ContentItem>): Promise<ContentItem | undefined> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM content_items WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as ContentItem | undefined;
+      if (!cur) return undefined;
+      const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId };
+      await c.query(`UPDATE content_items SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+      return next;
+    });
+  }
+  async casUpdateContentItem(id: ID, expectedVersion: number, patch: Partial<ContentItem>): Promise<ContentItem | undefined | 'conflict'> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM content_items WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as ContentItem | undefined;
+      if (!cur) return undefined;
+      if (cur.version !== expectedVersion) return 'conflict';
+      const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId, version: cur.version + 1 };
+      await c.query(`UPDATE content_items SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+      return next;
+    });
+  }
+  async createContentVersion(v: ContentItemVersion): Promise<ContentItemVersion> {
+    await this.q(`INSERT INTO content_versions(id, content_id, version, data) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`, [v.contentVersionId, v.contentId, v.version, JSON.stringify(v)]);
+    return v;
+  }
+  async listContentVersions(contentId: ID): Promise<ContentItemVersion[]> {
+    const r = await this.q(`SELECT data FROM content_versions WHERE content_id=$1 ORDER BY version ASC`, [contentId]);
+    return r.rows.map(row => row['data'] as ContentItemVersion);
+  }
+  async getContentVersion(contentId: ID, contentVersionId: ID): Promise<ContentItemVersion | undefined> {
+    const r = await this.q(`SELECT data FROM content_versions WHERE id=$1 AND content_id=$2`, [contentVersionId, contentId]);
+    return r.rows[0]?.['data'] as ContentItemVersion | undefined;
+  }
+  async deleteContentItem(id: ID): Promise<boolean> {
+    await this.q(`DELETE FROM task_content_links WHERE content_id=$1`, [id]);
+    const r = await this.q(`DELETE FROM content_items WHERE id=$1`, [id]);
+    return (r.rowCount ?? 0) > 0;
+  }
+  async listContentItems(orgId: ID): Promise<ContentItem[]> {
+    const r = await this.q(`SELECT data FROM content_items WHERE org_id=$1`, [orgId]);
+    return r.rows.map(row => row['data'] as ContentItem);
+  }
+  async attachTaskContent(l: TaskResourceLink): Promise<TaskResourceLink> {
+    await this.q(`INSERT INTO task_content_links(task_id, content_id, data) VALUES($1,$2,$3) ON CONFLICT (task_id, content_id) DO UPDATE SET data=EXCLUDED.data`, [l.taskId, l.contentId, JSON.stringify(l)]);
+    return l;
+  }
+  async detachTaskContent(taskId: ID, contentId: ID): Promise<boolean> {
+    const r = await this.q(`DELETE FROM task_content_links WHERE task_id=$1 AND content_id=$2`, [taskId, contentId]);
+    return (r.rowCount ?? 0) > 0;
+  }
+  async listTaskContent(taskId: ID): Promise<TaskResourceLink[]> {
+    const r = await this.q(`SELECT data FROM task_content_links WHERE task_id=$1`, [taskId]);
+    return r.rows.map(row => row['data'] as TaskResourceLink);
+  }
+  async createContentAck(a: ContentAck & { orgId: ID }): Promise<ContentAck> {
+    await this.q(`INSERT INTO content_acks(org_id, user_id, client_ack_id, data) VALUES($1,$2,$3,$4) ON CONFLICT (org_id, user_id, client_ack_id) DO NOTHING`, [a.orgId, a.userId, a.clientAckId, JSON.stringify(a)]);
+    return a;
+  }
+  async getContentAck(orgId: ID, userId: ID, clientAckId: string): Promise<ContentAck | undefined> {
+    const r = await this.q(`SELECT data FROM content_acks WHERE org_id=$1 AND user_id=$2 AND client_ack_id=$3`, [orgId, userId, clientAckId]);
+    return r.rows[0]?.['data'] as ContentAck | undefined;
+  }
+
+  // ---- v1.20 §22 stakeholders ----
+  async createExternalParty(p: ExternalParty): Promise<ExternalParty> {
+    await this.q(`INSERT INTO external_parties(id, org_id, data) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`, [p.id, p.orgId, JSON.stringify(p)]);
+    return p;
+  }
+  async getExternalParty(id: ID): Promise<ExternalParty | undefined> {
+    const r = await this.q(`SELECT data FROM external_parties WHERE id=$1`, [id]);
+    return r.rows[0]?.['data'] as ExternalParty | undefined;
+  }
+  async updateExternalParty(id: ID, patch: Partial<ExternalParty>): Promise<ExternalParty | undefined> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM external_parties WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as ExternalParty | undefined;
+      if (!cur) return undefined;
+      const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId, version: cur.version + 1 };
+      await c.query(`UPDATE external_parties SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+      return next;
+    });
+  }
+  async deleteExternalParty(id: ID): Promise<boolean> {
+    const r = await this.q(`DELETE FROM external_parties WHERE id=$1`, [id]);
+    return (r.rowCount ?? 0) > 0;
+  }
+  async listExternalParties(orgId: ID): Promise<ExternalParty[]> {
+    const r = await this.q(`SELECT data FROM external_parties WHERE org_id=$1`, [orgId]);
+    return r.rows.map(row => row['data'] as ExternalParty);
+  }
+  async createStatusToken(t: StatusToken): Promise<StatusToken> {
+    await this.q(`INSERT INTO status_tokens(id, org_id, token_hash, data) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`, [t.id, t.orgId, t.tokenHash, JSON.stringify(t)]);
+    return t;
+  }
+  async getStatusToken(id: ID): Promise<StatusToken | undefined> {
+    const r = await this.q(`SELECT data FROM status_tokens WHERE id=$1`, [id]);
+    return r.rows[0]?.['data'] as StatusToken | undefined;
+  }
+  async findExternalPartyByContactRef(value: string): Promise<ExternalParty | undefined> {
+    const r = await this.q(`SELECT data FROM external_parties WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(data->'contactRefs') cr WHERE cr->>'value' = $1) LIMIT 1`, [value]);
+    return r.rows[0]?.['data'] as ExternalParty | undefined;
+  }
+  async getStatusTokenByHash(tokenHash: string): Promise<StatusToken | undefined> {
+    const r = await this.q(`SELECT data FROM status_tokens WHERE token_hash=$1`, [tokenHash]);
+    return r.rows[0]?.['data'] as StatusToken | undefined;
+  }
+  async updateStatusToken(id: ID, patch: Partial<StatusToken>): Promise<StatusToken | undefined> {
+    const cur = (await this.q(`SELECT data FROM status_tokens WHERE id=$1`, [id])).rows[0]?.['data'] as StatusToken | undefined;
+    if (!cur) return undefined;
+    const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId };
+    await this.q(`UPDATE status_tokens SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+    return next;
+  }
+
+  // ---- v1.20 §23 branches ----
+  async createBranch(b: Branch): Promise<Branch> {
+    await this.q(`INSERT INTO branches(id, org_id, data) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data`, [b.id, b.orgId, JSON.stringify(b)]);
+    return b;
+  }
+  async getBranch(id: ID): Promise<Branch | undefined> {
+    const r = await this.q(`SELECT data FROM branches WHERE id=$1`, [id]);
+    return r.rows[0]?.['data'] as Branch | undefined;
+  }
+  async updateBranch(id: ID, patch: Partial<Branch>): Promise<Branch | undefined> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM branches WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as Branch | undefined;
+      if (!cur) return undefined;
+      const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId, version: cur.version + 1 };
+      await c.query(`UPDATE branches SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+      return next;
+    });
+  }
+  async listBranches(orgId: ID): Promise<Branch[]> {
+    const r = await this.q(`SELECT data FROM branches WHERE org_id=$1`, [orgId]);
+    return r.rows.map(row => row['data'] as Branch);
+  }
+
+  // ---- v1.20 §24 report read state ----
+  async markReportRead(st: ReportReadState): Promise<ReportReadState> {
+    await this.q(`INSERT INTO report_read_states(report_id, user_id, data) VALUES($1,$2,$3) ON CONFLICT (report_id, user_id) DO UPDATE SET data=EXCLUDED.data`, [st.reportId, st.userId, JSON.stringify(st)]);
+    return st;
+  }
+  async getReportReadState(reportId: ID, userId: ID): Promise<ReportReadState | undefined> {
+    const r = await this.q(`SELECT data FROM report_read_states WHERE report_id=$1 AND user_id=$2`, [reportId, userId]);
+    return r.rows[0]?.['data'] as ReportReadState | undefined;
+  }
+  async listReportReadStates(userId: ID): Promise<ReportReadState[]> {
+    const r = await this.q(`SELECT data FROM report_read_states WHERE user_id=$1`, [userId]);
+    return r.rows.map(row => row['data'] as ReportReadState);
+  }
+
+  // ---- v1.20.2 opt-out suppressions + idempotency records ----
+  async createOptoutSuppression(x: OptoutSuppression): Promise<OptoutSuppression> {
+    await this.q(`INSERT INTO optout_suppressions(id, channel, address, org_id, data) VALUES($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING`, [x.id, x.channel, x.address, x.orgId, JSON.stringify(x)]);
+    return x;
+  }
+  async findActiveSuppression(channel: string, address: string, orgId?: ID): Promise<OptoutSuppression | undefined> {
+    const r = await this.q(
+      `SELECT data FROM optout_suppressions WHERE channel=$1 AND address=$2 AND (org_id IS NULL OR org_id=$3) AND data->>'removedAt' IS NULL LIMIT 1`, [channel, address, orgId ?? null]);
+    return r.rows[0]?.['data'] as OptoutSuppression | undefined;
+  }
+  async listOptoutSuppressions(orgId?: ID): Promise<OptoutSuppression[]> {
+    const r = orgId === undefined
+      ? await this.q(`SELECT data FROM optout_suppressions`, [])
+      : await this.q(`SELECT data FROM optout_suppressions WHERE org_id=$1 OR org_id IS NULL`, [orgId]);
+    return r.rows.map(row => row['data'] as OptoutSuppression);
+  }
+  async removeOptoutSuppression(id: ID, by: ID, reason: string, at: string): Promise<OptoutSuppression | undefined> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM optout_suppressions WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as OptoutSuppression | undefined;
+      if (!cur || cur.removedAt) return undefined;
+      const next = { ...cur, removedAt: at, removedBy: by, removeReason: reason };
+      await c.query(`UPDATE optout_suppressions SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+      return next;
+    });
+  }
+  async getIdempotencyRecord(orgId: ID, actorId: ID, route: string, clientMutationId: string): Promise<IdempotencyRecord | undefined> {
+    const r = await this.q(`SELECT data FROM idempotency_records WHERE org_id=$1 AND actor_id=$2 AND route=$3 AND client_mutation_id=$4`, [orgId, actorId, route, clientMutationId]);
+    return r.rows[0]?.['data'] as IdempotencyRecord | undefined;
+  }
+  async putIdempotencyRecord(rec: IdempotencyRecord): Promise<IdempotencyRecord> {
+    await this.q(`INSERT INTO idempotency_records(org_id, actor_id, route, client_mutation_id, data) VALUES($1,$2,$3,$4,$5) ON CONFLICT (org_id, actor_id, route, client_mutation_id) DO NOTHING`, [rec.orgId, rec.actorId, rec.route, rec.clientMutationId, JSON.stringify(rec)]);
+    return rec;
+  }
+
   async appendAudit(e: AuditLogEntry): Promise<void> {
     await this.q(`INSERT INTO audit_log(org_id, data) VALUES($1,$2)`, [e.orgId, JSON.stringify(e)]);
   }

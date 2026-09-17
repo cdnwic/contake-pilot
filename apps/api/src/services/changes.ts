@@ -57,6 +57,10 @@ function denialTarget(change: ProposedChange): { entityType: AuditEntityType; en
       return { entityType: 'dependency', entityId: change.dependencyId };
     case 'domino.apply':
       return { entityType: 'change_request', entityId: change.changeRequestId };
+    case 'task.advance':
+      return { entityType: 'advance_proposal', entityId: change.proposalId };
+    case 'report.correct':
+      return { entityType: 'report', entityId: change.reportId };
   }
 }
 
@@ -514,6 +518,26 @@ export async function applyNeutral(
       await audit(repo, { ...auditBase, entityType: 'resource', entityId: change.resourceId, before, after, ...(changeRequestId ? { changeRequestId } : {}), ...(deviceClass ? { deviceClass } : {}) });
       return [];
     }
+    case 'report.correct': {
+      // v1.21.2 §26.1א: CAS-guarded correction + stale-mark derived proposals, all
+      // inside the surrounding withAuditSafety transaction.
+      const before = await repo.getReport(change.reportId);
+      if (!before) throw new ApiError(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+      const corrected = await repo.correctReport(change.reportId, change.expectedReportVersion, {
+        actualFinishAt: change.actualFinishAt,
+        lastCorrection: { reason: change.reason, at: new Date().toISOString(), by: principal.userId },
+      });
+      if (corrected === 'conflict') throw new ApiError(409, 'VERSION_CONFLICT', 'גרסה לא עדכנית - נדרש רענון');
+      if (!corrected) throw new ApiError(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+      const staleIds = await repo.markProposalsStaleForReport(change.reportId);
+      await audit(repo, { ...auditBase, entityType: 'report', entityId: change.reportId, before, after: corrected,
+        ...(changeRequestId ? { changeRequestId } : {}), ...(deviceClass ? { deviceClass } : {}) });
+      for (const pid of staleIds) {
+        await audit(repo, { ...auditBase, entityType: 'advance_proposal', entityId: pid,
+          after: { stale: true, reason: 'source_report_corrected' }, ...(changeRequestId ? { changeRequestId } : {}) });
+      }
+      return [];
+    }
     case 'resource.delete': {
       const before = await repo.getResource(change.resourceId);
       const usedBy = snapshot.tasks.filter(t => t.assigneeResourceIds.includes(change.resourceId) && t.status !== 'cancelled');
@@ -592,6 +616,8 @@ const ACTION_OF_TYPE: Record<ProposedChange['type'], Action> = {
   'dependency.create': 'dependency.create', 'dependency.delete': 'dependency.delete',
   'constraint.lock': 'constraint.lock', 'constraint.unlock': 'constraint.unlock',
   'domino.apply': 'domino.apply',
+  'task.advance': 'task.advance',
+  'report.correct': 'report.correct',
 };
 
 export function actionOfChange(change: ProposedChange): Action {

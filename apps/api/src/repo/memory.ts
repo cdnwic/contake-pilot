@@ -1,7 +1,9 @@
 import type {
-  AuditLogEntry, ChangeRequest, DependencyEdge, EventNode, GraphSnapshot, ID,
-  NotificationJob, PushSubscription, ResourceNode, StatusReport, TaskNode,
+  AuditLogEntry, Branch, ChangeRequest, ContentAck, ContentItem, ContentItemVersion, DependencyEdge, EventNode,
+  ExternalParty, GraphSnapshot, ID, IdempotencyRecord, NotificationJob, OptoutSuppression, PushSubscription, ReportReadState,
+  ResourceNode, StatusReport, StatusToken, TaskNode, TaskResourceLink,
   WhitelistEntry, WhitelistStatus,
+  AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
 
@@ -20,6 +22,19 @@ export class MemoryGraphRepository implements GraphRepository {
   private pushSubscriptions = new Map<string, PushSubscription>(); // keyed by endpoint (v1.10)
   private whitelist = new Map<string, WhitelistEntry>(); // keyed by phone (v1.18)
   private auditLog: AuditLogEntry[] = [];
+  // v1.20 stores
+  private contentItems = new Map<ID, ContentItem>();
+  private taskContent = new Map<string, TaskResourceLink>(); // key taskId + ':' + contentId
+  private contentAcks = new Map<string, ContentAck>(); // keyed orgId + ':' + userId + ':' + clientAckId (v1.20.2 isolation)
+  private contentVersions = new Map<ID, ContentItemVersion>(); // keyed contentVersionId (v1.20.2, never deleted)
+  private optoutSuppressions = new Map<ID, OptoutSuppression>();
+  private advanceProposals = new Map<ID, AdvanceProposal>();
+  private advanceOutbox = new Map<ID, AdvanceOutbox>();
+  private idempotency = new Map<string, IdempotencyRecord>(); // key orgId|actorId|route|clientMutationId
+  private externalParties = new Map<ID, ExternalParty>();
+  private statusTokens = new Map<ID, StatusToken>();
+  private branches = new Map<ID, Branch>();
+  private reportReads = new Map<string, ReportReadState>(); // key reportId + ':' + userId
 
   static seeded(data: SeedData): MemoryGraphRepository {
     const repo = new MemoryGraphRepository();
@@ -52,6 +67,12 @@ export class MemoryGraphRepository implements GraphRepository {
 
   // whitelist onboarding (v1.18 §15)
   async upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry> { this.whitelist.set(e.phone, e); return e; }
+  async createWhitelistInvite(e: WhitelistEntry): Promise<{ outcome: 'created' | 'exists'; entry: WhitelistEntry }> {
+    const existing = this.whitelist.get(e.phone);
+    if (existing) return { outcome: 'exists', entry: existing };
+    this.whitelist.set(e.phone, e);
+    return { outcome: 'created', entry: e };
+  }
   async getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined> { return this.whitelist.get(phone); }
   /** QA round-7: per-phone promise-chain mutex. EVERY whitelist mutation
    *  (invite, register CAS, approve, reject) runs through it, so a mutation
@@ -128,6 +149,10 @@ export class MemoryGraphRepository implements GraphRepository {
       changeRequests: [...this.changeRequests], reports: [...this.reports],
       notificationJobs: [...this.notificationJobs], pushSubscriptions: [...this.pushSubscriptions], auditLog: this.auditLog,
       whitelist: [...this.whitelist],
+      contentItems: [...this.contentItems], taskContent: [...this.taskContent], contentAcks: [...this.contentAcks],
+      externalParties: [...this.externalParties], statusTokens: [...this.statusTokens],
+      branches: [...this.branches], reportReads: [...this.reportReads],
+      contentVersions: [...this.contentVersions], optoutSuppressions: [...this.optoutSuppressions], idempotency: [...this.idempotency], advanceProposals: [...this.advanceProposals], advanceOutbox: [...this.advanceOutbox],
     });
   }
   async commit(_cp: string): Promise<void> { /* in-memory: nothing to commit */ }
@@ -140,6 +165,18 @@ export class MemoryGraphRepository implements GraphRepository {
     this.notificationJobs = new Map(d['notificationJobs']!); this.auditLog = d['auditLog'] as never[] as typeof this.auditLog;
     this.pushSubscriptions = new Map((d['pushSubscriptions'] ?? []) as [string, PushSubscription][]);
     this.whitelist = new Map((d['whitelist'] ?? []) as [string, WhitelistEntry][]);
+    this.contentItems = new Map((d['contentItems'] ?? []) as [string, ContentItem][]);
+    this.taskContent = new Map((d['taskContent'] ?? []) as [string, TaskResourceLink][]);
+    this.contentAcks = new Map((d['contentAcks'] ?? []) as [string, ContentAck][]);
+    this.externalParties = new Map((d['externalParties'] ?? []) as [string, ExternalParty][]);
+    this.statusTokens = new Map((d['statusTokens'] ?? []) as [string, StatusToken][]);
+    this.branches = new Map((d['branches'] ?? []) as [string, Branch][]);
+    this.contentVersions = new Map((d['contentVersions'] ?? []) as [string, ContentItemVersion][]);
+    this.optoutSuppressions = new Map((d['optoutSuppressions'] ?? []) as [string, OptoutSuppression][]);
+    this.advanceProposals = new Map((d['advanceProposals'] ?? []) as [string, AdvanceProposal][]);
+    this.advanceOutbox = new Map((d['advanceOutbox'] ?? []) as [string, AdvanceOutbox][]);
+    this.idempotency = new Map((d['idempotency'] ?? []) as [string, IdempotencyRecord][]);
+    this.reportReads = new Map((d['reportReads'] ?? []) as [string, ReportReadState][]);
   }
 
   async createEvent(e: EventNode): Promise<EventNode> { this.events.set(e.id, e); return e; }
@@ -257,6 +294,52 @@ export class MemoryGraphRepository implements GraphRepository {
     return { report: next, applied: true };
   }
 
+  async correctReport(id: ID, expectedVersion: number, patch: { actualFinishAt: string; lastCorrection: { reason: string; at: string; by: ID } }): Promise<StatusReport | 'conflict' | undefined> {
+    // No awaits inside: check-and-set is atomic on the JS runloop.
+    const cur = this.reports.get(id);
+    if (!cur) return undefined;
+    if ((cur.version ?? 1) !== expectedVersion) return 'conflict';
+    const next: StatusReport = { ...cur, actualFinishAt: patch.actualFinishAt, version: (cur.version ?? 1) + 1, lastCorrection: patch.lastCorrection };
+    this.reports.set(id, next);
+    return next;
+  }
+
+  async createAdvanceProposal(p: AdvanceProposal): Promise<AdvanceProposal> { this.advanceProposals.set(p.proposalId, p); return p; }
+  async getAdvanceProposal(id: ID): Promise<AdvanceProposal | undefined> { return this.advanceProposals.get(id); }
+  async listAdvanceProposals(eventId: ID): Promise<AdvanceProposal[]> {
+    return [...this.advanceProposals.values()].filter(p => p.eventId === eventId);
+  }
+  async updateAdvanceProposal(id: ID, patch: Partial<Pick<AdvanceProposal, 'status'>>): Promise<AdvanceProposal | undefined> {
+    const cur = this.advanceProposals.get(id);
+    if (!cur) return undefined;
+    const next = { ...cur, ...patch, proposalId: cur.proposalId };
+    this.advanceProposals.set(id, next);
+    return next;
+  }
+  async findOpenAdvanceProposal(eventId: ID, anchorTaskId: ID, actualFinishAt: string, graphVersion: number): Promise<AdvanceProposal | undefined> {
+    return [...this.advanceProposals.values()].find(p =>
+      p.eventId === eventId && p.anchorTaskId === anchorTaskId && p.actualFinishAt === actualFinishAt &&
+      p.graphVersion === graphVersion && p.status === 'open');
+  }
+  async markProposalsStaleForReport(reportId: ID): Promise<ID[]> {
+    const stale: ID[] = [];
+    for (const p of this.advanceProposals.values()) {
+      if (p.sourceReportId === reportId && p.status === 'open') {
+        this.advanceProposals.set(p.proposalId, { ...p, status: 'stale' });
+        stale.push(p.proposalId);
+      }
+    }
+    return stale;
+  }
+  async createAdvanceOutbox(o: AdvanceOutbox): Promise<AdvanceOutbox> { this.advanceOutbox.set(o.id, o); return o; }
+  async listPendingAdvanceOutbox(): Promise<AdvanceOutbox[]> {
+    return [...this.advanceOutbox.values()].filter(o => o.status === 'pending');
+  }
+  async markAdvanceOutboxMaterialized(id: ID): Promise<void> {
+    const cur = this.advanceOutbox.get(id);
+    if (cur) this.advanceOutbox.set(id, { ...cur, status: 'materialized' });
+  }
+
   async createNotificationJob(j: NotificationJob): Promise<NotificationJob> { this.notificationJobs.set(j.id, j); return j; }
   async getNotificationJob(id: ID): Promise<NotificationJob | undefined> { return this.notificationJobs.get(id); }
   async updateNotificationJob(id: ID, patch: Partial<NotificationJob>): Promise<NotificationJob | undefined> {
@@ -308,6 +391,107 @@ export class MemoryGraphRepository implements GraphRepository {
   }
   async deletePushSubscriptionByEndpoint(endpoint: string): Promise<boolean> {
     return this.pushSubscriptions.delete(endpoint);
+  }
+
+  // ---- v1.20 §20 content surface ----
+  async createContentItem(c: ContentItem): Promise<ContentItem> { this.contentItems.set(c.id, c); return c; }
+  async getContentItem(id: ID): Promise<ContentItem | undefined> { return this.contentItems.get(id); }
+  async updateContentItem(id: ID, patch: Partial<ContentItem>): Promise<ContentItem | undefined> {
+    const cur = this.contentItems.get(id);
+    if (!cur) return undefined;
+    const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId };
+    this.contentItems.set(id, next);
+    return next;
+  }
+  async casUpdateContentItem(id: ID, expectedVersion: number, patch: Partial<ContentItem>): Promise<ContentItem | undefined | 'conflict'> {
+    const cur = this.contentItems.get(id);
+    if (!cur) return undefined;
+    if (cur.version !== expectedVersion) return 'conflict';
+    const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId, version: cur.version + 1 };
+    this.contentItems.set(id, next);
+    return next;
+  }
+  async deleteContentItem(id: ID): Promise<boolean> {
+    for (const k of [...this.taskContent.keys()]) if (k.endsWith(':' + id)) this.taskContent.delete(k);
+    return this.contentItems.delete(id);
+  }
+  async createContentVersion(v: ContentItemVersion): Promise<ContentItemVersion> { this.contentVersions.set(v.contentVersionId, v); return v; }
+  async listContentVersions(contentId: ID): Promise<ContentItemVersion[]> {
+    return [...this.contentVersions.values()].filter(v => v.contentId === contentId).sort((a, b) => a.version - b.version);
+  }
+  async getContentVersion(contentId: ID, contentVersionId: ID): Promise<ContentItemVersion | undefined> {
+    const v = this.contentVersions.get(contentVersionId);
+    return v && v.contentId === contentId ? v : undefined;
+  }
+  async listContentItems(orgId: ID): Promise<ContentItem[]> { return [...this.contentItems.values()].filter(c => c.orgId === orgId); }
+  async attachTaskContent(l: TaskResourceLink): Promise<TaskResourceLink> { this.taskContent.set(l.taskId + ':' + l.contentId, l); return l; }
+  async detachTaskContent(taskId: ID, contentId: ID): Promise<boolean> { return this.taskContent.delete(taskId + ':' + contentId); }
+  async listTaskContent(taskId: ID): Promise<TaskResourceLink[]> { return [...this.taskContent.values()].filter(l => l.taskId === taskId); }
+  async createContentAck(a: ContentAck & { orgId: ID }): Promise<ContentAck> { this.contentAcks.set(a.orgId + ':' + a.userId + ':' + a.clientAckId, a); return a; }
+  async getContentAck(orgId: ID, userId: ID, clientAckId: string): Promise<ContentAck | undefined> { return this.contentAcks.get(orgId + ':' + userId + ':' + clientAckId); }
+
+  // ---- v1.20 §22 stakeholders ----
+  async createExternalParty(p: ExternalParty): Promise<ExternalParty> { this.externalParties.set(p.id, p); return p; }
+  async getExternalParty(id: ID): Promise<ExternalParty | undefined> { return this.externalParties.get(id); }
+  async updateExternalParty(id: ID, patch: Partial<ExternalParty>): Promise<ExternalParty | undefined> {
+    const cur = this.externalParties.get(id);
+    if (!cur) return undefined;
+    const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId, version: cur.version + 1 };
+    this.externalParties.set(id, next);
+    return next;
+  }
+  async deleteExternalParty(id: ID): Promise<boolean> { return this.externalParties.delete(id); }
+  async listExternalParties(orgId: ID): Promise<ExternalParty[]> { return [...this.externalParties.values()].filter(p => p.orgId === orgId); }
+  async createStatusToken(t: StatusToken): Promise<StatusToken> { this.statusTokens.set(t.id, t); return t; }
+  async getStatusToken(id: ID): Promise<StatusToken | undefined> { return this.statusTokens.get(id); }
+  async getStatusTokenByHash(tokenHash: string): Promise<StatusToken | undefined> { return [...this.statusTokens.values()].find(t => t.tokenHash === tokenHash); }
+  async findExternalPartyByContactRef(value: string): Promise<ExternalParty | undefined> { return [...this.externalParties.values()].find(p => p.contactRefs.some(c => c.value === value)); }
+  async updateStatusToken(id: ID, patch: Partial<StatusToken>): Promise<StatusToken | undefined> {
+    const cur = this.statusTokens.get(id);
+    if (!cur) return undefined;
+    const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId };
+    this.statusTokens.set(id, next);
+    return next;
+  }
+
+  // ---- v1.20 §23 branches ----
+  async createBranch(b: Branch): Promise<Branch> { this.branches.set(b.id, b); return b; }
+  async getBranch(id: ID): Promise<Branch | undefined> { return this.branches.get(id); }
+  async updateBranch(id: ID, patch: Partial<Branch>): Promise<Branch | undefined> {
+    const cur = this.branches.get(id);
+    if (!cur) return undefined;
+    const next = { ...cur, ...patch, id: cur.id, orgId: cur.orgId, version: cur.version + 1 };
+    this.branches.set(id, next);
+    return next;
+  }
+  async listBranches(orgId: ID): Promise<Branch[]> { return [...this.branches.values()].filter(b => b.orgId === orgId); }
+
+  // ---- v1.20 §24 report read state ----
+  async markReportRead(s: ReportReadState): Promise<ReportReadState> { this.reportReads.set(s.reportId + ':' + s.userId, s); return s; }
+  async getReportReadState(reportId: ID, userId: ID): Promise<ReportReadState | undefined> { return this.reportReads.get(reportId + ':' + userId); }
+  async listReportReadStates(userId: ID): Promise<ReportReadState[]> { return [...this.reportReads.values()].filter(s => s.userId === userId); }
+
+  // ---- v1.20.2 opt-out suppressions + idempotency records ----
+  async createOptoutSuppression(x: OptoutSuppression): Promise<OptoutSuppression> { this.optoutSuppressions.set(x.id, x); return x; }
+  async findActiveSuppression(channel: string, address: string, orgId?: ID): Promise<OptoutSuppression | undefined> {
+    return [...this.optoutSuppressions.values()].find(x => !x.removedAt && x.channel === channel && x.address === address && (x.orgId === null || (orgId !== undefined && x.orgId === orgId)));
+  }
+  async listOptoutSuppressions(orgId?: ID): Promise<OptoutSuppression[]> {
+    return [...this.optoutSuppressions.values()].filter(x => orgId === undefined || x.orgId === orgId || x.orgId === null);
+  }
+  async removeOptoutSuppression(id: ID, by: ID, reason: string, at: string): Promise<OptoutSuppression | undefined> {
+    const cur = this.optoutSuppressions.get(id);
+    if (!cur || cur.removedAt) return undefined;
+    const next = { ...cur, removedAt: at, removedBy: by, removeReason: reason };
+    this.optoutSuppressions.set(id, next);
+    return next;
+  }
+  async getIdempotencyRecord(orgId: ID, actorId: ID, route: string, clientMutationId: string): Promise<IdempotencyRecord | undefined> {
+    return this.idempotency.get([orgId, actorId, route, clientMutationId].join('|'));
+  }
+  async putIdempotencyRecord(r: IdempotencyRecord): Promise<IdempotencyRecord> {
+    this.idempotency.set([r.orgId, r.actorId, r.route, r.clientMutationId].join('|'), r);
+    return r;
   }
 
   async appendAudit(e: AuditLogEntry): Promise<void> { this.auditLog.push(e); }

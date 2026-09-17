@@ -1,5 +1,5 @@
 /** contracts v1.12: POST /v1/reports/:id/resolve, GET /v1/users, contactPhone visibility. */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AuthService } from '../src/auth.js';
@@ -16,6 +16,10 @@ beforeEach(async () => {
   app = buildApp(repo, auth);
   await app.ready();
 });
+// Whitelist-PG gate lifecycle: release the app's resources per test (the PG
+// lane reuses one file-scoped DB; a closed app cannot fire late work across
+// the next test's reset).
+afterEach(async () => { await app.close(); });
 const login = async (e: string, p: string) => (await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: e, password: p } })).json().token as string;
 const H = (t: string) => ({ authorization: `Bearer ${t}` });
 

@@ -133,6 +133,7 @@ export interface EventNode {
   orgId: ID;
   domainProfileId: ID;        // e.g. 'camp', 'film-shoot', 'conference'
   name: string;
+  branchId?: ID;              // v1.20 §23: additive, nullable; event without branch stays valid
   date: string;               // ISO date, event-local wall time
   timezone: string;           // IANA, e.g. 'Asia/Jerusalem' — the rendering + working-window timezone
   siteIds: ID[];
@@ -221,6 +222,11 @@ export interface DomainProfile {
     workingWindow?: { startHHMM: string; endHHMM: string };
     externalStakeholderLabel?: string;
     quietHours?: { startHHMM: string; endHHMM: string };  // default 22:00-07:00
+    /** v1.21.2 §26.2: below this many minutes of safe gain a candidate verdict is
+     *  'unchanged'. Default 5. */
+    minAdvanceMin?: number;
+    /** v1.21.2 §26.3: advance-proposal validity window in minutes. Default 30. */
+    proposalTtlMin?: number;
   };
   /** Hebrew RTL. Allowlisted {{params}} only — no free interpolation. */
   notificationTemplates: Record<NotificationKind | 'digest_multi_change', string>;
@@ -231,6 +237,8 @@ export interface DomainProfile {
 // ============================================================
 
 export type Role = 'admin' | 'field_manager' | 'focus_worker';
+/** v2.1 #12: machine principal for webhook-originated writes only. Every user route rejects it. */
+export type ActorRole = Role | 'system';
 
 /** Impact classes: approval requirement derives from impact, not role alone. */
 export type ImpactClass = 'S0' | 'S1' | 'S2' | 'S3';
@@ -248,7 +256,15 @@ export type Action =
   | 'notify.send.targeted'
   | 'notify.ack'               // v1.8 — audit completeness for the ack endpoint
   | 'push.subscribe' | 'push.unsubscribe' // v1.10 — push self-service audit (no matrix rows, v1.8 precedent)
-  | 'whitelist.invite' | 'whitelist.list' | 'whitelist.approve' | 'whitelist.reject'; // v1.18 - matrix v1.4 rows, admin-only
+  | 'whitelist.invite' | 'whitelist.list' | 'whitelist.approve' | 'whitelist.reject' // v1.18 - matrix v1.4 rows, admin-only
+  // v1.20 (matrix v1.5, additive, 27 -> 45 actions):
+  | 'content.create' | 'content.update' | 'content.delete' | 'content.attach' | 'content.read' | 'content.ack'
+  | 'report.list' | 'report.mark_read'
+  | 'stakeholder.create' | 'stakeholder.update' | 'stakeholder.delete' | 'stakeholder.link' | 'stakeholder.read'
+  | 'branch.create' | 'branch.update' | 'branch.archive' | 'branch.read'
+  | 'org.matrix.read'
+  | 'channel.optout'          // v1.20.2: machine-principal-only (system-inbound); user roles deny (matrix v1.6)
+  | 'task.advance' | 'report.correct'; // v1.21.2 §26
 
 export interface Scope { eventId: ID; siteId?: ID; }
 
@@ -279,7 +295,11 @@ export type ProposedChange =
   | { type: 'dependency.delete'; dependencyId: ID }
   | { type: 'constraint.lock'; taskId: ID }
   | { type: 'constraint.unlock'; taskId: ID }
-  | { type: 'domino.apply'; changeRequestId: ID };
+  | { type: 'domino.apply'; changeRequestId: ID }
+  /** v1.21.2 §26.3: approve an early-finish advance proposal through the CR flow. */
+  | { type: 'task.advance'; proposalId: ID; graphVersion: number }
+  /** v1.21.2 §26.1א: correct a report's actualFinishAt (CAS on expectedReportVersion). */
+  | { type: 'report.correct'; reportId: ID; actualFinishAt: ISODateTime; expectedReportVersion: number; reason: string; allowBeforeStart?: boolean };
 
 export interface Conflict {
   code: 'LOCK_VIOLATION' | 'DEPENDENCY_VIOLATION' | 'DOUBLE_BOOKING' | 'WINDOW_VIOLATION' | 'MAX_SHIFT_EXCEEDED';
@@ -376,6 +396,13 @@ export interface StatusReport {
   resolvedBy?: ID;
   resolvedAt?: ISODateTime;
   resolutionNoteHe?: string;
+  /** v1.21.2 §26.1: actual field finish time (ISO offset-bearing). Correctable ONLY
+   *  via POST /v1/reports/:id/correct (§26.1א) - never patched directly. */
+  actualFinishAt?: ISODateTime;
+  /** v1.21.2 §26.1א: optimistic-concurrency counter for report.correct. */
+  version?: number;
+  /** v1.21.2 §26.1א: most recent correction reason, stored on the record. */
+  lastCorrection?: { reason: string; at: ISODateTime; by: ID };
 }
 /** Apply authority for delay reports (QA C2, matrix reportApplyRule):
  *  own-task delay, computed impact S0, task unlocked => auto-apply.
@@ -386,7 +413,8 @@ export interface StatusReport {
 // 7. NOTIFICATIONS — targeted stakeholder sync
 // ============================================================
 
-export type NotificationKind = 'task_delayed' | 'task_moved' | 'task_cancelled' | 'change_needs_approval' | 'task_assigned' | 'task_unassigned';
+export type NotificationKind = 'task_delayed' | 'task_moved' | 'task_cancelled' | 'change_needs_approval' | 'task_assigned' | 'task_unassigned'
+  | 'report_blocked'; // v1.20 (matrix v1.5): manager-surface job when a field report lands status='blocked'; no push
 export type NotifyChannel = 'whatsapp' | 'sms' | 'in_app' | 'web_push'; // v1.10: dispatch-time delivery path over in_app targeting
 
 export interface NotificationTarget {
@@ -432,19 +460,75 @@ export interface PushSubscription {
 }
 
 // ============================================================
+// 7.4 BIDIRECTIONAL DOMINO — early-finish advancement (v1.21.2 §26, additive)
+// ============================================================
+
+/** Privacy-safe blocker detail: NEVER contactPhone/PII (same leak class as the
+ *  resource contactPhone rule). */
+export interface AdvanceBlocker {
+  kind: 'person' | 'equipment' | 'location' | 'content' | 'lock' | 'dependency' | 'policy';
+  detail: string;
+}
+
+export interface AdvanceCandidate {
+  taskId: ID;
+  verdict: 'advanceable' | 'blocked' | 'unchanged';
+  proposedStart?: ISODateTime;
+  proposedEnd?: ISODateTime;
+  blockers?: AdvanceBlocker[];
+  /** minutes of safe gain (0 for blocked/unchanged) */
+  freedMin: number;
+}
+
+/** §26.2: deterministic output of an advance compute. Same input (graph version +
+ *  actualFinishAt) => same proposal content, always. Pinned to graphVersion; any
+ *  conflicting mutation before approval marks it stale; TTL expiry marks expired. */
+export interface AdvanceProposal {
+  proposalId: ID;
+  orgId: ID;
+  eventId: ID;
+  graphVersion: number;
+  anchorTaskId: ID;
+  actualFinishAt: ISODateTime;
+  /** §26.1א: the report this proposal was derived from; a correction to it
+   *  stale-marks every open proposal pointing here. */
+  sourceReportId?: ID;
+  candidates: AdvanceCandidate[];
+  status: 'open' | 'stale' | 'expired' | 'approved' | 'rejected' | 'applied';
+  createdAt: ISODateTime;
+  expiresAt: ISODateTime;
+}
+
+/** §26.3 BD-07: durable notification plan, written in the SAME transactional commit
+ *  as the schedule shift. The dispatcher materializes outbox -> delivery records
+ *  idempotently after the commit (key: proposalId+recipient+channel). */
+export interface AdvanceOutbox {
+  id: ID;
+  proposalId: ID;
+  orgId: ID;
+  eventId: ID;
+  payload: string;            // serialized notification plan
+  status: 'pending' | 'materialized';
+  createdAt: ISODateTime;
+}
+
+// ============================================================
 // 7.5 AUDIT LOG — append-only, every mutation (QA §9)
 // ============================================================
 
 export type AuditEntityType = NodeKind | 'user' | 'change_request' | 'notification' | 'dependency' | 'whitelist_entry' /* v1.18 */
   | 'push_subscription'        // v1.10
-  | 'report';                  // v1.12 (report.resolve audits under its precise entity)
+  | 'report'                  // v1.12 (report.resolve audits under its precise entity)
+  | 'content_item' | 'external_party' | 'status_token' | 'branch' // v1.20
+  | 'subscriber_channel' | 'optout_suppression' // v1.20.2 (STOP taxonomy)
+  | 'advance_proposal' | 'advance_outbox'; // v1.21.2 §26
 
 export interface AuditLogEntry {
   id: ID;
   orgId: ID;
   eventId: ID;
   actorUserId: ID;
-  role: Role;
+  role: ActorRole;
   action: Action;
   entityType: AuditEntityType;
   entityId: ID;
@@ -875,3 +959,165 @@ export interface WhitelistRejectRequest { reasonHe?: string; }
 export interface WhitelistCheckRequest { phone: string; }
 export interface WhitelistCheckResponse { status: WhitelistStatus | 'unknown'; }
 export interface WhitelistRegisterRequest { phone: string; displayName: string; requestedRole: Role; }
+
+// ============================================================
+// 14. v1.20 — BUILDER CONTENT SURFACE / STAKEHOLDERS / BRANCHES (additive-only)
+//     Source: contake-contracts-v1.20.md (TL-approved for dev branches, 2026-09-17).
+//     Coexistence: no existing route/field/enum changes; ResourceKind untouched;
+//     Day maps to Event-per-day; new write routes carry clientMutationId in body
+//     with server-side dedupe (same pattern as clientReportId on POST /v1/reports).
+// ============================================================
+
+/** §20 content kinds. 'file' is BLOCKED at Alpha: file = external URL only and
+ *  the file kind is never exposed in the Builder; no placeholders. */
+export type ContentKind = 'text' | 'link' | 'checklist' | 'equipment' | 'form';
+
+export interface ContentItem {
+  id: ID;
+  orgId: ID;
+  kind: ContentKind;
+  title: string;
+  body?: string;
+  url?: string;               // link + external-URL file reference
+  checklistItems?: { id: ID; text: string; done: boolean }[];
+  meta?: Record<string, unknown>;
+  createdBy: ID;
+  createdAt: ISODateTime;
+  version: number;            // content edit after publish = version++ (Focus always sees latest in open window)
+  // v1.20.2: delete = tombstone only (admin). Links + versions stay retrievable historically.
+  deletedAt?: ISODateTime;
+  deletedBy?: ID;
+}
+
+/** v1.20.2: every content version is an immutable row with its own id; the head
+ *  pointer advances by CAS on (contentId, expectedVersion). Versions are never
+ *  deleted (preservation directive). */
+export interface ContentItemVersion {
+  contentVersionId: ID;
+  contentId: ID;
+  version: number;
+  title: string;
+  body?: string;
+  url?: string;
+  checklistItems?: { id: ID; text: string; done: boolean }[];
+  meta?: Record<string, unknown>;
+  createdBy: ID;
+  createdAt: ISODateTime;
+}
+
+/** §20 task<->content link (Appendix A: role 'media' merged into 'link';
+ *  visibleFrom represented as server-computed visibleFromOffsetMin). */
+export type TaskContentRole = 'instructions' | 'script' | 'checklist' | 'equipment' | 'form';
+export interface TaskResourceLink {
+  taskId: ID;
+  contentId: ID;
+  role: TaskContentRole;
+  visibleFromOffsetMin: number;
+  visibleUntil?: ISODateTime;
+  ackRequired?: boolean;
+  /** v1.21.2 §26.2: only a link with advanceRequired=true can block an early-finish
+   *  advancement when its visibility window cannot hold in the advanced window.
+   *  Default false - simple tasks are never content-blocked (progressive disclosure).
+   *  Separate from ackRequired (a worker commitment, not a schedule condition). */
+  advanceRequired?: boolean;
+}
+
+/** §20 offline ack, deduped by clientAckId (same pattern as clientReportId). */
+export interface ContentAck {
+  clientAckId: string;
+  contentId: ID;
+  taskId: ID;
+  userId: ID;
+  at: ISODateTime;
+}
+
+/** §22 external stakeholder. contactRefs privacy class = same as contactPhone:
+ *  admin/field_manager only; never in realtime frames or focus_worker payloads. */
+export type ExternalPartyKind = 'guardian' | 'supplier' | 'client';
+export type ConsentStatus = 'pending' | 'granted' | 'revoked';
+export interface ContactRef {
+  channel: 'in_app' | 'whatsapp' | 'sms';
+  value: string;
+  transport: 'deferred';      // v1.20: external channels deferred; delivery records status='not_sent_transport_deferred'
+}
+export interface StakeholderLink {
+  entity: 'event' | 'task' | 'resource';
+  entityId: ID;
+  relation: string;
+}
+export interface ExternalParty {
+  id: ID;
+  orgId: ID;
+  kind: ExternalPartyKind;
+  displayName: string;
+  contactRefs: ContactRef[];
+  links: StakeholderLink[];
+  consent: { status: ConsentStatus; at: ISODateTime };
+  createdAt: ISODateTime;
+  version: number;
+}
+
+/** §22 G6 guardian public status token (read-only guest surface, revocable). */
+export interface StatusToken {
+  id: ID;
+  orgId: ID;
+  externalPartyId: ID;
+  /** v1.20.2: HMAC-SHA256(token, pepper) only. Plaintext is never persisted;
+   *  it is returned exactly once at creation. Lookup = compute HMAC, compare
+   *  against this indexed column. */
+  tokenHash: string;
+  expiresAt: ISODateTime;     // default 72h from creation
+  createdBy: ID;
+  createdAt: ISODateTime;
+  revokedAt?: ISODateTime;
+}
+
+/** v1.20.2 §25.1ב: durable opt-out suppression. Created only by the machine
+ *  principal (system-inbound) via channel.optout. orgId NULL marks the
+ *  deterministic ambiguous/multi-tenant rule: the (channel, address) pair is
+ *  suppressed across every tenant (regulatorily safe over-block, v2.1 #6).
+ *  The full address lives ONLY here (extended audit carries sha256(addr)[:12]+last4). */
+export interface OptoutSuppression {
+  id: ID;
+  channel: string;            // e.g. whatsapp | sms | in_app
+  address: string;            // normalized full address - admin/system access only
+  addressMasked: string;      // sha256(address)[:12] + last 4 digits
+  orgId: ID | null;           // null = global-ambiguous
+  createdAt: ISODateTime;
+  correlation: { from: string; channel: string; receivingAccount?: string; receivedAt: ISODateTime; bodyHash: string; providerEventId?: string };
+  removedAt?: ISODateTime;    // org-admin unsuppress of an org-scoped row only (reason + audit mandatory)
+  removedBy?: ID;
+  removeReason?: string;
+}
+
+/** v1.20.2 §26.3א: per-route dedupe record. Written in the SAME transaction as
+ *  the business write + audit; PG enforces UNIQUE on the key. Replay returns
+ *  the stored response verbatim with Idempotency-Replayed:true. */
+export interface IdempotencyRecord {
+  orgId: ID;
+  actorId: ID;
+  route: string;              // e.g. content.create
+  clientMutationId: string;
+  requestHash: string;        // sha256 of the normalized request body
+  statusCode: number;
+  responseBody: string;       // exact serialized response
+  createdAt: ISODateTime;
+}
+
+/** §23 org-level branch. Coexists with event-level siteIds; no domino impact. */
+export interface Branch {
+  id: ID;
+  orgId: ID;
+  name: string;
+  location?: string;
+  active: boolean;
+  createdAt: ISODateTime;
+  version: number;
+}
+
+/** §24 per-manager report read state. */
+export interface ReportReadState {
+  reportId: ID;
+  userId: ID;
+  readAt: ISODateTime;
+}

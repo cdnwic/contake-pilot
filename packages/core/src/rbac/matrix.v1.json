@@ -1,6 +1,6 @@
 {
-  "version": "1.4",
-  "date": "2026-09-14",
+  "version": "1.6",
+  "date": "2026-09-17",
   "normativeSource": "contake_rbac_spec.md (delivered to product owner 2026-09-11)",
   "roles": [
     "admin",
@@ -148,6 +148,111 @@
     "whitelist.reject": {
       "admin": "allow",
       "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "content.create": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "content.update": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "content.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "content.attach": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "content.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "scope"
+    },
+    "content.ack": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "scope"
+    },
+    "report.list": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "report.mark_read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "stakeholder.create": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "stakeholder.update": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "stakeholder.delete": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "stakeholder.link": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "stakeholder.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "branch.create": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "branch.update": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "branch.archive": {
+      "admin": "allow",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "branch.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "org.matrix.read": {
+      "admin": "allow",
+      "field_manager": "scope",
+      "focus_worker": "deny"
+    },
+    "channel.optout": {
+      "admin": "deny",
+      "field_manager": "deny",
+      "focus_worker": "deny"
+    },
+    "task.advance": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "report.correct": {
+      "admin": "allow",
+      "field_manager": "propose",
       "focus_worker": "deny"
     }
   },

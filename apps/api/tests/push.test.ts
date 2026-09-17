@@ -1,5 +1,5 @@
 /** Web push (contracts v1.10, web-push-spec §8): AC-PUSH-1/2/3/5/7/8 backend probes. */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { NotificationJob, PushSubscription } from '@contake/core';
 import { buildApp } from '../src/app.js';
@@ -16,6 +16,8 @@ beforeEach(async () => {
   app = buildApp(repo, new AuthService(repo));
   await app.ready();
 });
+// Whitelist-PG gate lifecycle: release the app's resources per test.
+afterEach(async () => { await app.close(); });
 const login = async (e: string, p: string) => (await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: e, password: p } })).json().token as string;
 const H = (t: string) => ({ authorization: `Bearer ${t}` });
 const subBody = (endpoint: string) => ({ endpoint, keys: { p256dh: 'k'.repeat(88), auth: 'a'.repeat(24) } });
