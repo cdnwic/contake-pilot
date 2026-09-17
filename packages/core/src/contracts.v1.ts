@@ -264,7 +264,10 @@ export type Action =
   | 'branch.create' | 'branch.update' | 'branch.archive' | 'branch.read'
   | 'org.matrix.read'
   | 'channel.optout'          // v1.20.2: machine-principal-only (system-inbound); user roles deny (matrix v1.6)
-  | 'task.advance' | 'report.correct'; // v1.21.2 §26
+  | 'task.advance' | 'report.correct' // v1.21.2 §26
+  // v1.20.2-superadmin (additive): audited super-admin test impersonation.
+  // Server-authorized only; every switch writes one of these to audit_log.
+  | 'identity.impersonate.start' | 'identity.impersonate.stop';
 
 export interface Scope { eventId: ID; siteId?: ID; }
 

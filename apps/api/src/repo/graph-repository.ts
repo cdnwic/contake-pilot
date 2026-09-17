@@ -15,6 +15,13 @@ export interface UserRecord extends Principal {
   /** Dev-grade password hash (scrypt). OTP codes are kept separately. */
   passwordHash?: string;
   active: boolean;
+  /** Server-authorized Super Admin (pilot owner). Set ONLY by the backend
+   *  super-admin enrollment path (phone allowlist); re-read from the repo on
+   *  every authenticated request - never derivable from frontend state. */
+  isSuperAdmin?: boolean;
+  /** Set on synthetic sandbox identities minted by super-admin test
+   *  impersonation: the impersonator's userId. Regular users never have it. */
+  impersonationOf?: ID;
 }
 
 export interface ChannelRecord {
