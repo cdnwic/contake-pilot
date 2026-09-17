@@ -9,6 +9,14 @@ import { ApprovalsView } from './views/Approvals';
 import { IncidentsView } from './views/Incidents';
 import { SyncView } from './views/Sync';
 import { NotifyBell, NotifyPanel } from './views/NotifyCenter';
+import './alpha.css';
+import {
+  selectIdentityApi, showSwitcher, showImpersonationBadge,
+  beginImpersonationSession, endImpersonationSession, currentImpersonation,
+  type WhoAmI, type ImpersonationAside,
+} from './api/identity';
+import { isLiveMode, loadSession } from './api/session';
+import type { Role } from './contracts/contake-core-contracts.v1.1';
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } } });
 
@@ -28,6 +36,35 @@ function Shell() {
   const clock = useClock();
 
   useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
+
+  // Super Admin profile switching (backend 5f39b4d3, wip/super-admin-profile-switch).
+  // Server authority only: whoami markers drive every gate; no client-side role inference.
+  const [whoami, setWhoami] = useState<WhoAmI | null>(null);
+  const [imp, setImp] = useState<ImpersonationAside | null>(() => currentImpersonation());
+  const [saRole, setSaRole] = useState<Role>('field_manager');
+  const [saProfile, setSaProfile] = useState<string>(profileId);
+  const refreshWhoami = () => selectIdentityApi().whoami().then(setWhoami).catch(() => setWhoami(null));
+  useEffect(() => { refreshWhoami(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const startSwitch = async () => {
+    const start = await selectIdentityApi().startImpersonation(saRole, saProfile);
+    if (isLiveMode()) {
+      const real = loadSession();
+      if (real) setImp(beginImpersonationSession(real, start));
+    } else {
+      // mock harness: record the marked session aside and reflect the sandbox role/profile in the demo view
+      setImp({ real: { token: 'mock', principal: { userId: 'u-chaim' } as never }, sandbox: { token: start.token, principal: start.principal }, marked: true, role: saRole, domainProfileId: saProfile });
+      setRole(saRole); setProfile(saProfile);
+    }
+    await refreshWhoami();
+  };
+  const returnToReal = async () => {
+    await selectIdentityApi().stopImpersonation().catch(() => undefined);
+    endImpersonationSession();
+    setImp(null);
+    await refreshWhoami();
+  };
+  const badgeActive = imp !== null || showImpersonationBadge(whoami);
+  const ROLE_HE: Record<string, string> = { admin: 'מנהל-על', field_manager: 'מנהל שטח', focus_worker: 'עובד שטח' };
   useEffect(() => { document.documentElement.dataset.vertical = profileId; }, [profileId]);
   useEffect(() => {
     if (!toast) return;
@@ -84,6 +121,12 @@ function Shell() {
           </button>
         ))}
       </nav>
+      {badgeActive && (
+        <div className="impersonation-banner" role="status" aria-live="polite">
+          <b>התחזות בדיקה</b> — {ROLE_HE[(imp?.role ?? whoami?.principal?.role) ?? ''] ?? ''} · פרופיל {imp?.domainProfileId ?? ''} · סביבת ארגז חול בלבד
+          <button className="btn ghost" onClick={returnToReal} aria-label="חזרה לזהות האמיתית">חזרה לזהות האמיתית</button>
+        </div>
+      )}
       <div className="session-bar">
         <label>פרופיל
           <select value={profileId} onChange={(e) => setProfile(e.target.value)} aria-label="בחירת פרופיל תחום">
@@ -97,6 +140,19 @@ function Shell() {
             <option value="focus_worker">עובד שטח</option>
           </select>
         </label>
+        {showSwitcher(whoami) && (
+          <label>החלפת פרופיל (בדיקה)
+            <select value={saRole} onChange={(e) => setSaRole(e.target.value as Role)} aria-label="תפקיד להתחזות בדיקה">
+              <option value="admin">מנהל-על</option>
+              <option value="field_manager">מנהל שטח</option>
+              <option value="focus_worker">עובד שטח</option>
+            </select>
+            <select value={saProfile} onChange={(e) => setSaProfile(e.target.value)} aria-label="פרופיל להתחזות בדיקה">
+              {profiles.map((p) => <option key={p.id} value={p.id}>{p.displayNameHe}</option>)}
+            </select>
+            <button className="btn ghost" onClick={startSwitch} aria-label="מעבר להתחזות בדיקה">מעבר</button>
+          </label>
+        )}
         <span className="spacer" />
         <button className="btn ghost" onClick={() => setTheme(theme === 'day' ? 'night' : 'day')} aria-label={`מעבר למצב ${theme === 'day' ? 'לילה' : 'יום'}`} aria-pressed={theme === 'night'}>
           {theme === 'day' ? 'מצב לילה' : 'מצב יום'}

@@ -205,3 +205,22 @@ Tracking items: (a) full OFL license-text packaging before distribution — DONE
 (OFL-Heebo.txt, OFL-IBMPlexMono.txt); (b) localhost-only dev/test tooling enforcement — DONE in this
 commit (dev/preview scripts pinned --host 127.0.0.1, SECURITY-DISPOSITION updated).
 This commit is docs+license+hardening only; the QA-passed code tree remains 4e4c93c8/a74f86cc.
+
+## 2026-09-17 13:54 — Super Admin profile switching (FE counterpart, parent 13:50:49)
+Backend contract: commit 5f39b4d3838cd6d557b01da211c1e480b2dfa2eb (wip/super-admin-profile-switch).
+- src/api/identity.ts (authored-new): WhoAmI/ImpersonationStart contract types; http transport
+  (GET /v1/whoami, POST /v1/admin/impersonations[/stop], bearer from session); MockIdentityApi mirroring
+  backend semantics (403 matrix_deny for non-super, marked sandbox mint + audit, per-request active
+  re-read token kill, 404 on non-impersonation stop); pure gating fns showSwitcher/showImpersonationBadge;
+  session-aside helpers (real token kept aside, sandbox token installed, stop+restore on return).
+- src/api/identity.test.ts (authored-new, 7 tests, jsdom): whoami truth, non-super deny shape, marked
+  sandbox + badge gating + audit, immediate token kill, super-admin targeted stop + real-user refusal,
+  session-aside swap/restore, http transport paths/headers/body.
+- src/App.tsx (REWRITE): whoami on mount; role/profile picker rendered ONLY when showSwitcher(whoami);
+  impersonation banner (RTL, Hebrew role labels) whenever aside or whoami markers set; return-to-real
+  via stop + real-token restore. src/alpha.css (authored-new) holds banner styles — RC-capture styles.css
+  NOT touched (sha 80d131f1… matches manifest).
+- Visual verification (sa-shots.mjs, qa/parity/sa-*.png): picker visible for super admin; banner with
+  Hebrew role + sandbox marking after switch; banner gone and picker restored after return.
+GATES: tsc EXIT 0; vitest 36/36 (6 files); build EXIT 0; console smoke clean x3; asset smoke PASS.
+No staging/prod contact; live http transport is unexercised against a real server (mock + fake-fetch only).

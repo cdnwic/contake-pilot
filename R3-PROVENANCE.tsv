@@ -86,3 +86,8 @@ public/fonts/	authored-new	QA correction 3: 8 OFL-licensed woff2 (Heebo v28, IBM
 smoke-assets.mjs	authored-new	QA correction 3b: asset status/MIME/body/wOF2-magic smoke — PASS
 SECURITY-DISPOSITION.md	authored-new	QA correction 4: devDep-only audit disposition; vite/vitest never exposed at runtime
 preserved-candidates/MANIFEST.sha256	authored-new	QA correction 5: 14-entry manifest, hash bound into R3-DIVERGENCE-LEDGER.md
+src/api/identity.ts	authored-new	Super Admin FE counterpart of backend 5f39b4d3: whoami truth, impersonation start/stop, session-aside; server authority only
+src/api/identity.test.ts	authored-new	7 hermetic tests for the identity contract + gating + transports
+src/App.tsx	REWRITE	Super Admin switcher picker + test-impersonation banner + return-to-real, gated on whoami markers
+src/alpha.css	authored-new	banner styles; keeps RC-capture styles.css untouched
+sa-shots.mjs	authored-new	visual-verification harness for switcher states (qa/parity/sa-*.png)
