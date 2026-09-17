@@ -89,6 +89,8 @@ export function computeDomino(
     case 'constraint.lock':
     case 'constraint.unlock':
     case 'domino.apply':
+    case 'task.advance': // v1.21.2 §26: applied via its own atomic route, not the delay engine
+    case 'report.correct': // v1.21.2 §26.1א: report record update, no schedule effect here
       return zeroResult();
     default:
       break;

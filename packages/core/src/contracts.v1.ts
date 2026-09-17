@@ -222,6 +222,11 @@ export interface DomainProfile {
     workingWindow?: { startHHMM: string; endHHMM: string };
     externalStakeholderLabel?: string;
     quietHours?: { startHHMM: string; endHHMM: string };  // default 22:00-07:00
+    /** v1.21.2 §26.2: below this many minutes of safe gain a candidate verdict is
+     *  'unchanged'. Default 5. */
+    minAdvanceMin?: number;
+    /** v1.21.2 §26.3: advance-proposal validity window in minutes. Default 30. */
+    proposalTtlMin?: number;
   };
   /** Hebrew RTL. Allowlisted {{params}} only — no free interpolation. */
   notificationTemplates: Record<NotificationKind | 'digest_multi_change', string>;
@@ -290,7 +295,11 @@ export type ProposedChange =
   | { type: 'dependency.delete'; dependencyId: ID }
   | { type: 'constraint.lock'; taskId: ID }
   | { type: 'constraint.unlock'; taskId: ID }
-  | { type: 'domino.apply'; changeRequestId: ID };
+  | { type: 'domino.apply'; changeRequestId: ID }
+  /** v1.21.2 §26.3: approve an early-finish advance proposal through the CR flow. */
+  | { type: 'task.advance'; proposalId: ID; graphVersion: number }
+  /** v1.21.2 §26.1א: correct a report's actualFinishAt (CAS on expectedReportVersion). */
+  | { type: 'report.correct'; reportId: ID; actualFinishAt: ISODateTime; expectedReportVersion: number; reason: string; allowBeforeStart?: boolean };
 
 export interface Conflict {
   code: 'LOCK_VIOLATION' | 'DEPENDENCY_VIOLATION' | 'DOUBLE_BOOKING' | 'WINDOW_VIOLATION' | 'MAX_SHIFT_EXCEEDED';
@@ -387,6 +396,13 @@ export interface StatusReport {
   resolvedBy?: ID;
   resolvedAt?: ISODateTime;
   resolutionNoteHe?: string;
+  /** v1.21.2 §26.1: actual field finish time (ISO offset-bearing). Correctable ONLY
+   *  via POST /v1/reports/:id/correct (§26.1א) - never patched directly. */
+  actualFinishAt?: ISODateTime;
+  /** v1.21.2 §26.1א: optimistic-concurrency counter for report.correct. */
+  version?: number;
+  /** v1.21.2 §26.1א: most recent correction reason, stored on the record. */
+  lastCorrection?: { reason: string; at: ISODateTime; by: ID };
 }
 /** Apply authority for delay reports (QA C2, matrix reportApplyRule):
  *  own-task delay, computed impact S0, task unlocked => auto-apply.
@@ -444,6 +460,59 @@ export interface PushSubscription {
 }
 
 // ============================================================
+// 7.4 BIDIRECTIONAL DOMINO — early-finish advancement (v1.21.2 §26, additive)
+// ============================================================
+
+/** Privacy-safe blocker detail: NEVER contactPhone/PII (same leak class as the
+ *  resource contactPhone rule). */
+export interface AdvanceBlocker {
+  kind: 'person' | 'equipment' | 'location' | 'content' | 'lock' | 'dependency' | 'policy';
+  detail: string;
+}
+
+export interface AdvanceCandidate {
+  taskId: ID;
+  verdict: 'advanceable' | 'blocked' | 'unchanged';
+  proposedStart?: ISODateTime;
+  proposedEnd?: ISODateTime;
+  blockers?: AdvanceBlocker[];
+  /** minutes of safe gain (0 for blocked/unchanged) */
+  freedMin: number;
+}
+
+/** §26.2: deterministic output of an advance compute. Same input (graph version +
+ *  actualFinishAt) => same proposal content, always. Pinned to graphVersion; any
+ *  conflicting mutation before approval marks it stale; TTL expiry marks expired. */
+export interface AdvanceProposal {
+  proposalId: ID;
+  orgId: ID;
+  eventId: ID;
+  graphVersion: number;
+  anchorTaskId: ID;
+  actualFinishAt: ISODateTime;
+  /** §26.1א: the report this proposal was derived from; a correction to it
+   *  stale-marks every open proposal pointing here. */
+  sourceReportId?: ID;
+  candidates: AdvanceCandidate[];
+  status: 'open' | 'stale' | 'expired' | 'approved' | 'rejected' | 'applied';
+  createdAt: ISODateTime;
+  expiresAt: ISODateTime;
+}
+
+/** §26.3 BD-07: durable notification plan, written in the SAME transactional commit
+ *  as the schedule shift. The dispatcher materializes outbox -> delivery records
+ *  idempotently after the commit (key: proposalId+recipient+channel). */
+export interface AdvanceOutbox {
+  id: ID;
+  proposalId: ID;
+  orgId: ID;
+  eventId: ID;
+  payload: string;            // serialized notification plan
+  status: 'pending' | 'materialized';
+  createdAt: ISODateTime;
+}
+
+// ============================================================
 // 7.5 AUDIT LOG — append-only, every mutation (QA §9)
 // ============================================================
 
@@ -452,7 +521,7 @@ export type AuditEntityType = NodeKind | 'user' | 'change_request' | 'notificati
   | 'report'                  // v1.12 (report.resolve audits under its precise entity)
   | 'content_item' | 'external_party' | 'status_token' | 'branch' // v1.20
   | 'subscriber_channel' | 'optout_suppression' // v1.20.2 (STOP taxonomy)
-  | 'advance_proposal';       // v1.21.2 §26
+  | 'advance_proposal' | 'advance_outbox'; // v1.21.2 §26
 
 export interface AuditLogEntry {
   id: ID;
@@ -946,6 +1015,11 @@ export interface TaskResourceLink {
   visibleFromOffsetMin: number;
   visibleUntil?: ISODateTime;
   ackRequired?: boolean;
+  /** v1.21.2 §26.2: only a link with advanceRequired=true can block an early-finish
+   *  advancement when its visibility window cannot hold in the advanced window.
+   *  Default false - simple tasks are never content-blocked (progressive disclosure).
+   *  Separate from ackRequired (a worker commitment, not a schedule condition). */
+  advanceRequired?: boolean;
 }
 
 /** §20 offline ack, deduped by clientAckId (same pattern as clientReportId). */

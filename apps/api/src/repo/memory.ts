@@ -3,6 +3,7 @@ import type {
   ExternalParty, GraphSnapshot, ID, IdempotencyRecord, NotificationJob, OptoutSuppression, PushSubscription, ReportReadState,
   ResourceNode, StatusReport, StatusToken, TaskNode, TaskResourceLink,
   WhitelistEntry, WhitelistStatus,
+  AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
 
@@ -27,6 +28,8 @@ export class MemoryGraphRepository implements GraphRepository {
   private contentAcks = new Map<string, ContentAck>(); // keyed orgId + ':' + userId + ':' + clientAckId (v1.20.2 isolation)
   private contentVersions = new Map<ID, ContentItemVersion>(); // keyed contentVersionId (v1.20.2, never deleted)
   private optoutSuppressions = new Map<ID, OptoutSuppression>();
+  private advanceProposals = new Map<ID, AdvanceProposal>();
+  private advanceOutbox = new Map<ID, AdvanceOutbox>();
   private idempotency = new Map<string, IdempotencyRecord>(); // key orgId|actorId|route|clientMutationId
   private externalParties = new Map<ID, ExternalParty>();
   private statusTokens = new Map<ID, StatusToken>();
@@ -143,7 +146,7 @@ export class MemoryGraphRepository implements GraphRepository {
       contentItems: [...this.contentItems], taskContent: [...this.taskContent], contentAcks: [...this.contentAcks],
       externalParties: [...this.externalParties], statusTokens: [...this.statusTokens],
       branches: [...this.branches], reportReads: [...this.reportReads],
-      contentVersions: [...this.contentVersions], optoutSuppressions: [...this.optoutSuppressions], idempotency: [...this.idempotency],
+      contentVersions: [...this.contentVersions], optoutSuppressions: [...this.optoutSuppressions], idempotency: [...this.idempotency], advanceProposals: [...this.advanceProposals], advanceOutbox: [...this.advanceOutbox],
     });
   }
   async commit(_cp: string): Promise<void> { /* in-memory: nothing to commit */ }
@@ -164,6 +167,8 @@ export class MemoryGraphRepository implements GraphRepository {
     this.branches = new Map((d['branches'] ?? []) as [string, Branch][]);
     this.contentVersions = new Map((d['contentVersions'] ?? []) as [string, ContentItemVersion][]);
     this.optoutSuppressions = new Map((d['optoutSuppressions'] ?? []) as [string, OptoutSuppression][]);
+    this.advanceProposals = new Map((d['advanceProposals'] ?? []) as [string, AdvanceProposal][]);
+    this.advanceOutbox = new Map((d['advanceOutbox'] ?? []) as [string, AdvanceOutbox][]);
     this.idempotency = new Map((d['idempotency'] ?? []) as [string, IdempotencyRecord][]);
     this.reportReads = new Map((d['reportReads'] ?? []) as [string, ReportReadState][]);
   }
@@ -281,6 +286,52 @@ export class MemoryGraphRepository implements GraphRepository {
     const next = { ...cur, resolvedBy: by, resolvedAt: at, ...(noteHe ? { resolutionNoteHe: noteHe } : {}) };
     this.reports.set(id, next);
     return { report: next, applied: true };
+  }
+
+  async correctReport(id: ID, expectedVersion: number, patch: { actualFinishAt: string; lastCorrection: { reason: string; at: string; by: ID } }): Promise<StatusReport | 'conflict' | undefined> {
+    // No awaits inside: check-and-set is atomic on the JS runloop.
+    const cur = this.reports.get(id);
+    if (!cur) return undefined;
+    if ((cur.version ?? 1) !== expectedVersion) return 'conflict';
+    const next: StatusReport = { ...cur, actualFinishAt: patch.actualFinishAt, version: (cur.version ?? 1) + 1, lastCorrection: patch.lastCorrection };
+    this.reports.set(id, next);
+    return next;
+  }
+
+  async createAdvanceProposal(p: AdvanceProposal): Promise<AdvanceProposal> { this.advanceProposals.set(p.proposalId, p); return p; }
+  async getAdvanceProposal(id: ID): Promise<AdvanceProposal | undefined> { return this.advanceProposals.get(id); }
+  async listAdvanceProposals(eventId: ID): Promise<AdvanceProposal[]> {
+    return [...this.advanceProposals.values()].filter(p => p.eventId === eventId);
+  }
+  async updateAdvanceProposal(id: ID, patch: Partial<Pick<AdvanceProposal, 'status'>>): Promise<AdvanceProposal | undefined> {
+    const cur = this.advanceProposals.get(id);
+    if (!cur) return undefined;
+    const next = { ...cur, ...patch, proposalId: cur.proposalId };
+    this.advanceProposals.set(id, next);
+    return next;
+  }
+  async findOpenAdvanceProposal(eventId: ID, anchorTaskId: ID, actualFinishAt: string, graphVersion: number): Promise<AdvanceProposal | undefined> {
+    return [...this.advanceProposals.values()].find(p =>
+      p.eventId === eventId && p.anchorTaskId === anchorTaskId && p.actualFinishAt === actualFinishAt &&
+      p.graphVersion === graphVersion && p.status === 'open');
+  }
+  async markProposalsStaleForReport(reportId: ID): Promise<ID[]> {
+    const stale: ID[] = [];
+    for (const p of this.advanceProposals.values()) {
+      if (p.sourceReportId === reportId && p.status === 'open') {
+        this.advanceProposals.set(p.proposalId, { ...p, status: 'stale' });
+        stale.push(p.proposalId);
+      }
+    }
+    return stale;
+  }
+  async createAdvanceOutbox(o: AdvanceOutbox): Promise<AdvanceOutbox> { this.advanceOutbox.set(o.id, o); return o; }
+  async listPendingAdvanceOutbox(): Promise<AdvanceOutbox[]> {
+    return [...this.advanceOutbox.values()].filter(o => o.status === 'pending');
+  }
+  async markAdvanceOutboxMaterialized(id: ID): Promise<void> {
+    const cur = this.advanceOutbox.get(id);
+    if (cur) this.advanceOutbox.set(id, { ...cur, status: 'materialized' });
   }
 
   async createNotificationJob(j: NotificationJob): Promise<NotificationJob> { this.notificationJobs.set(j.id, j); return j; }

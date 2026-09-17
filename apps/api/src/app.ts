@@ -15,7 +15,7 @@ import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
 import { auditDenied, type DenialMeta, audit, deviceClassOf } from './services/audit.js';
 import type { AuditEntityType, Branch, ContentItem, ContentItemVersion, ExternalParty, OptoutSuppression, StatusToken, TaskContentRole, TaskResourceLink } from '@contake/core';
-import { bodyHashOf, maskAddress, mintStatusToken, normalizeAddress, peppersFromEnv, hashToken, rateOk, requestHashOf, timingSafeEqualStr, tokenTtlMs } from './services/security.js';
+import { bodyHashOf, maskAddress, mintStatusToken, normalizeAddress, peppersFromEnv, hashToken, rateOk, requestHashOf, timingSafeEqualStr, tokenTtlMs, containsSecretPattern } from './services/security.js';
 import { buildApprovalNeededJob, recordJobs } from './services/notify.js';
 
 declare module 'fastify' {
@@ -1096,6 +1096,84 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       return r;
     });
     return { report: resolved?.report ?? report };
+  });
+
+  // v1.21.2 §26.1א: report.correct - the ONLY path that changes actualFinishAt.
+  // CAS on expectedReportVersion; idempotent on clientMutationId; reason scanned
+  // for secret patterns (v1.21.4 #8); allowBeforeStart honored for admin or for
+  // an FM covered by an approved CR for the same correction (v1.21.4 #9).
+  app.post('/v1/reports/:id/correct', async (req, reply) => {
+    const user = await me(req);
+    const { id } = req.params as { id: ID };
+    const base = rawDecision('report.correct', user.role);
+    if (base !== 'allow' && base !== 'propose') {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'report.correct', entityType: 'report', entityId: id, eventId: 'pending',
+      });
+    }
+    const report = await repo.getReport(id);
+    if (!report) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+    const task = await repo.getTask(report.taskId);
+    if (!task) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+    const ev = await repo.getEvent(task.eventId);
+    if (!ev || ev.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא'); // cross-org 404
+    const body = (req.body ?? {}) as { actualFinishAt?: string; expectedReportVersion?: number; reason?: string; clientMutationId?: string; allowBeforeStart?: boolean };
+    if (!body.actualFinishAt || typeof body.expectedReportVersion !== 'number' || !body.reason || body.reason.trim() === '') {
+      fail(400, 'BAD_REQUEST', 'חסרים actualFinishAt / expectedReportVersion / reason');
+    }
+    if (!/(Z|[+-]\d{2}:\d{2})$/.test(body.actualFinishAt) || Number.isNaN(Date.parse(body.actualFinishAt))) {
+      fail(400, 'BAD_REQUEST', 'actualFinishAt חייב להיות ISO עם offset');
+    }
+    if (containsSecretPattern(body.reason)) {
+      fail(400, 'BAD_REQUEST', 'הסירו מהסיבה מידע שנראה כמו סוד (טוקן/סיסמה)');
+    }
+    const key = requireMutationKey(body.clientMutationId);
+    // NOTE: the CAS precondition lives INSIDE the idemExec handler - a replay of
+    // the same clientMutationId must return the stored result even after the
+    // report version moved on (§26.1א idempotency).
+    // before-start correction needs the override, honored per v1.21.4 #9
+    if (task.start && Date.parse(body.actualFinishAt) < Date.parse(task.start)) {
+      let honored = false;
+      if (body.allowBeforeStart === true) {
+        if (user.role === 'admin') honored = true;
+        else {
+          const covering = (await repo.listChangeRequests({ eventId: task.eventId, state: 'approved' })).find(cr =>
+            cr.change.type === 'report.correct' && cr.change.reportId === id && cr.change.actualFinishAt === body.actualFinishAt);
+          honored = covering !== undefined;
+        }
+        if (!honored) {
+          await audit(repo, { orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
+            action: 'report.correct', entityType: 'report', entityId: id,
+            after: { deniedBeforeStartOverride: true }, deviceClass: deviceClassOf(ua(req)) });
+          fail(403, 'FORBIDDEN', 'תיקון לפני תחילת המשימה דורש אישור מנהל');
+        }
+      } else {
+        fail(400, 'BAD_REQUEST', 'actualFinishAt לפני תחילת המשימה דורש allowBeforeStart');
+      }
+    }
+    const change: ProposedChange = {
+      type: 'report.correct', reportId: id, actualFinishAt: body.actualFinishAt,
+      expectedReportVersion: body.expectedReportVersion, reason: body.reason,
+      ...(body.allowBeforeStart === true ? { allowBeforeStart: true } : {}),
+    };
+    return idemExec('report.correct', user, key, body, reply, async (record) => {
+      const fresh = await repo.getReport(id);
+      if (!fresh) fail(404, 'NOT_FOUND', 'הדיווח לא נמצא');
+      if ((fresh.version ?? 1) !== body.expectedReportVersion) {
+        fail(409, 'VERSION_CONFLICT', 'גרסה לא עדכנית - נדרש רענון');
+      }
+      const outcome = await proposeMutation(repo, { userId: user.userId, role: user.role, scopes: user.scopes, orgId: user.orgId, name: user.name }, 'report.correct', change, task.eventId, ua(req));
+      let out: object;
+      if ('changeRequest' in outcome && outcome.changeRequest) {
+        out = { changeRequest: outcome.changeRequest };
+      } else if ('blockedPreview' in outcome && outcome.blockedPreview) {
+        out = { blocked: true };
+      } else {
+        out = { report: await repo.getReport(id) };
+      }
+      await record(out);
+      return out;
+    });
   });
 
   // ---------- users directory (contracts v1.12) ----------

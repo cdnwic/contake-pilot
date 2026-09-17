@@ -76,3 +76,15 @@ export function rateOk(key: string, limit: number, windowMs: number, now = Date.
 }
 /** Test hook: clear all buckets. */
 export function rateResetAll(): void { buckets.clear(); }
+
+// ---- secret-pattern scan (v1.21.4 #8): report.correct reason is scanned for
+// secret-looking patterns; a match rejects with 400 (no store-and-redact) ----
+const SECRET_PATTERNS: RegExp[] = [
+  /\bbearer\s+\S+/i,
+  /\bsk-[A-Za-z0-9_-]{6,}/,
+  /\b(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[=:]\s*\S+/i,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+export function containsSecretPattern(text: string): boolean {
+  return SECRET_PATTERNS.some(p => p.test(text));
+}

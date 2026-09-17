@@ -3,7 +3,7 @@ import type {
   AuditLogEntry, Branch, ChangeRequest, ContentAck, ContentItem, ContentItemVersion, DependencyEdge, EventNode,
   ExternalParty, GraphSnapshot, ID, IdempotencyRecord, NotificationJob, OptoutSuppression, PushSubscription, ReportReadState,
   ResourceNode, StatusReport, StatusToken, TaskNode, TaskResourceLink,
-  WhitelistEntry, WhitelistStatus,
+  WhitelistEntry, WhitelistStatus, AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
 import type { DispatchStateStore } from '../services/dispatch.js';
@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS report_read_states(report_id text NOT NULL, user_id t
 CREATE TABLE IF NOT EXISTS content_versions(id text PRIMARY KEY, content_id text NOT NULL, version integer NOT NULL, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS optout_suppressions(id text PRIMARY KEY, channel text NOT NULL, address text NOT NULL, org_id text, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS idempotency_records(org_id text NOT NULL, actor_id text NOT NULL, route text NOT NULL, client_mutation_id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY(org_id, actor_id, route, client_mutation_id));
+CREATE TABLE IF NOT EXISTS advance_proposals(id text PRIMARY KEY, event_id text NOT NULL, status text NOT NULL, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS advance_outbox(id text PRIMARY KEY, proposal_id text NOT NULL, status text NOT NULL, data jsonb NOT NULL);
 CREATE INDEX IF NOT EXISTS content_items_org ON content_items(org_id);
 CREATE INDEX IF NOT EXISTS external_parties_org ON external_parties(org_id);
 CREATE INDEX IF NOT EXISTS branches_org ON branches(org_id);
@@ -475,6 +477,75 @@ export class PostgresGraphRepository implements GraphRepository {
       await c.query(`UPDATE reports SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
       return { report: next, applied: true };
     });
+  }
+
+  async correctReport(id: ID, expectedVersion: number, patch: { actualFinishAt: string; lastCorrection: { reason: string; at: string; by: ID } }): Promise<StatusReport | 'conflict' | undefined> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM reports WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as StatusReport | undefined;
+      if (!cur) return undefined;
+      if ((cur.version ?? 1) !== expectedVersion) return 'conflict';
+      const next: StatusReport = { ...cur, actualFinishAt: patch.actualFinishAt, version: (cur.version ?? 1) + 1, lastCorrection: patch.lastCorrection };
+      await c.query(`UPDATE reports SET data=$2 WHERE id=$1`, [id, JSON.stringify(next)]);
+      return next;
+    });
+  }
+
+  // ---- advance proposals + outbox (v1.21.2 §26) --------------------------------
+  async createAdvanceProposal(p: AdvanceProposal): Promise<AdvanceProposal> {
+    await this.q(`INSERT INTO advance_proposals(id, event_id, status, data) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`, [p.proposalId, p.eventId, p.status, JSON.stringify(p)]);
+    return p;
+  }
+  async getAdvanceProposal(id: ID): Promise<AdvanceProposal | undefined> {
+    const r = await this.q(`SELECT data FROM advance_proposals WHERE id=$1`, [id]);
+    return r.rows[0]?.['data'] as AdvanceProposal | undefined;
+  }
+  async listAdvanceProposals(eventId: ID): Promise<AdvanceProposal[]> {
+    const r = await this.q(`SELECT data FROM advance_proposals WHERE event_id=$1`, [eventId]);
+    return r.rows.map(x => x['data'] as AdvanceProposal);
+  }
+  async updateAdvanceProposal(id: ID, patch: Partial<Pick<AdvanceProposal, 'status'>>): Promise<AdvanceProposal | undefined> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM advance_proposals WHERE id=$1 FOR UPDATE`, [id]);
+      const cur = r.rows[0]?.['data'] as AdvanceProposal | undefined;
+      if (!cur) return undefined;
+      const next = { ...cur, ...patch, proposalId: cur.proposalId };
+      await c.query(`UPDATE advance_proposals SET status=$2, data=$3 WHERE id=$1`, [id, next.status, JSON.stringify(next)]);
+      return next;
+    });
+  }
+  async findOpenAdvanceProposal(eventId: ID, anchorTaskId: ID, actualFinishAt: string, graphVersion: number): Promise<AdvanceProposal | undefined> {
+    const r = await this.q(`SELECT data FROM advance_proposals WHERE event_id=$1 AND status='open'`, [eventId]);
+    return (r.rows.map(x => x['data'] as AdvanceProposal)).find(p =>
+      p.anchorTaskId === anchorTaskId && p.actualFinishAt === actualFinishAt && p.graphVersion === graphVersion);
+  }
+  async markProposalsStaleForReport(reportId: ID): Promise<ID[]> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM advance_proposals WHERE status='open' FOR UPDATE`);
+      const stale: ID[] = [];
+      for (const row of r.rows) {
+        const p = row['data'] as AdvanceProposal;
+        if (p.sourceReportId === reportId) {
+          const next = { ...p, status: 'stale' as const };
+          await c.query(`UPDATE advance_proposals SET status='stale', data=$2 WHERE id=$1`, [p.proposalId, JSON.stringify(next)]);
+          stale.push(p.proposalId);
+        }
+      }
+      return stale;
+    });
+  }
+  async createAdvanceOutbox(o: AdvanceOutbox): Promise<AdvanceOutbox> {
+    await this.q(`INSERT INTO advance_outbox(id, proposal_id, status, data) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`, [o.id, o.proposalId, o.status, JSON.stringify(o)]);
+    return o;
+  }
+  async listPendingAdvanceOutbox(): Promise<AdvanceOutbox[]> {
+    const r = await this.q(`SELECT data FROM advance_outbox WHERE status='pending'`);
+    return r.rows.map(x => x['data'] as AdvanceOutbox);
+  }
+  async markAdvanceOutboxMaterialized(id: ID): Promise<void> {
+    const r = await this.q(`SELECT data FROM advance_outbox WHERE id=$1`, [id]);
+    const cur = r.rows[0]?.['data'] as AdvanceOutbox | undefined;
+    if (cur) await this.q(`UPDATE advance_outbox SET status='materialized', data=$2 WHERE id=$1`, [id, JSON.stringify({ ...cur, status: 'materialized' })]);
   }
 
   // ---- notification jobs --------------------------------------------------------

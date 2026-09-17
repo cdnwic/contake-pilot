@@ -3,6 +3,7 @@ import type {
   ExternalParty, GraphSnapshot, ID, IdempotencyRecord, NotificationJob, OptoutSuppression, Principal, PushSubscription, ReportReadState,
   ResourceNode, Role, StatusReport, StatusToken, TaskNode, TaskResourceLink,
   WhitelistEntry, WhitelistStatus,
+  AdvanceProposal, AdvanceOutbox, ISODateTime,
 } from '@contake/core';
 
 /** Authenticated user record (the Principal plus login material). */
@@ -96,6 +97,20 @@ export interface GraphRepository {
   /** v1.12: write-once handled-state (ack-style idempotency): applied=false when
    *  already resolved - a re-resolve never overwrites and never re-audits. */
   resolveReport(id: ID, by: ID, at: string, noteHe?: string): Promise<{ report: StatusReport; applied: boolean } | undefined>;
+  /** v1.21.2 §26.1א: CAS correction - returns 'conflict' on stale expectedVersion,
+   *  undefined when the report does not exist. */
+  correctReport(id: ID, expectedVersion: number, patch: { actualFinishAt: ISODateTime; lastCorrection: { reason: string; at: ISODateTime; by: ID } }): Promise<StatusReport | 'conflict' | undefined>;
+  /** v1.21.2 §26: advance proposals + durable outbox. */
+  createAdvanceProposal(p: AdvanceProposal): Promise<AdvanceProposal>;
+  getAdvanceProposal(id: ID): Promise<AdvanceProposal | undefined>;
+  listAdvanceProposals(eventId: ID): Promise<AdvanceProposal[]>;
+  updateAdvanceProposal(id: ID, patch: Partial<Pick<AdvanceProposal, 'status'>>): Promise<AdvanceProposal | undefined>;
+  /** Natural-key reuse: an identical open proposal for the same compute input. */
+  findOpenAdvanceProposal(eventId: ID, anchorTaskId: ID, actualFinishAt: ISODateTime, graphVersion: number): Promise<AdvanceProposal | undefined>;
+  markProposalsStaleForReport(reportId: ID): Promise<ID[]>;
+  createAdvanceOutbox(o: AdvanceOutbox): Promise<AdvanceOutbox>;
+  listPendingAdvanceOutbox(): Promise<AdvanceOutbox[]>;
+  markAdvanceOutboxMaterialized(id: ID): Promise<void>;
 
   // notification jobs (recorder; sandbox dispatch lands at M3)
   createNotificationJob(j: NotificationJob): Promise<NotificationJob>;
