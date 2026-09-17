@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# G4 diagnostic external sampler (controller v4 family). 1s JSONL series for the
+# G4 diagnostic external sampler (controller v5 family). 1s JSONL series for the
 # dedicated diagnostic process group: per-process PID/PPID/state/cumulative
 # CPU jiffies/RSS/threads/fds/socket-fds/wchan + birth/death events; system
 # memory/load/PSI/OOM counter/cgroup limits. Events: sampler-start,
@@ -8,7 +8,26 @@
 # low/self pgids so the cap can only target the dedicated diagnostic group.
 # usage: ext-sampler.sh <target-pgid> <outfile> <cap-seconds>
 set -u
-PGID_T="${1:-}"; OUT="${2:-}"; CAP="${3:-600}"
+PGID_T="${1:-}"; OUT="${2:-}"; CAP="${3:-600}"; RUN_DIR="${4:-}"; IDENTITY_FILE="${5:-}"; SENTINEL="${6:-}"
+# v5: when given an identity file, verify process identity (sentinel, pgid,
+# sid, start ticks, cmdline) before any signal; mismatch -> loud refusal.
+verify_identity() {
+  [ -n "$IDENTITY_FILE" ] && [ -f "$IDENTITY_FILE" ] || return 1
+  jq -e . "$IDENTITY_FILE" >/dev/null 2>&1 || return 1
+  local vpid vpgid vsid vticks vsent vcmdsha
+  vpid=$(jq -r '.pid // empty' "$IDENTITY_FILE"); vpgid=$(jq -r '.pgid // empty' "$IDENTITY_FILE")
+  vsid=$(jq -r '.sid // empty' "$IDENTITY_FILE"); vticks=$(jq -r '.start_ticks // empty' "$IDENTITY_FILE")
+  vsent=$(jq -r '.sentinel // empty' "$IDENTITY_FILE"); vcmdsha=$(jq -r '.cmdline_sha1 // empty' "$IDENTITY_FILE")
+  [[ "$vpid" =~ ^[0-9]+$ ]] || return 1
+  [ "$vsent" = "$SENTINEL" ] || return 1
+  [ "$vpgid" = "$PGID_T" ] || return 1
+  [ -d "/proc/$vpid" ] || return 1
+  [ "$(ps -o pgid= -p "$vpid" 2>/dev/null | tr -d ' ')" = "$vpgid" ] || return 1
+  [ "$(ps -o sid= -p "$vpid" 2>/dev/null | tr -d ' ')" = "$vsid" ] || return 1
+  [ "$(sed 's/^.*) //' "/proc/$vpid/stat" 2>/dev/null | awk '{print $20}')" = "$vticks" ] || return 1
+  [ "$(tr '\0' ' ' < "/proc/$vpid/cmdline" 2>/dev/null | sed 's/ $//' | sha1sum | cut -d' ' -f1)" = "$vcmdsha" ] || return 1
+  return 0
+}
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 if [ -z "$PGID_T" ] || ! [[ "$PGID_T" =~ ^[0-9]+$ ]] || [ "$PGID_T" -lt 100 ] || [ "$PGID_T" = "$SELF_PGID" ] || [ "$PGID_T" = "$PPID" ]; then
   echo "{\"ts\":\"$(date -Iseconds)\",\"ev\":\"abort-bad-pgid\",\"given\":\"$PGID_T\",\"self_pgid\":$SELF_PGID}" >> "$OUT"
@@ -91,9 +110,20 @@ while sample; do
       jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" '{ts:$ts,ev:"sigterm-sent",target_pgid:$pgid}'
     } >> "$OUT" 2>&1
     sync -f "$OUT" 2>/dev/null || sync
+    [ -n "$RUN_DIR" ] && { touch "$RUN_DIR/cap-fired"; sync -f "$RUN_DIR/cap-fired" 2>/dev/null || true; }
+    if [ -n "$IDENTITY_FILE" ] && ! verify_identity; then
+      jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" '{ts:$ts,ev:"identity-refuse",target_pgid:$pgid,reason:"identity mismatch at cap; no signal sent"}' >> "$OUT"
+      sync -f "$OUT" 2>/dev/null || sync
+      exit 3
+    fi
     kill -TERM -"$PGID_T" 2>/dev/null
-    sleep 10
+    tw=0; while pgrep -g "$PGID_T" >/dev/null 2>&1 && [ $tw -lt 10 ]; do sleep 1; tw=$((tw+1)); done
     if pgrep -g "$PGID_T" >/dev/null 2>&1; then
+      if [ -n "$IDENTITY_FILE" ] && ! verify_identity; then
+        jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" '{ts:$ts,ev:"identity-refuse",target_pgid:$pgid,reason:"identity mismatch before KILL; no signal sent"}' >> "$OUT"
+        sync -f "$OUT" 2>/dev/null || sync
+        exit 3
+      fi
       jq -nc --arg ts "$(date -Iseconds)" --argjson pgid "$PGID_T" '{ts:$ts,ev:"sigkill-sent",target_pgid:$pgid}' >> "$OUT"
   sync -f "$OUT" 2>/dev/null || sync
       kill -KILL -"$PGID_T" 2>/dev/null
