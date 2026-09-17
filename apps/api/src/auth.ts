@@ -250,14 +250,25 @@ export class AuthService {
   }
 
   /** Super Admin enrollment: the allowlisted phone IS the credential-level
-   *  identity. First login creates the real pilot-tenant admin record;
-   *  later logins upgrade a pre-existing record. Idempotent. */
+   *  identity. QA provisioning ruling (2026-09-17), fail-closed:
+   *  - NO existing binding -> create the canonical record (pilot home org,
+   *    role admin, isSuperAdmin true);
+   *  - an EXACT canonical binding (isSuperAdmin===true, home org, role admin)
+   *    -> idempotent return, no writes;
+   *  - ANY other existing binding - cross-tenant, wrong role, or a regular
+   *    home-org admin never claimed - FAILS LOUD with NO mutation. Silently
+   *    upgrading/flipping a pre-existing record is exactly the confused-
+   *    deputy path the ruling removes: re-binding requires an audited
+   *    operator claim flow, which does not exist yet. */
   async ensureSuperAdmin(phone: string, existing?: UserRecord): Promise<UserRecord | undefined> {
     if (existing) {
-      if (existing.isSuperAdmin !== true) {
-        return this.repo.updateUser(existing.userId, { isSuperAdmin: true });
-      }
-      return existing;
+      const canonical = existing.isSuperAdmin === true && existing.orgId === SUPER_ADMIN_HOME_ORG && existing.role === 'admin';
+      if (canonical) return existing;
+      throw new Error(
+        `SUPER_ADMIN_BINDING_CONFLICT: allowlisted phone ${phone} is already bound to user ${existing.userId} ` +
+        `(org=${existing.orgId}, role=${existing.role}, isSuperAdmin=${existing.isSuperAdmin === true}) - ` +
+        'refusing silent claim; an audited operator claim flow must re-bind this identity first',
+      );
     }
     const user: UserRecord = {
       userId: `u-superadmin-${phone.replace(/\D/g, '')}`,
