@@ -77,10 +77,12 @@ export function memoryOtpState(): OtpStateStore {
   };
 }
 
-/** Super Admin phone allowlist (server-side, env-overridable for ops). The
- *  verified pilot-owner phone enrolls directly as the real Super Admin
- *  identity on first OTP login. Frontend state can never set this. */
-export const SUPER_ADMIN_PHONES: readonly string[] = (process.env['CONTAKE_SUPER_ADMIN_PHONES'] ?? '+972587700852')
+/** Super Admin phone allowlist (server-side, env-only). QA stop-ship
+ *  (2026-09-17): FAIL CLOSED - there is NO hardcoded/default privileged
+ *  phone. An unset CONTAKE_SUPER_ADMIN_PHONES means an empty allowlist: no
+ *  phone enrolls as Super Admin, period. Ops sets the comma-separated
+ *  allowlist explicitly per environment. Frontend state can never set this. */
+export const SUPER_ADMIN_PHONES: readonly string[] = (process.env['CONTAKE_SUPER_ADMIN_PHONES'] ?? '')
   .split(',').map(p => p.trim()).filter(Boolean);
 
 /** The pilot tenant a super admin enrolls into. */

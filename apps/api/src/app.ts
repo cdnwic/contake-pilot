@@ -566,7 +566,10 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     }
     const profileId = body.domainProfileId ?? 'camp';
     if (!listProfiles().some(p => p.id === profileId)) fail(400, 'BAD_REQUEST', 'פרופיל לא קיים');
-    await ensureSuperAdminSandbox(repo, profileId);
+    // QA stop-ship (2026-09-17): sandbox ensure + identity mint + start audit
+    // commit ATOMICALLY (withAuditSafety: PG runInTx / memory checkpoint). A
+    // fault anywhere in the unit leaves no partial sandbox, no unaudited
+    // identity, and no audit without its identity.
     const evId = sandboxEventId(profileId);
     const sandboxUser: UserRecord = {
       userId: `sa-imp-${randomUUID()}`,
@@ -580,14 +583,17 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       active: true,
       impersonationOf: user.userId,
     };
-    await repo.createUser(sandboxUser);
-    await audit(repo, {
-      orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: 'admin',
-      action: 'identity.impersonate.start', entityType: 'user', entityId: sandboxUser.userId,
-      after: {
-        by: user.userId, byPhone: user.phone ?? null, targetRole: role,
-        domainProfileId: profileId, sandboxOrg: SUPERADMIN_SANDBOX_ORG, sandboxEventId: evId,
-      },
+    await withAuditSafety(repo, async () => {
+      await ensureSuperAdminSandbox(repo, profileId);
+      await repo.createUser(sandboxUser);
+      await audit(repo, {
+        orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: 'admin',
+        action: 'identity.impersonate.start', entityType: 'user', entityId: sandboxUser.userId,
+        after: {
+          by: user.userId, byPhone: user.phone ?? null, targetRole: role,
+          domainProfileId: profileId, sandboxOrg: SUPERADMIN_SANDBOX_ORG, sandboxEventId: evId,
+        },
+      });
     });
     return {
       token: auth.issueToken(sandboxUser.userId),
@@ -619,16 +625,21 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (!target || target.impersonationOf === undefined || !target.active) {
       fail(404, 'NOT_FOUND', 'ההתחזות לא נמצאה');
     }
-    await repo.updateUser(target.userId, { active: false });
-    const impersonator = await repo.getUser(target.impersonationOf);
-    await audit(repo, {
-      orgId: impersonator?.orgId ?? actor.orgId, eventId: 'pending',
-      actorUserId: actor.userId, role: actor.role,
-      action: 'identity.impersonate.stop', entityType: 'user', entityId: target.userId,
-      after: {
-        stoppedBy: actor.userId, impersonatorUserId: target.impersonationOf,
-        targetRole: target.role, sandboxOrg: SUPERADMIN_SANDBOX_ORG,
-      },
+    // QA stop-ship (2026-09-17): deactivate + stop audit commit ATOMICALLY.
+    // A fault in the audit write rolls the deactivation back, so a sandbox
+    // identity is never left dead-but-unaudited (or audited-but-alive).
+    await withAuditSafety(repo, async () => {
+      await repo.updateUser(target.userId, { active: false });
+      const impersonator = await repo.getUser(target.impersonationOf!);
+      await audit(repo, {
+        orgId: impersonator?.orgId ?? actor.orgId, eventId: 'pending',
+        actorUserId: actor.userId, role: actor.role,
+        action: 'identity.impersonate.stop', entityType: 'user', entityId: target.userId,
+        after: {
+          stoppedBy: actor.userId, impersonatorUserId: target.impersonationOf,
+          targetRole: target.role, sandboxOrg: SUPERADMIN_SANDBOX_ORG,
+        },
+      });
     });
     return { stopped: true };
   });

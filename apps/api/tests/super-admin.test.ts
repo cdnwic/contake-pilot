@@ -1,7 +1,9 @@
 /** Super Admin test impersonation (server-authorized, audited, sandbox-scoped).
  *  Covers: phone-allowlist enrollment, sandbox identity minting, tenant
  *  isolation, deny matrix, session stop + token revocation, audit trail. */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+// Fail-closed allowlist (QA stop-ship): tests opt in explicitly.
+vi.hoisted(() => { process.env['CONTAKE_SUPER_ADMIN_PHONES'] = '+972587700852'; });
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AuthService, SUPER_ADMIN_PHONES } from '../src/auth.js';

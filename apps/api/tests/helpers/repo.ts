@@ -118,7 +118,22 @@ export function getFileInstanceInfo(): { instanceId: string; fileId: string; res
   return filePg && { instanceId: filePg.instanceId, fileId: filePg.fileId, resets: filePg.resets, maxRssMB: filePg.maxRssMB };
 }
 
+/** QA stop-ship (2026-09-17): REPO_IMPL=realpg runs against REAL PostgreSQL
+ *  via DATABASE_URL (node-pg Pool). Per-test isolation mirrors the PGlite
+ *  lane: DROP/CREATE SCHEMA public, then the production bootstrap re-runs.
+ *  PGlite is single-connection; this lane is the multi-connection proof. */
+async function makeRealPgRepo(): Promise<GraphRepository> {
+  const { Pool } = await import('pg');
+  const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
+  await pool.query('DROP SCHEMA public CASCADE');
+  await pool.query('CREATE SCHEMA public');
+  const repo = await PostgresGraphRepository.create(pool as unknown as Connectable);
+  await applySeed(repo, seedDemo());
+  return repo;
+}
+
 export async function makeTestRepo(): Promise<GraphRepository> {
+  if (REPO_IMPL === 'realpg') return makeRealPgRepo();
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
     await resetInstance(fp);
@@ -133,6 +148,15 @@ export async function makeTestRepo(): Promise<GraphRepository> {
 
 /** Same factory with an explicit seed (profile-parity builds custom graphs). */
 export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository> {
+  if (REPO_IMPL === 'realpg') {
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
+    await pool.query('DROP SCHEMA public CASCADE');
+    await pool.query('CREATE SCHEMA public');
+    const repo = await PostgresGraphRepository.create(pool as unknown as Connectable);
+    await applySeed(repo, data);
+    return repo;
+  }
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
     await resetInstance(fp);
