@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS optout_suppressions(id text PRIMARY KEY, channel text
 CREATE TABLE IF NOT EXISTS idempotency_records(org_id text NOT NULL, actor_id text NOT NULL, route text NOT NULL, client_mutation_id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY(org_id, actor_id, route, client_mutation_id));
 CREATE TABLE IF NOT EXISTS advance_proposals(id text PRIMARY KEY, event_id text NOT NULL, status text NOT NULL, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS advance_outbox(id text PRIMARY KEY, proposal_id text NOT NULL, status text NOT NULL, data jsonb NOT NULL);
+-- whitelist-PG gate: the PG REPO writes auth_audit (commitWhitelistRegistration),
+-- so the table must exist even when the OTP store is memory-backed. Mirrors the
+-- OTP DDL block (IF NOT EXISTS = idempotent when createPgOtpState also runs).
+CREATE TABLE IF NOT EXISTS auth_audit(seq bigserial PRIMARY KEY, phone text NOT NULL, kind text NOT NULL, data jsonb, created_at timestamptz NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS content_items_org ON content_items(org_id);
 CREATE INDEX IF NOT EXISTS external_parties_org ON external_parties(org_id);
 CREATE INDEX IF NOT EXISTS branches_org ON branches(org_id);
