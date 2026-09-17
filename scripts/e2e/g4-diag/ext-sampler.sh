@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# G4 diagnostic external sampler (controller v5 family). 1s JSONL series for the
+# G4 diagnostic external sampler (controller v6 family). 1s JSONL series for the
 # dedicated diagnostic process group: per-process PID/PPID/state/cumulative
 # CPU jiffies/RSS/threads/fds/socket-fds/wchan + birth/death events; system
 # memory/load/PSI/OOM counter/cgroup limits. Events: sampler-start,
@@ -14,10 +14,10 @@ PGID_T="${1:-}"; OUT="${2:-}"; CAP="${3:-600}"; RUN_DIR="${4:-}"; IDENTITY_FILE=
 verify_identity() {
   [ -n "$IDENTITY_FILE" ] && [ -f "$IDENTITY_FILE" ] || return 1
   jq -e . "$IDENTITY_FILE" >/dev/null 2>&1 || return 1
-  local vpid vpgid vsid vticks vsent vcmdsha
+  local vpid vpgid vsid vticks vsent
   vpid=$(jq -r '.pid // empty' "$IDENTITY_FILE"); vpgid=$(jq -r '.pgid // empty' "$IDENTITY_FILE")
   vsid=$(jq -r '.sid // empty' "$IDENTITY_FILE"); vticks=$(jq -r '.start_ticks // empty' "$IDENTITY_FILE")
-  vsent=$(jq -r '.sentinel // empty' "$IDENTITY_FILE"); vcmdsha=$(jq -r '.cmdline_sha1 // empty' "$IDENTITY_FILE")
+  vsent=$(jq -r '.sentinel // empty' "$IDENTITY_FILE")
   [[ "$vpid" =~ ^[0-9]+$ ]] || return 1
   [ "$vsent" = "$SENTINEL" ] || return 1
   [ "$vpgid" = "$PGID_T" ] || return 1
@@ -25,7 +25,6 @@ verify_identity() {
   [ "$(ps -o pgid= -p "$vpid" 2>/dev/null | tr -d ' ')" = "$vpgid" ] || return 1
   [ "$(ps -o sid= -p "$vpid" 2>/dev/null | tr -d ' ')" = "$vsid" ] || return 1
   [ "$(sed 's/^.*) //' "/proc/$vpid/stat" 2>/dev/null | awk '{print $20}')" = "$vticks" ] || return 1
-  [ "$(tr '\0' ' ' < "/proc/$vpid/cmdline" 2>/dev/null | sed 's/ $//' | sha1sum | cut -d' ' -f1)" = "$vcmdsha" ] || return 1
   return 0
 }
 SELF_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
