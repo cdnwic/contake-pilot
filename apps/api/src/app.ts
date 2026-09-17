@@ -1144,7 +1144,13 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       }
       const { change, domino, decision } = delayed;
       if (decision === 'auto-apply' && domino.ok) {
-        applyDomino(repo, snapshot, domino, change, withOrg(user), 'task.move', deviceClassOf(ua(req)));
+        // v1.20.3 (QA Alpha-2 2026-09-17): applyDomino is async and MUST be
+        // awaited. Un-awaited, withAuditSafety committed/returned before the
+        // domino writes finished: failures detached from the rollback (task
+        // updates could land post-commit, and a rejection became an unhandled
+        // post-response rejection while the client already held a 200).
+        // Awaited, report + domino + audits commit or roll back atomically.
+        await applyDomino(repo, snapshot, domino, change, withOrg(user), 'task.move', deviceClassOf(ua(req)));
         return { report, applied: { domino } };
       }
       const cr: ChangeRequest = {
