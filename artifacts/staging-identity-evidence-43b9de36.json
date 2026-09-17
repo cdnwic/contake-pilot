@@ -1,0 +1,9 @@
+{
+  "verified_at": "2026-09-17T02:58:16+03:00",
+  "source": "Render API GET /v1/services/srv-dak86d15efls73d1r6gg/deploys/dep-dak9apek1f9s73cfhoag (read lease, vault-injected key, key never exposed)",
+  "service": { "id": "srv-dak86d15efls73d1r6gg", "name": "contake-api-staging", "branch": "main", "autoDeploy": "yes", "repo": "https://github.com/cdnwic/contake-pilot", "runtime": "node" },
+  "live_deploy": { "id": "dep-dak9apek1f9s73cfhoag", "status": "live", "commit": "a32d1c06e062c55941a9b544aab52f404f358eeb", "commit_short": "a32d1c0", "commit_message_first_line": "fix(api): emit whitelist.updated only after the transition unit resolves", "commit_createdAt": "2026-09-15T00:26:35Z", "trigger": "api", "createdAt": "2026-09-15T00:46:29.808563Z", "finishedAt": "2026-09-15T00:47:38.796657Z" },
+  "prior_deploys": [ {"id":"dep-dak91k5g1s2s73bf5pv0","status":"deactivated","finishedAt":"2026-09-15T00:28:11.671157Z"}, {"id":"dep-dak8vvjm8hqs73dng760","status":"deactivated","finishedAt":"2026-09-15T00:24:36.818481Z"} ],
+  "lineage": { "origin_main": "ef65394d736d420dec489e59012293ca2dde915a", "merge_base": "a32d1c0 (ancestor of origin/main)", "origin_main_ahead_by": 3, "ahead_commits": ["522b892","f5664c2","ef65394"], "apps_packages_trees_byte_identical": true, "reanchor_doc": "contake-contracts-reanchor-a32d1c0-v1.1.md (sha256 98e9c1ef94dbbf803258d034817449ee6bda042313cd0821e2aa63628c47b004, sidecar verified)" },
+  "hazard": "staging service tracks branch main with autoDeploy=yes while live deploy is a32d1c0, 3 commits behind origin/main ef65394; any future push to main will trigger a staging redeploy (cold start + code change) - material for demo-on-staging"
+}

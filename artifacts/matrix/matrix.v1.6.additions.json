@@ -1,0 +1,28 @@
+{
+  "baseVersion": "1.5",
+  "version": "1.6",
+  "date": "2026-09-17",
+  "additiveOnly": true,
+  "totalActions": 48,
+  "supersedes": "matrix.v1.6.additions.json @ fc49035cb5b358c47cac2f3235e8b4a8924d208549e54d8ee338f0c6f14c9427 (channel.optout admin cell corrected to deny)",
+  "note": "v1.5 (45 actions, corrected content.delete fm=deny) + channel.optout (v1.20.2, machine-principal-only: ALL user roles deny; executed solely by actor system-inbound) + task.advance & report.correct (v1.21.2 §26).",
+  "actions": {
+    "channel.optout": {
+      "admin": "deny",
+      "field_manager": "deny",
+      "focus_worker": "deny",
+      "scope": "system",
+      "note": "Machine-principal-only (system-inbound webhook actor). No user-facing route exists; any user-role invocation is deny. Audit entity: external_party (before/after consent), subscriber_channel, or optout_suppression (durable record keyed (channel, address), inbound correlation)."
+    },
+    "task.advance": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    },
+    "report.correct": {
+      "admin": "allow",
+      "field_manager": "propose",
+      "focus_worker": "deny"
+    }
+  }
+}

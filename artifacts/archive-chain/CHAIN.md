@@ -14,3 +14,7 @@ Transport tarballs retained byte-identical per protocol: "not used" never means 
 | (active, not stored here) 0247 | 2428869108f70a48c2f34b4d82d5e2e3e3829b2e71ee20401dbe87a9879655d0 | active | Independent QA PASS (T1-T8, byte-reproducibility); extracted to canonical paths; sidecar in artifacts/control/ |
 
 Generator history: archive-gen v1.1 (tar 0058aac4) REJECTED (QA: determinism claim + announced hash wrong); portable corrected generator (b8cd9a3c...) retained in artifacts/generator/.
+
+## Corrections
+
+- 2026-09-17 (TL, additive): the 0246 row's Findings text is corrected. Verified fact: 0246 FAILS generator v1.2 test T8 (root '.' entry present; 56 members vs expected 55) — do not claim 0246 passes. The deterministic-generator claim was rejected and its announced hash was wrong. The original row above is preserved unedited for history.
