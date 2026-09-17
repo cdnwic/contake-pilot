@@ -28,6 +28,7 @@ import type { GraphRepository } from '../../src/repo/graph-repository.js';
 import { MemoryGraphRepository } from '../../src/repo/memory.js';
 import { PostgresGraphRepository, pgliteConnectable, createPgOtpState, type Connectable } from '../../src/repo/postgres.js';
 import { memoryOtpState, type OtpStateStore } from '../../src/auth.js';
+import { probe } from './g4-diag.js';
 import { applySeed, seedDemo } from '../../src/seed.js';
 import type { SeedData } from '../../src/repo/graph-repository.js';
 
@@ -61,11 +62,13 @@ if (process.env['VITEST']) {
     const fp = filePg;
     filePg = undefined;
     if (!fp) return;
+    probe('helperAA:closing', { instance: fp.instanceId, file: fp.fileId, resets: fp.resets, maxRssMB: fp.maxRssMB });
     try {
       await fp.raw.close();
     } catch (e) {
       throw new Error(`[pg-harness] LOUD cleanup failure: instance ${fp.instanceId} (${fp.fileId}) close: ${String(e)}`);
     }
+    probe('helperAA:closed', { instance: fp.instanceId });
     trace(fp, { op: 'close', resets: fp.resets, maxRssMB: fp.maxRssMB });
   });
 }
@@ -88,6 +91,7 @@ async function fileInstance(): Promise<FilePglite> {
  *  PostgresGraphRepository.create / createPgOtpState) is invoked by the
  *  factories right after. */
 async function resetInstance(fp: FilePglite): Promise<void> {
+  probe('pg:reset-entry', { instance: fp.instanceId, resets: fp.resets });
   if (fp.resets > 0) {
     if (fp.lastConn) {
       const t0 = performance.now();
@@ -103,6 +107,7 @@ async function resetInstance(fp: FilePglite): Promise<void> {
     await fp.raw.query('ALTER SCHEMA public OWNER TO postgres');
     await fp.raw.query('GRANT ALL ON SCHEMA public TO public');
     await fp.raw.query('SET search_path TO public');
+    probe('pg:reset-done', { instance: fp.instanceId, resets: fp.resets });
     trace(fp, { op: 'reset', ms: Math.round((performance.now() - t0) * 10) / 10 });
   }
   fp.resets += 1;

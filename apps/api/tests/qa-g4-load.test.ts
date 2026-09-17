@@ -10,7 +10,8 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AuthService, hashPasswordPure } from '../src/auth.js';
 import type { GraphRepository } from '../src/repo/graph-repository.js';
-import { makeTestRepo, REPO_IMPL } from './helpers/repo.js';
+import { makeTestRepo, REPO_IMPL, getFileInstanceInfo } from './helpers/repo.js';
+import { probe, roomsSnapshot, trackHttp } from './helpers/g4-diag.js';
 import { createRealtime, type Realtime } from '../src/realtime.js';
 
 const PG = REPO_IMPL === 'postgres';
@@ -18,25 +19,39 @@ const N = Number(process.env['G4_N'] ?? 200);
 let app: FastifyInstance; let repo: GraphRepository; let rt: Realtime; let url: string; let auth: AuthService;
 const clients: ClientSocket[] = [];
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
+let httpStats: () => Record<string, number> = () => ({});
 
 beforeAll(async () => {
+  probe('beforeAll:entry');
   if (!PG) return;
   repo = await makeTestRepo();
+  probe('beforeAll:repo', { pg: getFileInstanceInfo() });
   auth = new AuthService(repo);
   app = buildApp(repo, auth);
+  httpStats = trackHttp(app.server);
+  probe('beforeAll:app-built');
   await app.ready();
+  probe('beforeAll:ready');
   await app.listen({ port: 0, host: '127.0.0.1' });
   const addr = app.server.address();
   url = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}`;
+  probe('beforeAll:listening', { url });
   rt = createRealtime(app.server, repo, auth, { revalidateMs: 60_000 }); // isolate fanout from revalidate churn
+  probe('beforeAll:realtime', { rt: roomsSnapshot(rt.io), http: httpStats() });
+  probe('beforeAll:exit');
 }, 120_000);
 
 afterAll(async () => {
+  probe('afterAll:entry');
   if (!PG) return;
   for (const c of clients) c.disconnect();
   clients.length = 0;
+  probe('afterAll:clients-disconnected', { g4clients: clients.length, rt: roomsSnapshot(rt.io), http: httpStats() });
   await rt.close();
+  probe('afterAll:rt-closed', { http: httpStats() });
   await app.close();
+  probe('afterAll:app-closed', { http: httpStats() });
+  probe('afterAll:exit');
 }, 120_000);
 
 const H = (t: string): { authorization: string } => ({ authorization: `Bearer ${t}` });
@@ -70,7 +85,9 @@ const pct = (sorted: number[], p: number): number => sorted[Math.min(sorted.leng
 
 describe.skipIf(!PG)('QA G4 load harness (PG)', () => {
   it('G4-L1: one mutation fans out to N site subscribers + adminsRoom with zero loss', async () => {
+    probe('L1:entry');
     const tokens = await spawnFocusUsers(N);
+    probe('L1:users-spawned', { pg: getFileInstanceInfo() });
     const conns: Conn[] = [];
     for (let i = 0; i < tokens.length; i += 50) // connect in waves of 50
       conns.push(...await Promise.all(tokens.slice(i, i + 50).map(connect)));
@@ -87,9 +104,11 @@ describe.skipIf(!PG)('QA G4 load harness (PG)', () => {
     console.log(`G4-L1 N=${N}: loss=${lost} p50=${pct(got, 50)}ms p95=${pct(got, 95)}ms max=${got[got.length - 1]}ms`);
     expect(lost).toBe(0);
     expect(pct(got, 95)).toBeLessThan(2000);
+    probe('L1:exit', { rt: roomsSnapshot(rt.io), http: httpStats() });
   }, 180_000);
 
   it('G4-L2: M concurrent same-event patches -> clean CAS per mutation, gapless version sequence, no lost update', async () => {
+    probe('L2:entry');
     const token = await adminToken();
     const tasks = (await repo.listTasks('e1')).filter(t => !t.locked && t.status !== 'canceled');
     const M = tasks.length; // all unlocked tasks of the event (seed-sized)
@@ -121,11 +140,13 @@ describe.skipIf(!PG)('QA G4 load harness (PG)', () => {
     const pairCodes = pair.map(r => r.statusCode).sort();
     console.log(`G4-L2b same-task race: ${pairCodes}`);
     expect(pairCodes).toEqual([200, 409]);
+    probe('L2:exit');
   }, 60_000);
 
   it('G4-L3: 60s burst digest — K changes x R recipients coalesce to ONE digest per recipient, zero duplicates', async () => {
     // QA-set bar: exactly R provider sends total (one per recipient), each a digest
     // with changeCount = K; closing tick < 5000ms; no per-change sends; tick 3 silent.
+    probe('L3:entry');
     const R = 25, K = 40;
     let clock = Date.parse('2026-09-14T12:00:00+03:00');
     const calls: { to: string; body: string }[] = [];
@@ -165,29 +186,45 @@ describe.skipIf(!PG)('QA G4 load harness (PG)', () => {
     expect(recs3.filter(r => r.status !== 'held')).toEqual([]);
     console.log(`G4-L3 R=${R} K=${K}: seed=${seedMs}ms, closing tick=${closeMs}ms, sends=${calls.length} (1 digest/recipient), batched records=${batched.length}`);
     expect(closeMs).toBeLessThan(5000);
+    probe('L3:exit');
   }, 120_000);
 
   it('G4-L4: thundering-herd reconnect — all N clients reconnect, server stays responsive', async () => {
+    probe('L4:entry', { pg: getFileInstanceInfo() });
     const tokens = await spawnFocusUsers(N);
+    probe('L4:users-spawned', { n: tokens.length, pg: getFileInstanceInfo() });
     const first: Conn[] = [];
-    for (let i = 0; i < tokens.length; i += 50) first.push(...await Promise.all(tokens.slice(i, i + 50).map(connect)));
+    for (let i = 0; i < tokens.length; i += 50) { first.push(...await Promise.all(tokens.slice(i, i + 50).map(connect))); probe('L4:init-wave', { i, total: first.length, rt: roomsSnapshot(rt.io), http: httpStats() }); }
+    probe('L4:initial-connected', { total: first.length, rt: roomsSnapshot(rt.io), http: httpStats() });
     for (const c of first) c.socket.disconnect();
+    probe('L4:initial-disconnected', { rt: roomsSnapshot(rt.io), http: httpStats() });
     const t0 = Date.now();
     const herd: Conn[] = [];
     const waves: Promise<Conn[]>[] = [];
-    for (let i = 0; i < tokens.length; i += 50) waves.push(Promise.all(tokens.slice(i, i + 50).map(connect)));
-    for (const w of waves) herd.push(...await w);
+    for (let i = 0; i < tokens.length; i += 50) { waves.push(Promise.all(tokens.slice(i, i + 50).map(connect))); probe('L4:herd-wave-armed', { i }); }
+    probe('L4:herd-armed', { waves: waves.length });
+    for (const w of waves) { herd.push(...await w); probe('L4:herd-wave-resolved', { total: herd.length, rt: roomsSnapshot(rt.io), http: httpStats() }); }
     const reconnectMs = Date.now() - t0;
+    probe('L4:herd-connected', { reconnectMs, total: herd.length, rt: roomsSnapshot(rt.io), http: httpStats() });
     // server responsive after herd: a mutation still applies and fans out
     const token = await adminToken();
+    probe('L4:admin-token');
     const task = (await repo.listTasks('e1')).find(t => !t.locked && t.status !== 'canceled')!;
+    probe('L4:task-listed', { taskId: task.id, version: task.version });
     const res = await app.inject({ method: 'PATCH', url: `/v1/tasks/${task.id}`, headers: H(token), payload: { version: task.version, patch: { name: `${task.name} · G4-L4` } } });
+    probe('L4:patch-response', { status: res.statusCode });
     expect(res.statusCode).toBe(200);
     const deadline = Date.now() + 15_000;
-    while (Date.now() < deadline && herd.some(c => !c.frames.some(f => f.name === 'graph.patch' && f.at >= t0))) await sleep(100);
+    probe('L4:fanout-wait-start', { deadlineMs: 15_000 });
+    while (Date.now() < deadline && herd.some(c => !c.frames.some(f => f.name === 'graph.patch' && f.at >= t0))) { await sleep(100); probe('L4:fanout-poll'); }
+    probe('L4:fanout-wait-done', { rt: roomsSnapshot(rt.io), http: httpStats() });
     const lost = herd.filter(c => !c.frames.some(f => f.name === 'graph.patch' && f.at >= t0)).length;
     console.log(`G4-L4 N=${N}: herd reconnect=${reconnectMs}ms, post-herd fanout loss=${lost}`);
+    probe('L4:pre-assert', { herdLen: herd.length, lost });
     expect(herd.length).toBe(N);
+    probe('L4:assert-herd-length-ok');
     expect(lost).toBe(0);
+    probe('L4:assert-lost-ok');
+    probe('L4:return');
   }, 180_000);
 });
