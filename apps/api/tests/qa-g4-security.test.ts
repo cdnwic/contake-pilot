@@ -60,7 +60,7 @@ describe('QA-G4-SEC-1: systematic RBAC sweep — focus_worker denied on every mu
     expect((await deniedRows()).length).toBe(beforeDomino);
     // positive control: focus_worker CAN report on an own task (no denied row)
     const beforeReport = (await deniedRows()).length;
-    const rep = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(t), payload: { taskId: 't1', status: 'ok', clientReportId: 'sweep-ok-1', clientTimestamp: new Date().toISOString() } });
+    const rep = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(t), payload: { taskId: 't1', status: 'on_track', clientReportId: 'sweep-ok-1', clientTimestamp: new Date().toISOString() } });
     expect([200, 201]).toContain(rep.statusCode);
     expect((await deniedRows()).length).toBe(beforeReport);
   });
@@ -122,7 +122,7 @@ describe('QA-G4-SEC-3: replay idempotency — a replayed mutation or report neve
 
   it('same clientReportId resubmitted: deduped, one stored report, one applied audit row', async () => {
     const w = auth.issueToken('u-w1');
-    const payload = { taskId: 't1', status: 'ok', clientReportId: 'replay-1', clientTimestamp: new Date().toISOString() };
+    const payload = { taskId: 't1', status: 'on_track', clientReportId: 'replay-1', clientTimestamp: new Date().toISOString() };
     const r1 = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(w), payload });
     const r2 = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(w), payload });
     expect(r1.statusCode).toBe(200);
@@ -146,7 +146,7 @@ describe('QA-G4-SEC-4: cross-org isolation — REST and socket silence', () => {
     expect([403, 404]).toContain(patch.statusCode);
     expect((await repo.getTask('t1'))!.name).not.toBe('x'); // untouched
     // org-2 reporting against an org-1 task: 404 (no existence leak)
-    const rep = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(b), payload: { taskId: 't1', status: 'ok', clientReportId: 'xo-1', clientTimestamp: new Date().toISOString() } });
+    const rep = await app.inject({ method: 'POST', url: '/v1/reports', headers: H(b), payload: { taskId: 't1', status: 'on_track', clientReportId: 'xo-1', clientTimestamp: new Date().toISOString() } });
     expect(rep.statusCode).toBe(404);
     // and the org-1 audit log holds no trace of org-2 attempts beyond denied rows (no applied rows)
     const applied = (await repo.listAudit('org-1')).filter(r => r.outcome !== 'denied' && r.actorUserId === 'u-admin-b');

@@ -6,6 +6,7 @@ import type {
   AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
+import { ReportClientIdConflictError } from './graph-repository.js';
 
 /** In-memory GraphRepository (M1). Atomic batch semantics mirror the future
  *  Postgres transaction: validate everything, then commit (QA AC-DOM-7). */
@@ -275,7 +276,14 @@ export class MemoryGraphRepository implements GraphRepository {
       && (filter.state === undefined || cr.state === filter.state));
   }
 
-  async createReport(r: StatusReport): Promise<StatusReport> { this.reports.set(r.id, r); return r; }
+  async createReport(r: StatusReport): Promise<StatusReport> {
+    if (r.clientReportId) {
+      for (const x of this.reports.values()) {
+        if (x.clientReportId === r.clientReportId) throw new ReportClientIdConflictError();
+      }
+    }
+    this.reports.set(r.id, r); return r;
+  }
   async getReportByClientId(clientReportId: string): Promise<StatusReport | undefined> {
     return [...this.reports.values()].find(r => r.clientReportId === clientReportId);
   }

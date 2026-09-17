@@ -12,6 +12,7 @@ import { appEvents } from './services/events.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
 import { AuthService } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
+import { ReportClientIdConflictError } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
 import { auditDenied, type DenialMeta, audit, deviceClassOf } from './services/audit.js';
 import type { AuditEntityType, Branch, ContentItem, ContentItemVersion, ExternalParty, OptoutSuppression, StatusToken, TaskContentRole, TaskResourceLink } from '@contake/core';
@@ -993,24 +994,99 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
   // ---------- field reports (Focus Mode; dedupe on clientReportId, QA C3) ----------
   app.post('/v1/reports', async (req) => {
     const user = await me(req);
+    const body = (req.body ?? {}) as {
+      taskId?: ID; status?: StatusReport['status']; delayMin?: number; noteHe?: string;
+      clientReportId?: string; clientTimestamp?: string;
+    };
+    // v1.20.2 (QA QM4 2026-09-17): runtime request validation runs BEFORE any
+    // authorization, dedupe or write effect. Invalid input is a 400 with zero
+    // report/audit/job/frame/CR. Bounds are explicit and disclosed:
+    // clientReportId nonblank <= 200 (ULID is 26), noteHe <= 2000,
+    // delayMin a finite integer 1..10080 (one week).
+    const REPORT_CLIENT_ID_MAX = 200;
+    const REPORT_NOTE_MAX = 2000;
+    const DELAY_MIN_MAX = 10080;
+    const REPORT_STATUSES = new Set(['on_track', 'delayed', 'done', 'blocked']);
+    if (!body.taskId || !body.status || !body.clientReportId || !body.clientTimestamp) {
+      fail(400, 'BAD_REQUEST', 'חסרים taskId / status / clientReportId / clientTimestamp');
+    }
+    if (!REPORT_STATUSES.has(body.status)) {
+      fail(400, 'BAD_REQUEST', 'סטטוס לא חוקי');
+    }
+    if (typeof body.clientReportId !== 'string' || body.clientReportId.trim() === '' || body.clientReportId.length > REPORT_CLIENT_ID_MAX) {
+      fail(400, 'BAD_REQUEST', 'מזהה דיווח לא חוקי');
+    }
+    // v1.20.3 (QA QM5 2026-09-17): clientTimestamp must be an offset-bearing
+    // instant (parseInstant). V8's Date.parse accepts floating local/date-only
+    // and NORMALIZES invalid calendar days (2026-02-30 -> Mar 2), so the
+    // day-of-month is guarded against rollover before parsing.
+    if (typeof body.clientTimestamp !== 'string') {
+      fail(400, 'BAD_REQUEST', 'חותמת זמן לא חוקית');
+    }
+    const tsDate = /^(\d{4})-(\d{2})-(\d{2})T/.exec(body.clientTimestamp);
+    const tsDayOk = tsDate
+      ? (() => { const y = +tsDate[1]!, mo = +tsDate[2]!, d = +tsDate[3]!;
+          return mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate(); })()
+      : false;
+    let tsOk = false;
+    if (tsDayOk) { try { parseInstant(body.clientTimestamp); tsOk = true; } catch { tsOk = false; } }
+    if (!tsOk) {
+      fail(400, 'BAD_REQUEST', 'חותמת זמן לא חוקית (נדרש ISO עם אזור זמן)');
+    }
+    if (body.noteHe !== undefined && (typeof body.noteHe !== 'string' || body.noteHe.length > REPORT_NOTE_MAX)) {
+      fail(400, 'BAD_REQUEST', 'הערה ארוכה מדי');
+    }
+    if (body.status === 'delayed') {
+      if (typeof body.delayMin !== 'number' || !Number.isInteger(body.delayMin) || body.delayMin < 1 || body.delayMin > DELAY_MIN_MAX) {
+        fail(400, 'BAD_REQUEST', 'דיווח איחור מחייב delayMin שלם וחיובי (עד 10080)');
+      }
+    } else if (body.delayMin !== undefined) {
+      fail(400, 'BAD_REQUEST', 'delayMin תקף רק לדיווח איחור');
+    }
     if (rawDecision('report.status.create', user.role) === 'deny') {
       fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
         reason: 'matrix_deny', action: 'report.status.create', entityType: 'task', entityId: 'pending', eventId: 'pending',
       });
     }
-    const body = (req.body ?? {}) as {
-      taskId?: ID; status?: StatusReport['status']; delayMin?: number; noteHe?: string;
-      clientReportId?: string; clientTimestamp?: string;
-    };
-    if (!body.taskId || !body.status || !body.clientReportId || !body.clientTimestamp) {
-      fail(400, 'BAD_REQUEST', 'חסרים taskId / status / clientReportId / clientTimestamp');
-    }
-    const existing = await repo.getReportByClientId(body.clientReportId);
-    if (existing) return { report: existing, deduped: true };
+    // v1.20.2 (QA QM3 2026-09-17): task resolution, same-org binding and
+    // per-role scope authorization run BEFORE any idempotent replay, so a
+    // clientReportId can never become a cross-tenant read oracle.
     const task = await repo.getTask(body.taskId);
     if (!task) fail(404, 'NOT_FOUND', 'המשימה לא נמצאה');
     const snapshot = await repo.snapshot(task.eventId);
     if (!snapshot || snapshot.event.orgId !== user.orgId) fail(404, 'NOT_FOUND', 'המשימה לא נמצאה');
+    // All statuses: FM is limited to in-scope sites (matching the list route),
+    // FW to their own assignment; admin passes on same-org binding above.
+    if (user.role === 'field_manager' && !taskInScope(user, task.eventId, task.siteId)) {
+      fail(403, 'FORBIDDEN', 'לא ניתן לדווח על משימה מחוץ לתחום', {
+        reason: 'scope_violation', action: 'report.status.create', entityType: 'task', entityId: task.id, eventId: task.eventId,
+      });
+    }
+    if (user.role === 'focus_worker' && (!user.linkedResourceId || !task.assigneeResourceIds.includes(user.linkedResourceId))) {
+      fail(403, 'FORBIDDEN', 'לא ניתן לדווח על משימה שלא משובצת אליך', {
+        reason: 'scope_violation', action: 'report.status.create', entityType: 'task', entityId: task.id, eventId: task.eventId,
+      });
+    }
+    // Tenant/actor-safe idempotency: an exact same-actor replay returns the
+    // existing report with no effects; any other collision (changed
+    // task/payload, different actor, different org) is a 409 with a conflict
+    // audit in the ATTEMPTING org and no leak of the stored row.
+    const conflictAudit = () => audit(repo, {
+      orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
+      action: 'report.status.create', entityType: 'task', entityId: task.id,
+      after: { outcome: 'conflict', reason: 'client_report_id_taken' }, deviceClass: deviceClassOf(ua(req)),
+    });
+    const replayOrConflict = async (existing: StatusReport): Promise<{ report: StatusReport; deduped: true }> => {
+      const samePayload = existing.taskId === task.id && existing.status === body.status
+        && (existing.delayMin ?? undefined) === (body.delayMin ?? undefined)
+        && (existing.noteHe ?? undefined) === (body.noteHe ?? undefined)
+        && existing.clientTimestamp === body.clientTimestamp;
+      if (existing.reportedBy === user.userId && samePayload) return { report: existing, deduped: true };
+      await conflictAudit();
+      return fail(409, 'REPORT_CONFLICT', 'כבר קיים דיווח עם מזהה זה');
+    };
+    const existing = await repo.getReportByClientId(body.clientReportId);
+    if (existing) return replayOrConflict(existing);
 
     const report: StatusReport = {
       id: newId('rep'),
@@ -1040,13 +1116,14 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       }
       delayed = { change, domino, decision };
     }
-    const outcome = await withAuditSafety(repo, async () => {
+    let outcome: { report: StatusReport; applied?: { domino: DominoResult }; changeRequest?: ChangeRequest };
+    try {
+    outcome = await withAuditSafety(repo, async () => {
       await repo.createReport(report);
       await audit(repo, {
         orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
         action: 'report.status.create', entityType: 'task', entityId: task.id, after: report, deviceClass: deviceClassOf(ua(req)),
       });
-      appEvents.emit({ type: 'report.new', report, eventId: task.eventId, siteId: task.siteId });
 
       // v1.20.2 §26.1ב: a blocked field report raises its manager-surface job
       // ATOMICALLY with the report + audit (same tx). Recipients are verified:
@@ -1084,6 +1161,19 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       });
       return { report, changeRequest: cr };
     });
+    } catch (e) {
+      // Durable-uniqueness race: another request won this clientReportId
+      // mid-transaction; our tx rolled back fully - resolve against the winner.
+      if (e instanceof ReportClientIdConflictError) {
+        const winner = await repo.getReportByClientId(body.clientReportId!);
+        if (winner) return replayOrConflict(winner);
+      }
+      throw e;
+    }
+    // QA QM4: frames publish ONLY after the write unit commits - a rolled-back
+    // transaction can never leak a ghost report.new (same post-commit rule as
+    // change.pending below).
+    appEvents.emit({ type: 'report.new', report, eventId: task.eventId, siteId: task.siteId });
     // TL pinned semantic: a report-originated escalated CR mirrors proposeMutation —
     // admins see change.pending in realtime AND get the admin-only approval-needed job.
     if ('changeRequest' in outcome) {
@@ -1990,6 +2080,12 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const reports: (StatusReport & { readAt?: string })[] = [];
     for (const e of events) {
       for (const r of await repo.listReports(e.id)) {
+        // v1.20.2 §21.1א (QA pre-adjudication 2026-09-17): list visibility is
+        // task/site-scoped, matching mark-read. Event-level admission alone
+        // leaked other-site reports to site-scoped FMs in multi-site events.
+        // An unresolvable task is fail-closed for every role.
+        const task = await repo.getTask(r.taskId);
+        if (!task || !taskInScope(user, e.id, task.siteId)) continue;
         if (status && r.status !== status) continue;
         const readAt = readAtByReport.get(r.id);
         if (unread === 'true' && readAt) continue;
