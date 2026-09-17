@@ -67,6 +67,12 @@ export class MemoryGraphRepository implements GraphRepository {
 
   // whitelist onboarding (v1.18 §15)
   async upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry> { this.whitelist.set(e.phone, e); return e; }
+  async createWhitelistInvite(e: WhitelistEntry): Promise<{ outcome: 'created' | 'exists'; entry: WhitelistEntry }> {
+    const existing = this.whitelist.get(e.phone);
+    if (existing) return { outcome: 'exists', entry: existing };
+    this.whitelist.set(e.phone, e);
+    return { outcome: 'created', entry: e };
+  }
   async getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined> { return this.whitelist.get(phone); }
   /** QA round-7: per-phone promise-chain mutex. EVERY whitelist mutation
    *  (invite, register CAS, approve, reject) runs through it, so a mutation

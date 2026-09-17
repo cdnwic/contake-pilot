@@ -206,6 +206,21 @@ export class PostgresGraphRepository implements GraphRepository {
       [e.phone, e.orgId, e.status, JSON.stringify(e)]);
     return e;
   }
+  /** QA 2026-09-17 (register exactly-one-winner): create-only invite.
+   *  Plain INSERT ... ON CONFLICT DO NOTHING - a concurrent winner's
+   *  committed row makes the loser's insert match zero rows; NO overwrite,
+   *  never a silent cross-org success (T2 defect class). Deterministic. */
+  async createWhitelistInvite(e: WhitelistEntry): Promise<{ outcome: 'created' | 'exists'; entry: WhitelistEntry }> {
+    const r = await this.q(
+      `INSERT INTO whitelist_entries(phone, org_id, status, data) VALUES($1,$2,$3,$4)
+       ON CONFLICT (phone) DO NOTHING RETURNING data`,
+      [e.phone, e.orgId, e.status, JSON.stringify(e)]);
+    const won = r.rows[0];
+    if (won) return { outcome: 'created', entry: won['data'] as WhitelistEntry };
+    const existing = await this.getWhitelistEntry(e.phone);
+    if (!existing) throw new Error('createWhitelistInvite: row vanished between insert and read');
+    return { outcome: 'exists', entry: existing };
+  }
   async getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined> {
     const r = await this.q(`SELECT data FROM whitelist_entries WHERE phone=$1 LIMIT 1`, [phone]);
     return r.rows[0]?.['data'] as WhitelistEntry | undefined;

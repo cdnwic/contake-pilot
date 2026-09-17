@@ -205,27 +205,66 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     const { phone } = (req.body ?? {}) as { phone?: string };
     if (!phone) fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
     wlDeny(user, 'whitelist.invite', phone);
-    // Round 8: the WHOLE invite mutation runs as one repository transition -
-    // memory per-phone mutex / PG one tx holding the row. It can never
-    // interleave a paused or rolling-back registration for the same phone.
-    const invited = await repo.withWhitelistMutation(phone, async (before) => {
+    // Register exactly-one-winner (QA 2026-09-17, T2 defect fix): the create
+    // path uses the invite-only atomic primitive (plain INSERT, never an
+    // overwrite). Explicit outcomes:
+    //   created   - this invite won the row; whitelist.invite audit in the same tx.
+    //   reinvited - SAME-ORG existing row: §15 reset to invited, decision fields
+    //               cleared, createdAt preserved. Deterministic and idempotent
+    //               under repetition (same final state on every repeat).
+    //   conflict  - 409: the phone's row belongs to a DIFFERENT org (pre-existing
+    //               or a concurrent create won it). NO overwrite, the row is
+    //               never touched, and a conflict audit row is written in the
+    //               ATTEMPTING org only; the response reveals nothing about the
+    //               other org. Same-org concurrent loser: the winner's row
+    //               already carries exactly this request's effect - idempotent
+    //               success, no further write.
+    type InviteResult = { outcome: 'conflict' } | { outcome: 'created' | 'reinvited'; entry: WhitelistEntry };
+    const result: InviteResult = await repo.withWhitelistMutation(phone, async (before): Promise<InviteResult> => {
       const now = new Date().toISOString();
-      // Upsert: re-invite resets to invited and clears decision fields (§15).
+      const conflictAudit = () => audit(repo, {
+        orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+        action: 'whitelist.invite', entityType: 'whitelist_entry', entityId: phone,
+        after: { outcome: 'conflict', reason: 'phone_registered_other_org' }, deviceClass: deviceClassOf(ua(req)),
+      });
+      if (before && before.orgId !== user.orgId) {
+        await conflictAudit();
+        return { outcome: 'conflict' };
+      }
       const entry: WhitelistEntry = { phone, status: 'invited', orgId: user.orgId, createdAt: before?.createdAt ?? now };
-      await withAuditSafety(repo, async () => {
-        await repo.upsertWhitelistEntry(entry);
+      if (before) {
+        await withAuditSafety(repo, async () => {
+          await repo.upsertWhitelistEntry(entry);
+          await audit(repo, {
+            orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
+            action: 'whitelist.invite', entityType: 'whitelist_entry', entityId: phone,
+            before, after: entry, deviceClass: deviceClassOf(ua(req)),
+          });
+        });
+        return { outcome: 'reinvited', entry };
+      }
+      const createRes = await withAuditSafety(repo, async () => {
+        const res = await repo.createWhitelistInvite(entry);
+        if (res.outcome !== 'created') return res;
         await audit(repo, {
           orgId: user.orgId, eventId: 'pending', actorUserId: user.userId, role: user.role,
           action: 'whitelist.invite', entityType: 'whitelist_entry', entityId: phone,
-          before, after: entry, deviceClass: deviceClassOf(ua(req)),
+          after: entry, deviceClass: deviceClassOf(ua(req)),
         });
+        return res;
       });
-      return entry;
+      if (createRes.outcome === 'created') return { outcome: 'created', entry };
+      if (createRes.entry.orgId !== user.orgId) {
+        await conflictAudit();
+        return { outcome: 'conflict' };
+      }
+      return { outcome: 'reinvited', entry: createRes.entry };
     });
+    if (result.outcome === 'conflict') fail(409, 'WHITELIST_CONFLICT', 'המספר כבר רשום במערכת');
     // Emit AFTER the transition unit resolves - post-commit on PG, so a
     // rolled-back transaction can never publish phantom state (hardening note).
-    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry: invited });
-    return invited;
+    appEvents.emit({ type: 'whitelist.updated', orgId: user.orgId, entry: result.entry });
+    return result.entry;
   });
 
   app.get('/v1/whitelist', async (req) => {

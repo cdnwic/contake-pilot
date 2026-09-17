@@ -139,6 +139,14 @@ export interface GraphRepository {
   // whitelist onboarding (contracts v1.18 §15): one row per phone, globally unique.
   /** Upsert on phone - invite reset and seed share this path (idempotent). */
   upsertWhitelistEntry(e: WhitelistEntry): Promise<WhitelistEntry>;
+  /** Create/invite-only atomic primitive (QA 2026-09-17, register
+   *  exactly-one-winner): plain INSERT semantics - NEVER overwrites an
+   *  existing row. Explicit outcome: 'created' = this call won the row;
+   *  'exists' = a row was already there (concurrent loser or pre-existing);
+   *  callers classify tenant-safety by the returned entry's orgId. Runs
+   *  inside the caller's withWhitelistMutation unit (PG: same tx).
+   *  upsertWhitelistEntry stays for the decide/registration CAS paths. */
+  createWhitelistInvite(e: WhitelistEntry): Promise<{ outcome: 'created' | 'exists'; entry: WhitelistEntry }>;
   getWhitelistEntry(phone: string): Promise<WhitelistEntry | undefined>;
   /** QA round-5 CAS registration primitive: atomically transition ONLY a
    *  status='invited' entry and append the committed auth_audit row for the
