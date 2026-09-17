@@ -994,17 +994,45 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
   // ---------- field reports (Focus Mode; dedupe on clientReportId, QA C3) ----------
   app.post('/v1/reports', async (req) => {
     const user = await me(req);
-    if (rawDecision('report.status.create', user.role) === 'deny') {
-      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
-        reason: 'matrix_deny', action: 'report.status.create', entityType: 'task', entityId: 'pending', eventId: 'pending',
-      });
-    }
     const body = (req.body ?? {}) as {
       taskId?: ID; status?: StatusReport['status']; delayMin?: number; noteHe?: string;
       clientReportId?: string; clientTimestamp?: string;
     };
+    // v1.20.2 (QA QM4 2026-09-17): runtime request validation runs BEFORE any
+    // authorization, dedupe or write effect. Invalid input is a 400 with zero
+    // report/audit/job/frame/CR. Bounds are explicit and disclosed:
+    // clientReportId nonblank <= 200 (ULID is 26), noteHe <= 2000,
+    // delayMin a finite integer 1..10080 (one week).
+    const REPORT_CLIENT_ID_MAX = 200;
+    const REPORT_NOTE_MAX = 2000;
+    const DELAY_MIN_MAX = 10080;
+    const REPORT_STATUSES = new Set(['on_track', 'delayed', 'done', 'blocked']);
     if (!body.taskId || !body.status || !body.clientReportId || !body.clientTimestamp) {
       fail(400, 'BAD_REQUEST', 'חסרים taskId / status / clientReportId / clientTimestamp');
+    }
+    if (!REPORT_STATUSES.has(body.status)) {
+      fail(400, 'BAD_REQUEST', 'סטטוס לא חוקי');
+    }
+    if (typeof body.clientReportId !== 'string' || body.clientReportId.trim() === '' || body.clientReportId.length > REPORT_CLIENT_ID_MAX) {
+      fail(400, 'BAD_REQUEST', 'מזהה דיווח לא חוקי');
+    }
+    if (typeof body.clientTimestamp !== 'string' || !Number.isFinite(Date.parse(body.clientTimestamp))) {
+      fail(400, 'BAD_REQUEST', 'חותמת זמן לא חוקית');
+    }
+    if (body.noteHe !== undefined && (typeof body.noteHe !== 'string' || body.noteHe.length > REPORT_NOTE_MAX)) {
+      fail(400, 'BAD_REQUEST', 'הערה ארוכה מדי');
+    }
+    if (body.status === 'delayed') {
+      if (typeof body.delayMin !== 'number' || !Number.isInteger(body.delayMin) || body.delayMin < 1 || body.delayMin > DELAY_MIN_MAX) {
+        fail(400, 'BAD_REQUEST', 'דיווח איחור מחייב delayMin שלם וחיובי (עד 10080)');
+      }
+    } else if (body.delayMin !== undefined) {
+      fail(400, 'BAD_REQUEST', 'delayMin תקף רק לדיווח איחור');
+    }
+    if (rawDecision('report.status.create', user.role) === 'deny') {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'report.status.create', entityType: 'task', entityId: 'pending', eventId: 'pending',
+      });
     }
     // v1.20.2 (QA QM3 2026-09-17): task resolution, same-org binding and
     // per-role scope authorization run BEFORE any idempotent replay, so a
@@ -1082,7 +1110,6 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
         orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
         action: 'report.status.create', entityType: 'task', entityId: task.id, after: report, deviceClass: deviceClassOf(ua(req)),
       });
-      appEvents.emit({ type: 'report.new', report, eventId: task.eventId, siteId: task.siteId });
 
       // v1.20.2 §26.1ב: a blocked field report raises its manager-surface job
       // ATOMICALLY with the report + audit (same tx). Recipients are verified:
@@ -1129,6 +1156,10 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       }
       throw e;
     }
+    // QA QM4: frames publish ONLY after the write unit commits - a rolled-back
+    // transaction can never leak a ghost report.new (same post-commit rule as
+    // change.pending below).
+    appEvents.emit({ type: 'report.new', report, eventId: task.eventId, siteId: task.siteId });
     // TL pinned semantic: a report-originated escalated CR mirrors proposeMutation —
     // admins see change.pending in realtime AND get the admin-only approval-needed job.
     if ('changeRequest' in outcome) {

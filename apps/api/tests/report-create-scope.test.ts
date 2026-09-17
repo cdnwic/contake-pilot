@@ -160,3 +160,97 @@ describe('POST /v1/reports tenant/actor-safe idempotency', () => {
     expect(results.filter(r => r.json().deduped).length).toBe(3);
   });
 });
+
+describe('POST /v1/reports runtime request validation (QM4)', () => {
+  const expectClean400 = async (label: string, payload: Record<string, unknown>) => {
+    const { frames, un } = watchFrames();
+    const auditsBefore = (await repo.listAudit('org-1')).length;
+    const r = await create(await fm(), payload);
+    expect(r.statusCode, label).toBe(400);
+    expect((await repo.listReports('e2')).length, label).toBe(0);
+    expect((await repo.listAudit('org-1')).length, label).toBe(auditsBefore);
+    expect((await repo.listNotificationJobs('e2')).length, label).toBe(0);
+    expect(await repo.listChangeRequests('e2'), label).toHaveLength(0);
+    expect(frames, label).toHaveLength(0);
+    un();
+  };
+  const base = { taskId: 'ta1', status: 'blocked', clientReportId: 'v-1', clientTimestamp: TS };
+
+  it('status enum enforced', async () => {
+    await expectClean400('unknown status', { ...base, status: 'stuck' });
+    await expectClean400('empty status', { ...base, status: '' });
+  });
+  it('clientTimestamp must be a valid date', async () => {
+    await expectClean400('garbage ts', { ...base, clientTimestamp: 'not-a-date' });
+    await expectClean400('numeric ts', { ...base, clientTimestamp: 12345 });
+  });
+  it('delayed requires finite positive integer delayMin (max 10080); delayMin rejected on other statuses', async () => {
+    await expectClean400('delayed without delayMin', { ...base, status: 'delayed' });
+    await expectClean400('delayMin 0', { ...base, status: 'delayed', delayMin: 0 });
+    await expectClean400('delayMin -5', { ...base, status: 'delayed', delayMin: -5 });
+    await expectClean400('delayMin 1.5', { ...base, status: 'delayed', delayMin: 1.5 });
+    await expectClean400('delayMin NaN', { ...base, status: 'delayed', delayMin: NaN });
+    await expectClean400('delayMin Infinity', { ...base, status: 'delayed', delayMin: Infinity });
+    await expectClean400('delayMin 10081', { ...base, status: 'delayed', delayMin: 10081 });
+    await expectClean400('delayMin on done', { ...base, status: 'done', delayMin: 5 });
+    await expectClean400('delayMin on blocked', { ...base, status: 'blocked', delayMin: 5 });
+    await expectClean400('delayMin on on_track', { ...base, status: 'on_track', delayMin: 5 });
+  });
+  it('clientReportId bounded nonblank; note bounded', async () => {
+    await expectClean400('blank id', { ...base, clientReportId: '   ' });
+    await expectClean400('201-char id', { ...base, clientReportId: 'x'.repeat(201) });
+    await expectClean400('2001-char note', { ...base, noteHe: 'נ'.repeat(2001) });
+  });
+  it('valid semantics stay green: on_track 200, delayed+valid delayMin 200 (CR path), done 200', async () => {
+    const t = await fm();
+    expect((await create(t, { taskId: 'ta1', status: 'on_track', clientReportId: 'v-ok-1', clientTimestamp: TS })).statusCode).toBe(200);
+    expect((await create(t, { taskId: 'ta1', status: 'done', clientReportId: 'v-ok-2', clientTimestamp: TS })).statusCode).toBe(200);
+    const delayed = await create(t, { taskId: 'ta1', status: 'delayed', delayMin: 10080, clientReportId: 'v-ok-3', clientTimestamp: TS });
+    expect(delayed.statusCode).toBe(200);
+    expect((await repo.listReports('e2')).length).toBe(3);
+  });
+});
+
+describe('POST /v1/reports ghost-frame safety (QM4)', () => {
+  it('blocked-job write fault -> 500, zero persisted report/audit/job/CR and ZERO report.new frames', async () => {
+    const t = await fm();
+    const { frames, un } = watchFrames();
+    const original = repo.createNotificationJob.bind(repo);
+    repo.createNotificationJob = () => { throw new Error('job store down'); };
+    const r = await create(t, blocked('ta1', 'ghost-1'));
+    repo.createNotificationJob = original;
+    expect(r.statusCode).toBe(500);
+    expect(await repo.getReportByClientId('ghost-1')).toBeUndefined();
+    expect((await repo.listReports('e2')).length).toBe(0);
+    expect((await repo.listAudit('org-1')).filter(x => x.action === 'report.status.create').length).toBe(0);
+    expect(await blockedJobs('e2')).toHaveLength(0);
+    expect(frames).toHaveLength(0);
+    un();
+  });
+
+  it('delayed-path CR write fault -> 500: no report.new, no change.pending, no approval job, no CR', async () => {
+    const t = await fm();
+    const frames: AppEvent[] = [];
+    const un = appEvents.subscribe(e => { if (e.type === 'report.new' || e.type === 'change.pending') frames.push(e); });
+    const original = repo.createChangeRequest.bind(repo);
+    repo.createChangeRequest = () => { throw new Error('cr store down'); };
+    const r = await create(t, { taskId: 'ta1', status: 'delayed', delayMin: 90, clientReportId: 'ghost-2', clientTimestamp: TS });
+    repo.createChangeRequest = original;
+    expect(r.statusCode).toBe(500);
+    expect(await repo.getReportByClientId('ghost-2')).toBeUndefined();
+    expect(await repo.listChangeRequests('e2')).toHaveLength(0);
+    expect((await repo.listNotificationJobs('e2')).filter(j => j.kind === 'change_needs_approval')).toHaveLength(0);
+    expect(frames).toHaveLength(0);
+    un();
+  });
+
+  it('adapter enforces clientReportId uniqueness durably (both lanes)', async () => {
+    const mk = (id: string) => ({
+      id, clientReportId: 'dup-adapter', taskId: 'ta1', reportedBy: 'u-w1', status: 'blocked' as const,
+      clientTimestamp: TS, createdAt: TS,
+    });
+    await repo.createReport(mk('r-first'));
+    await expect(repo.createReport(mk('r-second'))).rejects.toMatchObject({ name: 'ReportClientIdConflictError' });
+    expect((await repo.listReports('e2')).length).toBe(1);
+  });
+});
