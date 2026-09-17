@@ -1,0 +1,17 @@
+{
+  "action": "release-safety hold: autoDeploy OFF on staging+prod (TL release-safety ruling v1.0 + addendum, parent-authorized 2026-09-17 03:08 IDT; settings-only scope, no merge, no deploy)",
+  "executed_at": "2026-09-17T03:08:43+03:00",
+  "method": "Render API PATCH /v1/services/{id} {autoDeploy: no}, HTTP 200 both; write lease L-4tuekmphlye6ladraapekrilsu; vault-injected key never exposed",
+  "before": {
+    "staging": "yes|main|dep-dak9apek1f9s73cfhoag|a32d1c06e062c55941a9b544aab52f404f358eeb|live",
+    "prod": "yes|main|dep-dalgntuk1f9s7386s4ag|ea02ba0064375c8cd00294f205e5aa4acc963b77|live",
+    "_format": "autoDeploy|branch|live_deploy|live_commit|live_status"
+  },
+  "after": {
+    "staging": "no|main|dep-dak9apek1f9s73cfhoag|a32d1c06e062c55941a9b544aab52f404f358eeb|live",
+    "prod": "no|main|dep-dalgntuk1f9s7386s4ag|ea02ba0064375c8cd00294f205e5aa4acc963b77|live"
+  },
+  "verified": "re-read via GET after PATCH: autoDeploy=no on both; live deploys and SHAs unchanged",
+  "hold_rule": "autoDeploy stays OFF until explicit TL-approved release plan; repeat protocol for any future merge to main",
+  "provenance_note": "Corrected 2026-09-17 03:13 IDT (TL): top-level before values fixed to the true pre-mutation state (autoDeploy=yes); workaround field removed. Originally received hash daedf7c9 (QA-observed). Authority references are reported provenance: parent instruction 2026-09-17 03:08 IDT + TL release-safety ruling v1.0; this file grants no authority."
+}

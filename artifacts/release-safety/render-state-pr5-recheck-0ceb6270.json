@@ -1,0 +1,10 @@
+{
+  "checked_at": "2026-09-17T03:07:13+03:00",
+  "source": "Render API read lease L-gz3sxumu4kt6k2hljqxsup5rvi, vault-injected key, never exposed",
+  "staging": { "service": "srv-dak86d15efls73d1r6gg", "name": "contake-api-staging", "branch": "main", "autoDeploy": "yes", "suspended": "not_suspended", "live_deploy": "dep-dak9apek1f9s73cfhoag", "live_commit": "a32d1c06e062c55941a9b544aab52f404f358eeb", "finished": "2026-09-15T00:47:38.796657Z", "behind_origin_main": 3 },
+  "prod": { "service": "srv-dajej6gjo6nc73dien70", "name": "contake-api", "branch": "main", "autoDeploy": "yes", "suspended": "not_suspended", "live_deploy": "dep-dalgntuk1f9s7386s4ag", "live_commit": "ea02ba0", "live_commit_full_line": "QA staging (TL-approved 2026-09-14)", "finished": "2026-09-16T21:37:59.759958Z", "behind_origin_main": 15 },
+  "origin_main": "ef65394d736d420dec489e59012293ca2dde915a",
+  "anomaly": "both services autoDeploy=yes on main, yet origin/main received 3+ pushes (evidence commits Sep 15-16) with NO auto deploys triggered on either service since Sep 15 00:46 (staging, api-triggered) / Sep 16 21:37 (prod, api-triggered ea02ba0 deploy prod deploy Sep 16 21:37 was itself api-triggered at an old commit while main was already ahead, so push-to-deploy hook appears not to be firing, or autoDeploy was toggled)",
+  "demo_window_grounded": false,
+  "demo_window_evidence": "no parent-confirmed window; no calendar event; only WhatsApp concept video 2026-09-16 22:20 (contake-pulse-concept-demo) - not a scheduling commitment"
+}
