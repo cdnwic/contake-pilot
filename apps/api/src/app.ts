@@ -9,6 +9,7 @@ import {
   rawDecision, renderInstant, computeDomino, wouldCreateCycle, PROFILES_VERSION,
 } from '@contake/core';
 import { appEvents } from './services/events.js';
+import { createDispatcher, memoryDispatchState, type MessageProvider } from './services/dispatch.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
 import { AuthService } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
@@ -64,7 +65,19 @@ export function filteredGraph(snapshot: GraphSnapshot, user: UserRecord): GraphS
 }
 
 export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInstance {
+
+
   const app = Fastify({ logger: false });
+
+  // G2: app-level shared dispatch state + inbound-only dispatcher so the §25
+  // webhook's STOP path flows through the existing handleInboundStop (ND-5)
+  // and its suppression is visible to send-side dispatchers sharing the store.
+  const dispatchState = memoryDispatchState();
+  const inertProvider = (name: 'whatsapp' | 'sms'): MessageProvider => ({
+    name, send: () => Promise.resolve({ ok: false as const, retryable: false, error: 'inbound-only dispatcher' }),
+  });
+  const inboundDispatch = createDispatcher({ repo, providers: { whatsapp: inertProvider('whatsapp'), sms: inertProvider('sms') }, state: dispatchState });
+  app.decorate('dispatchState', dispatchState);
 
   // Pre-publish deploy-prep: CORS is opt-in via CORS_ORIGIN (comma-separated
   // allowed origins). Env absent -> no CORS headers at all (same-origin only),
@@ -2239,6 +2252,13 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       await recordWebhook({ handled: 1, _ctx: { suppressionId: suppression.id, optOutAt: suppression.createdAt } });
       return { handled: 1 };
     }
+    // G2 (carried onto the post-merge tree): every remaining STOP path below
+    // ALSO flows through the dispatcher's existing handleInboundStop (ND-5):
+    // modelled channel -> optedOut=true; unmodelled staff number -> suppression
+    // in the shared DispatchStateStore, blocking subsequent sends by send-side
+    // dispatchers sharing the store. The v1.20.2 durable consent/suppression
+    // machinery and channel.optout audit taxonomy below are unchanged.
+    await inboundDispatch.handleInboundStop(body.from);
     if (party && party.consent.status !== 'revoked') {
       const before = party.consent;
       const after = { status: 'revoked' as const, at: receivedAt };
