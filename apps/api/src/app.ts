@@ -1159,6 +1159,13 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
         orgId: user.orgId, eventId: task.eventId, actorUserId: user.userId, role: user.role,
         action: 'report.status.create', entityType: 'change_request', entityId: cr.id, after: cr, deviceClass: deviceClassOf(ua(req)),
       });
+      // v1.20.3 (QA Alpha 2026-09-17): the change_needs_approval job is written
+      // IN THE SAME TRANSACTION as the report + CR + audit (durable outbox).
+      // Previously it was written post-commit: a job-store failure left
+      // report+CR committed with no approval job, and an exact replay deduped
+      // without restoring it - the escalation was permanently lost. Same job
+      // shape, same idempotencyKey; recordJobs dedupes inside the tx.
+      await recordJobs(repo, [await buildApprovalNeededJob({ repo, event: snapshot.event, profile: getProfile(snapshot.event.domainProfileId), changeRequestId: cr.id, summaryHe: cr.dominoResult.summaryHe })]);
       return { report, changeRequest: cr };
     });
     } catch (e) {
@@ -1176,10 +1183,11 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     appEvents.emit({ type: 'report.new', report, eventId: task.eventId, siteId: task.siteId });
     // TL pinned semantic: a report-originated escalated CR mirrors proposeMutation —
     // admins see change.pending in realtime AND get the admin-only approval-needed job.
+    // QA Alpha: the job itself is now durable (written in the tx above); only the
+    // realtime frame remains post-commit.
     if ('changeRequest' in outcome) {
       const cr = outcome.changeRequest as ChangeRequest;
       appEvents.emit({ type: 'change.pending', changeRequest: cr });
-      await recordJobs(repo, [await buildApprovalNeededJob({ repo, event: snapshot.event, profile: getProfile(snapshot.event.domainProfileId), changeRequestId: cr.id, summaryHe: cr.dominoResult.summaryHe })]);
     }
     return outcome;
   });
