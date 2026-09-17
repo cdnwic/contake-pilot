@@ -22,3 +22,6 @@ Disposition:
    reproducibility and requires re-running all gates + pixel QA, so it is a separate TL decision,
    not folded into this recovery checkpoint.
 3. Runtime bundle contents verified: vite/vitest/esbuild code is NOT in dist/ (build tooling only).
+
+Enforcement (2026-09-17, QA conditional-PASS tracking item): dev/preview scripts now bind
+127.0.0.1 explicitly (--host 127.0.0.1); vite/vitest UI must never run on a routable interface.

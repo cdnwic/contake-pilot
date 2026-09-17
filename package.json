@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build && cp dist/index.html dist/200.html",
     "test": "vitest run",
-    "preview": "vite preview"
+    "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.59.0",

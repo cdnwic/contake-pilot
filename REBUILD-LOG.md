@@ -194,3 +194,14 @@ Logged per controlled-rebuild ruling; no runtime impact. tsc back to EXIT 0.
 GATES after clean npm ci (log qa/logs/npm-ci-r3.log): tsc EXIT 0; vitest 29/29 (5 files); build EXIT 0
 (dist/fonts 9 files); console smoke clean ×3; asset smoke PASS. Test fix logged: education test
 uses beforeStart!==afterStart (Impact has impactClass, no 'kind').
+
+## 2026-09-17 11:58 — Independent QA verdict: conditional technical PASS (all 5 correction classes)
+QA PASSes all five correction classes on exact transferred tree 4e4c93c8 / tree a74f86cc57676f6a1d49ffbe13feb8efa592a0ed.
+Status: conditional technical PASS pending remote anchoring. Visual/design/phone-review/demo/release
+and staging remain UNAPPROVED. No staging/live smoke.
+Recorded exact wording (QA via parent 11:58:25): "build is exit-clean, not warning-clean, because
+public font paths still emit transform warnings though dist delivery passed strict MIME/body/magic smoke."
+Tracking items: (a) full OFL license-text packaging before distribution — DONE in this commit
+(OFL-Heebo.txt, OFL-IBMPlexMono.txt); (b) localhost-only dev/test tooling enforcement — DONE in this
+commit (dev/preview scripts pinned --host 127.0.0.1, SECURITY-DISPOSITION updated).
+This commit is docs+license+hardening only; the QA-passed code tree remains 4e4c93c8/a74f86cc.

@@ -21,3 +21,6 @@ f1f7cfaef59431c7b391df81fb05520273303840bbe917213a2ab9f41b839675  public/fonts/H
 50dae2e12dae22c920388023e35aaebcd1e1d27bbe915c83d64210377e083e60  public/fonts/Heebo-700-latin.woff2
 08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7  public/fonts/IBMPlexMono-400-latin.woff2
 01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22  public/fonts/IBMPlexMono-500-latin.woff2
+
+Full OFL 1.1 license texts packaged (QA conditional-PASS tracking item, 2026-09-17):
+OFL-Heebo.txt (google/fonts ofl/heebo/OFL.txt), OFL-IBMPlexMono.txt (google/fonts ofl/ibmplexmono/OFL.txt).
