@@ -3,7 +3,7 @@
  *  isolation, deny matrix, session stop + token revocation, audit trail. */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Fail-closed allowlist (QA stop-ship): tests opt in explicitly.
-vi.hoisted(() => { process.env['CONTAKE_SUPER_ADMIN_PHONES'] = '+972587700852'; });
+vi.hoisted(() => { process.env['CONTAKE_SUPER_ADMIN_PHONES'] = '+15550100001'; });
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AuthService, SUPER_ADMIN_PHONES } from '../src/auth.js';
@@ -23,7 +23,7 @@ const otpLogin = async (phone: string): Promise<string> => {
   expect(res.statusCode).toBe(200);
   return res.json().token as string;
 };
-const superToken = (): Promise<string> => otpLogin('+972587700852');
+const superToken = (): Promise<string> => otpLogin('+15550100001');
 
 const whoami = async (token: string) => {
   const res = await app.inject({ method: 'GET', url: '/v1/whoami', headers: H(token) });
@@ -38,7 +38,7 @@ beforeEach(async () => {
 
 describe('super admin enrollment', () => {
   it('enrolls the verified owner phone directly as the real Super Admin identity', async () => {
-    expect(SUPER_ADMIN_PHONES).toContain('+972587700852');
+    expect(SUPER_ADMIN_PHONES).toContain('+15550100001');
     const token = await superToken();
     const { status, body } = await whoami(token);
     expect(status).toBe(200);

@@ -5,7 +5,7 @@ import type {
   ResourceNode, StatusReport, StatusToken, TaskNode, TaskResourceLink,
   WhitelistEntry, WhitelistStatus, AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
-import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
+import type { ChannelRecord, GraphRepository, ImpersonationEndState, ImpersonationSessionPage, SeedData, UserRecord } from './graph-repository.js';
 import { ReportClientIdConflictError } from './graph-repository.js';
 import type { DispatchStateStore } from '../services/dispatch.js';
 import type { AuthAuditEntry, OtpCodeEntry, OtpStateStore, OtpVerifyState } from '../auth.js';
@@ -89,6 +89,7 @@ CREATE INDEX IF NOT EXISTS tasks_event_id ON tasks(event_id);
 CREATE INDEX IF NOT EXISTS resources_event_id ON resources(event_id);
 CREATE INDEX IF NOT EXISTS channels_address ON channels(address);
 CREATE UNIQUE INDEX IF NOT EXISTS reports_client_report_id_unique ON reports(client_report_id);
+CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL;
 CREATE INDEX IF NOT EXISTS notification_jobs_idem ON notification_jobs(idempotency_key);
 CREATE INDEX IF NOT EXISTS audit_log_org_id ON audit_log(org_id);
 CREATE INDEX IF NOT EXISTS change_requests_event_id ON change_requests(event_id);
@@ -165,11 +166,17 @@ export class PostgresGraphRepository implements GraphRepository {
 
   // ---- users & channels -----------------------------------------------------
   async createUser(u: UserRecord): Promise<UserRecord> {
+    // QA lifecycle gate (2026-09-17): storage-level UNIQUE NORMALIZED phone
+    // (users_phone_unique partial index on btrim(phone)). Normalization =
+    // trim at the repository boundary; a phone belongs to exactly ONE user
+    // across all tenants. A colliding insert/upsert fails loud (23505).
+    const phone = u.phone === undefined ? undefined : u.phone.trim();
+    const rec = u.phone === undefined ? u : { ...u, phone };
     await this.q(
       `INSERT INTO users(user_id, org_id, email, phone, data) VALUES($1,$2,$3,$4,$5)
        ON CONFLICT (user_id) DO UPDATE SET org_id=EXCLUDED.org_id, email=EXCLUDED.email, phone=EXCLUDED.phone, data=EXCLUDED.data`,
-      [u.userId, u.orgId, u.email ?? null, u.phone ?? null, JSON.stringify(u)]);
-    return u;
+      [rec.userId, rec.orgId, rec.email ?? null, rec.phone ?? null, JSON.stringify(rec)]);
+    return rec;
   }
   async getUser(userId: ID): Promise<UserRecord | undefined> {
     const r = await this.q(`SELECT data FROM users WHERE user_id=$1`, [userId]);
@@ -180,7 +187,7 @@ export class PostgresGraphRepository implements GraphRepository {
     return r.rows[0]?.['data'] as UserRecord | undefined;
   }
   async findUserByPhone(phone: string): Promise<UserRecord | undefined> {
-    const r = await this.q(`SELECT data FROM users WHERE phone=$1 LIMIT 1`, [phone]);
+    const r = await this.q(`SELECT data FROM users WHERE phone=$1 LIMIT 1`, [phone.trim()]);
     return r.rows[0]?.['data'] as UserRecord | undefined;
   }
   async updateUser(userId: ID, patch: Partial<UserRecord>): Promise<UserRecord | undefined> {
@@ -189,6 +196,7 @@ export class PostgresGraphRepository implements GraphRepository {
       const cur = r.rows[0]?.['data'] as UserRecord | undefined;
       if (!cur) return undefined;
       const next = { ...cur, ...patch, userId: cur.userId, orgId: cur.orgId };
+      if (next.phone !== undefined) next.phone = next.phone.trim();
       await c.query(`UPDATE users SET email=$2, phone=$3, data=$4 WHERE user_id=$1`,
         [userId, next.email ?? null, next.phone ?? null, JSON.stringify(next)]);
       return next;
@@ -197,6 +205,51 @@ export class PostgresGraphRepository implements GraphRepository {
   async listUsers(orgId: ID): Promise<UserRecord[]> {
     const r = await this.q(`SELECT data FROM users WHERE org_id=$1`, [orgId]);
     return r.rows.map(row => row['data'] as UserRecord);
+  }
+
+  // ---- QA lifecycle gate (2026-09-17): impersonation session lifecycle ----
+  async transitionImpersonationSession(
+    userId: ID, expected: 'active', next: ImpersonationEndState,
+    at: string, auditEntry: AuditLogEntry, endBy: string,
+  ): Promise<'transitioned' | 'not-active' | 'not-found'> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT data FROM users WHERE user_id=$1 FOR UPDATE`, [userId]);
+      const cur = r.rows[0]?.['data'] as UserRecord | undefined;
+      if (!cur || cur.impersonationOf === undefined) return 'not-found';
+      if ((cur.sessionState ?? 'active') !== expected) return 'not-active';
+      // Row lock held: state flip + immutable audit row commit together.
+      const nextU: UserRecord = { ...cur, active: false, sessionState: next, sessionEndedAt: at, sessionEndBy: endBy };
+      await c.query(`UPDATE users SET data=$2 WHERE user_id=$1`, [userId, JSON.stringify(nextU)]);
+      await c.query(`INSERT INTO audit_log(org_id, data) VALUES($1,$2)`, [auditEntry.orgId, JSON.stringify(auditEntry)]);
+      return 'transitioned';
+    });
+  }
+
+  async listImpersonationSessions(opts: {
+    state?: 'active' | 'stopped' | 'expired' | 'revoked';
+    limit: number;
+    cursor?: string;
+  }): Promise<ImpersonationSessionPage> {
+    const conds: string[] = [`(data->>'impersonationOf') IS NOT NULL`];
+    const params: unknown[] = [];
+    if (opts.state) { params.push(opts.state); conds.push(`COALESCE(data->>'sessionState','active') = $${params.length}`); }
+    if (opts.cursor !== undefined) {
+      const sep = opts.cursor.lastIndexOf('|');
+      params.push(opts.cursor.slice(0, sep), opts.cursor.slice(sep + 1));
+      conds.push(`(COALESCE(data->>'createdAt',''), user_id) > ($${params.length - 1}, $${params.length})`);
+    }
+    params.push(opts.limit + 1);
+    const r = await this.q(
+      `SELECT data FROM users WHERE ${conds.join(' AND ')}
+       ORDER BY COALESCE(data->>'createdAt',''), user_id LIMIT $${params.length}`, params);
+    const rows = r.rows.map(row => row['data'] as UserRecord);
+    const sessions = rows.slice(0, opts.limit);
+    const out: ImpersonationSessionPage = { sessions };
+    if (rows.length > opts.limit && sessions.length > 0) {
+      const last = sessions[sessions.length - 1]!;
+      out.nextCursor = `${last.createdAt ?? ''}|${last.userId}`;
+    }
+    return out;
   }
 
   // whitelist onboarding (v1.18 §15): upsert on phone, org-scoped list.

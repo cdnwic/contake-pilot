@@ -77,13 +77,44 @@ export function memoryOtpState(): OtpStateStore {
   };
 }
 
+/** Strict E.164 (pilot allowlist entries): + then 8-15 digits, first
+ *  (country-code) digit non-zero. */
+const E164_STRICT = /^\+[1-9]\d{7,14}$/;
+
+/** QA lifecycle gate (2026-09-17): STRICT FAIL-LOUD parse of
+ *  CONTAKE_SUPER_ADMIN_PHONES. Comma-separated, whitespace-trimmed, exact
+ *  duplicates deduped; a malformed non-empty entry THROWS at boot (a
+ *  mistyped allowlist must never silently run with fewer/more privileges
+ *  than ops wrote). Empty/unset yields an EMPTY allowlist (fail CLOSED -
+ *  no privileged phone), which is a valid, deliberate configuration.
+ *  Approved real phone values live ONLY in the ops configuration record -
+ *  never in code or tests. */
+export function parseSuperAdminPhones(raw: string | undefined): readonly string[] {
+  if (raw === undefined || raw.trim() === '') return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const seg of raw.split(',')) {
+    const entry = seg.trim();
+    if (!entry) continue;
+    if (!E164_STRICT.test(entry)) {
+      throw new Error(`CONTAKE_SUPER_ADMIN_PHONES: malformed E.164 entry "${entry}" - refusing to boot with a corrupt allowlist`);
+    }
+    if (!seen.has(entry)) { seen.add(entry); out.push(entry); }
+  }
+  return out;
+}
+
 /** Super Admin phone allowlist (server-side, env-only). QA stop-ship
  *  (2026-09-17): FAIL CLOSED - there is NO hardcoded/default privileged
  *  phone. An unset CONTAKE_SUPER_ADMIN_PHONES means an empty allowlist: no
  *  phone enrolls as Super Admin, period. Ops sets the comma-separated
  *  allowlist explicitly per environment. Frontend state can never set this. */
-export const SUPER_ADMIN_PHONES: readonly string[] = (process.env['CONTAKE_SUPER_ADMIN_PHONES'] ?? '')
-  .split(',').map(p => p.trim()).filter(Boolean);
+export const SUPER_ADMIN_PHONES: readonly string[] = parseSuperAdminPhones(process.env['CONTAKE_SUPER_ADMIN_PHONES']);
+
+/** QA lifecycle gate (2026-09-17): impersonation sessions expire
+ *  server-side. Recommended pilot TTL: 15 minutes (matches the access-token
+ *  TTL); enforced on EVERY authentication, never by the client. */
+export const SANDBOX_SESSION_TTL_MS = 15 * 60 * 1000;
 
 /** The pilot tenant a super admin enrolls into. */
 export const SUPER_ADMIN_HOME_ORG = 'org-1';
@@ -129,9 +160,43 @@ export class AuthService {
     } catch {
       return null;
     }
-    if (!parsed.sub || !parsed.exp || parsed.exp * 1000 < this.now()) return null;
+    if (!parsed.sub || !parsed.exp) return null;
     const user = await this.repo.getUser(parsed.sub);
-    if (!user || !user.active) return null; // revocation takes effect immediately
+    if (!user) return null;
+    // QA lifecycle gate (2026-09-17): server-side session expiry, enforced on
+    // EVERY authentication of a sandbox impersonation identity. The first
+    // request observed at/after expiresAt atomically transitions
+    // active -> expired with an immutable audit row (single CAS - a burst of
+    // concurrent requests writes exactly one expire audit), and the token is
+    // rejected from then on. Crash/no-stop sessions expire exactly the same:
+    // expiry needs no client cooperation. This check runs BEFORE the JWT's
+    // own exp rejection: with equal 15-minute TTLs the JWT expires together
+    // with the session, and the lazy transition + audit must still fire.
+    if (user.impersonationOf !== undefined && user.expiresAt !== undefined
+        && Date.parse(user.expiresAt) <= this.now()) {
+      if ((user.sessionState ?? 'active') === 'active') {
+        const impersonator = await this.repo.getUser(user.impersonationOf);
+        const at = new Date(this.now()).toISOString();
+        await this.repo.transitionImpersonationSession(user.userId, 'active', 'expired', at, {
+          id: `aud_${this.now().toString(36)}_${randomBytes(4).toString('hex')}`,
+          orgId: impersonator?.orgId ?? user.orgId,
+          eventId: 'pending',
+          actorUserId: user.impersonationOf,
+          role: (impersonator?.role ?? 'admin') as UserRecord['role'],
+          action: 'identity.impersonate.expire',
+          entityType: 'user',
+          entityId: user.userId,
+          beforeJson: null,
+          afterJson: JSON.stringify({
+            expiredBy: 'server', impersonatorUserId: user.impersonationOf,
+            targetRole: user.role, expiresAt: user.expiresAt, sandboxOrg: user.orgId,
+          }),
+          createdAt: at,
+        }, 'server');
+      }
+      return null;
+    }
+    if (!user.active || parsed.exp * 1000 < this.now()) return null; // revocation / token expiry take effect immediately
     return user;
   }
 
@@ -197,7 +262,7 @@ export class AuthService {
     const user: UserRecord = {
       userId: `u-superadmin-${phone.replace(/\D/g, '')}`,
       orgId: SUPER_ADMIN_HOME_ORG,
-      name: 'חיים ויכנין',
+      name: 'Super Admin',
       role: 'admin',
       scopes: [],
       phone,

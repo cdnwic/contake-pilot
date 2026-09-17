@@ -10,11 +10,11 @@ import {
 } from '@contake/core';
 import { appEvents } from './services/events.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
-import { AuthService, toPrincipal } from './auth.js';
+import { AuthService, SANDBOX_SESSION_TTL_MS, toPrincipal } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
 import { ReportClientIdConflictError } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
-import { auditDenied, type DenialMeta, audit, deviceClassOf } from './services/audit.js';
+import { auditDenied, type DenialMeta, audit, buildAuditRecord, deviceClassOf } from './services/audit.js';
 import type { AuditEntityType, Branch, ContentItem, ContentItemVersion, ExternalParty, OptoutSuppression, StatusToken, TaskContentRole, TaskResourceLink } from '@contake/core';
 import { bodyHashOf, maskAddress, mintStatusToken, normalizeAddress, peppersFromEnv, hashToken, rateOk, requestHashOf, timingSafeEqualStr, tokenTtlMs, containsSecretPattern } from './services/security.js';
 import { randomUUID } from 'node:crypto';
@@ -571,6 +571,10 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     // fault anywhere in the unit leaves no partial sandbox, no unaudited
     // identity, and no audit without its identity.
     const evId = sandboxEventId(profileId);
+    // QA lifecycle gate (2026-09-17): every session carries explicit
+    // createdAt/expiresAt metadata (recommended 15-minute server-side TTL,
+    // enforced on every authentication in AuthService.authenticate).
+    const nowMs = Date.now();
     const sandboxUser: UserRecord = {
       userId: `sa-imp-${randomUUID()}`,
       orgId: SUPERADMIN_SANDBOX_ORG,
@@ -582,6 +586,9 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       ...(role === 'focus_worker' ? { linkedResourceId: sandboxResourceId(profileId) } : {}),
       active: true,
       impersonationOf: user.userId,
+      createdAt: new Date(nowMs).toISOString(),
+      expiresAt: new Date(nowMs + SANDBOX_SESSION_TTL_MS).toISOString(),
+      sessionState: 'active',
     };
     await withAuditSafety(repo, async () => {
       await ensureSuperAdminSandbox(repo, profileId);
@@ -625,13 +632,14 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (!target || target.impersonationOf === undefined || !target.active) {
       fail(404, 'NOT_FOUND', 'ההתחזות לא נמצאה');
     }
-    // QA stop-ship (2026-09-17): deactivate + stop audit commit ATOMICALLY.
-    // A fault in the audit write rolls the deactivation back, so a sandbox
-    // identity is never left dead-but-unaudited (or audited-but-alive).
-    await withAuditSafety(repo, async () => {
-      await repo.updateUser(target.userId, { active: false });
-      const impersonator = await repo.getUser(target.impersonationOf!);
-      await audit(repo, {
+    // QA stop-ship (2026-09-17) + lifecycle gate: deactivate + stop audit
+    // commit ATOMICALLY - now via the adapter-level CAS primitive
+    // (active -> stopped + immutable audit in one atomic unit), so the
+    // transition is race-safe even against concurrent stop/revoke/expiry.
+    const impersonator = await repo.getUser(target.impersonationOf!);
+    const outcome = await repo.transitionImpersonationSession(
+      target.userId, 'active', 'stopped', new Date().toISOString(),
+      buildAuditRecord({
         orgId: impersonator?.orgId ?? actor.orgId, eventId: 'pending',
         actorUserId: actor.userId, role: actor.role,
         action: 'identity.impersonate.stop', entityType: 'user', entityId: target.userId,
@@ -639,9 +647,85 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
           stoppedBy: actor.userId, impersonatorUserId: target.impersonationOf,
           targetRole: target.role, sandboxOrg: SUPERADMIN_SANDBOX_ORG,
         },
-      });
-    });
+      }),
+      actor.userId,
+    );
+    if (outcome !== 'transitioned') fail(404, 'NOT_FOUND', 'ההתחזות לא נמצאה');
     return { stopped: true };
+  });
+
+  // QA lifecycle gate (2026-09-17): tenant-safe PAGINATED listing of sandbox
+  // impersonation sessions. Super Admin only. Sessions live ONLY in the
+  // sandbox tenant; each entry carries its tenant markers (sandbox org,
+  // event scope) and full lifecycle provenance (state, createdAt, expiresAt,
+  // endedAt, endBy). Inactive sessions are preserved, never deleted.
+  app.get('/v1/admin/impersonations', async (req) => {
+    const user = await me(req);
+    if (user.isSuperAdmin !== true) {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'identity.impersonate.start',
+        entityType: 'user', entityId: user.userId, eventId: 'pending',
+      });
+    }
+    const q = req.query as { state?: string; limit?: string; cursor?: string };
+    const states = ['active', 'stopped', 'expired', 'revoked'] as const;
+    const state = q.state === undefined ? undefined
+      : (states as readonly string[]).includes(q.state) ? q.state as typeof states[number]
+      : fail(400, 'BAD_REQUEST', 'state לא חוקי');
+    const limitRaw = q.limit === undefined ? 50 : Number.parseInt(q.limit, 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+    const { sessions, nextCursor } = await repo.listImpersonationSessions({ ...(state ? { state } : {}), limit, ...(q.cursor !== undefined ? { cursor: q.cursor } : {}) });
+    return {
+      sessions: sessions.map(x => ({
+        userId: x.userId,
+        impersonatorUserId: x.impersonationOf,
+        role: x.role,
+        sandboxOrg: x.orgId,
+        scopes: x.scopes,
+        ...(x.linkedResourceId ? { linkedResourceId: x.linkedResourceId } : {}),
+        sessionState: x.sessionState ?? 'active',
+        createdAt: x.createdAt ?? null,
+        expiresAt: x.expiresAt ?? null,
+        sessionEndedAt: x.sessionEndedAt ?? null,
+        sessionEndBy: x.sessionEndBy ?? null,
+      })),
+      nextCursor: nextCursor ?? null,
+    };
+  });
+
+  // QA lifecycle gate (2026-09-17): AUDITED revoke-by-session-id. Super
+  // Admin only; atomic active -> revoked + immutable audit. Revoking an
+  // already-inactive session FAILS LOUD (409) instead of silently
+  // succeeding; unknown / non-session ids 404. The identity and its audits
+  // are preserved.
+  app.post('/v1/admin/impersonations/:userId/revoke', async (req) => {
+    const actor = await me(req);
+    if (actor.isSuperAdmin !== true) {
+      fail(403, 'FORBIDDEN', 'אין לך הרשאה לפעולה זו', {
+        reason: 'matrix_deny', action: 'identity.impersonate.revoke',
+        entityType: 'user', entityId: actor.userId, eventId: 'pending',
+      });
+    }
+    const target = await repo.getUser((req.params as { userId: string }).userId);
+    if (!target || target.impersonationOf === undefined) {
+      fail(404, 'NOT_FOUND', 'ההתחזות לא נמצאה');
+    }
+    const outcome = await repo.transitionImpersonationSession(
+      target.userId, 'active', 'revoked', new Date().toISOString(),
+      buildAuditRecord({
+        orgId: actor.orgId, eventId: 'pending',
+        actorUserId: actor.userId, role: actor.role,
+        action: 'identity.impersonate.revoke', entityType: 'user', entityId: target.userId,
+        after: {
+          revokedBy: actor.userId, impersonatorUserId: target.impersonationOf,
+          targetRole: target.role, sandboxOrg: SUPERADMIN_SANDBOX_ORG,
+        },
+      }),
+      actor.userId,
+    );
+    if (outcome === 'not-found') fail(404, 'NOT_FOUND', 'ההתחזות לא נמצאה');
+    if (outcome === 'not-active') fail(409, 'CONFLICT', 'ההתחזות כבר הסתיימה');
+    return { revoked: true };
   });
 
   app.get('/v1/events', async (req) => {

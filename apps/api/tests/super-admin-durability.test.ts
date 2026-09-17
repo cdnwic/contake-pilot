@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 
-vi.hoisted(() => { process.env['CONTAKE_SUPER_ADMIN_PHONES'] = '+972587700852'; });
+vi.hoisted(() => { process.env['CONTAKE_SUPER_ADMIN_PHONES'] = '+15550100001'; });
 
 import { buildApp } from '../src/app.js';
 import { AuthService } from '../src/auth.js';
@@ -24,7 +24,7 @@ beforeEach(async () => {
 afterEach(async () => { await app.close(); });
 
 const H = (t: string) => ({ authorization: `Bearer ${t}` });
-const SA = '+972587700852';
+const SA = '+15550100001';
 const otpLogin = async (phone: string) => {
   const q = await app.inject({ method: 'POST', url: '/v1/auth/otp/request', payload: { phone } });
   return (await app.inject({ method: 'POST', url: '/v1/auth/otp/verify', payload: { phone, code: q.json().devCode } })).json().token as string;
@@ -116,10 +116,12 @@ describe('transactional impersonation stop', () => {
     const t = await otpLogin(SA);
     const s = await start(t, 'admin');
     const sid = s.json().principal.userId as string;
-    const original = repo.appendAudit.bind(repo);
-    repo.appendAudit = () => { throw new Error('audit store down'); };
+    // Fault at the ATOMIC stop transition (audit write is inside it): the
+    // whole unit must fail loudly with NO state change.
+    const original = repo.transitionImpersonationSession.bind(repo);
+    repo.transitionImpersonationSession = () => { throw new Error('audit store down'); };
     const r = await stop(t, sid);
-    repo.appendAudit = original;
+    repo.transitionImpersonationSession = original;
     expect(r.statusCode).toBe(500);
     expect((await repo.getUser(sid))!.active).toBe(true);
     expect(await stopAudits()).toHaveLength(0);

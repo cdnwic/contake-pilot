@@ -22,6 +22,26 @@ export interface UserRecord extends Principal {
   /** Set on synthetic sandbox identities minted by super-admin test
    *  impersonation: the impersonator's userId. Regular users never have it. */
   impersonationOf?: ID;
+  /** QA lifecycle gate (2026-09-17): impersonation SESSION metadata, minted
+   *  only on sandbox identities. createdAt/expiresAt are ISO instants;
+   *  expiresAt is server-enforced on every authentication (recommended
+   *  15-minute session TTL). sessionState is the lifecycle provenance:
+   *  active -> stopped (self/admin stop) | expired (server-side TTL) |
+   *  revoked (admin revoke-by-id). Inactive identities and their audits are
+   *  PRESERVED - nothing is ever deleted. */
+  createdAt?: string;
+  expiresAt?: string;
+  sessionState?: 'active' | 'stopped' | 'expired' | 'revoked';
+  sessionEndedAt?: string;
+  /** Who ended the session: a userId for stop/revoke, 'server' for TTL expiry. */
+  sessionEndBy?: string;
+}
+
+/** Lifecycle states a sandbox impersonation session can END in. */
+export type ImpersonationEndState = 'stopped' | 'expired' | 'revoked';
+export interface ImpersonationSessionPage {
+  sessions: UserRecord[];
+  nextCursor?: string;
 }
 
 export interface ChannelRecord {
@@ -48,6 +68,25 @@ export interface GraphRepository {
   findUserByPhone(phone: string): Promise<UserRecord | undefined>;
   updateUser(userId: ID, patch: Partial<UserRecord>): Promise<UserRecord | undefined>;
   listUsers(orgId: ID): Promise<UserRecord[]>;
+  /** QA lifecycle gate (2026-09-17): ATOMIC impersonation-session transition
+   *  active -> stopped|expired|revoked plus its immutable audit row, in one
+   *  adapter-level atomic unit (PG: row lock in a transaction; memory:
+   *  single-threaded check+set+append). Returns 'not-found' when the id is
+   *  missing or not a sandbox identity, 'not-active' when the session is not
+   *  in the expected state (fail loud - the caller maps this to 404/409),
+   *  'transitioned' on success. No deletion, ever. */
+  transitionImpersonationSession(
+    userId: ID, expected: 'active', next: ImpersonationEndState,
+    at: string, auditEntry: AuditLogEntry, endBy: string,
+  ): Promise<'transitioned' | 'not-active' | 'not-found'>;
+  /** Tenant-safe paginated listing of sandbox impersonation sessions: only
+   *  sandbox identities (impersonationOf set), keyset-paginated by
+   *  (createdAt, userId), optionally filtered by lifecycle state. */
+  listImpersonationSessions(opts: {
+    state?: 'active' | 'stopped' | 'expired' | 'revoked';
+    limit: number;
+    cursor?: string;
+  }): Promise<ImpersonationSessionPage>;
   createChannel(c: ChannelRecord): Promise<ChannelRecord>;
   getChannel(id: ID): Promise<ChannelRecord | undefined>;
   findChannelByAddress(address: string): Promise<ChannelRecord | undefined>;

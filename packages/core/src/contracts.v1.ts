@@ -267,7 +267,8 @@ export type Action =
   | 'task.advance' | 'report.correct' // v1.21.2 §26
   // v1.20.2-superadmin (additive): audited super-admin test impersonation.
   // Server-authorized only; every switch writes one of these to audit_log.
-  | 'identity.impersonate.start' | 'identity.impersonate.stop';
+  | 'identity.impersonate.start' | 'identity.impersonate.stop'
+  | 'identity.impersonate.expire' | 'identity.impersonate.revoke';
 
 export interface Scope { eventId: ID; siteId?: ID; }
 
