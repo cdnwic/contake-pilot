@@ -1,24 +1,33 @@
-/** Release-migration runner (architecture convergence 2026-09-18; unified
- *  declarative redesign after QA FAILs of f9854cd6/9182487e/22267edb and the
- *  security verdicts + TL reconciliation of 2026-09-18).
+/** Release-migration runner - R3 closed-template execution contract with
+ *  the R4 integrity binding (trust-head rulings 2026-09-18; supersedes the
+ *  rejected artifact-SQL line 976db452/c862cbbe/4f947f3e/356c9e97/4d97f31a).
  *
  *  ONE shared runner owns ALL schema evolution:
- *  - DECLARATIVE SQL ARTIFACTS ONLY. A migration is frozen TEXT: { version,
- *    name, description, sql } plus runner-owned declarative guard primitives.
- *    There are NO function steps, NO DO/CALL/PLpgSQL, NO arbitrary raw-query
- *    capability anywhere in the framework - code execution inside migrations
- *    is not a feature that exists.
- *  - EXACT EXECUTED+HASHED BINDING. The digest hashes the artifact text; the
- *    ONLY statements executed are the parse of that exact text (nothing else
- *    can be in it - trailing garbage fails the parse). Execution runs the
- *    parsed statements of the hashed text, one per driver call.
- *  - REAL-PARSER AST ALLOWLIST (not regex). Every artifact parses with a real
- *    PostgreSQL parser (pgsql-ast-parser); only declarative DDL+DML statement
- *    types are permitted (create/alter/drop table+index, insert,
- *    update, delete). Transaction control, SELECT/CALL/DO, session advisory
- *    functions and anything unparseable (SAVEPOINT/SET/LOCK syntax) are
- *    rejected at registration - quoting, schema-qualification and comment
- *    tricks resolve to the same AST and cannot bypass it.
+ *  - CLOSED TEMPLATE REGISTRY (R3). A migration step is INERT DATA:
+ *    { version, name, description, template, params } plus runner-owned
+ *    guard primitives. There is NO caller SQL anywhere - no artifact text,
+ *    no parser, no AST allowlist (deleted, not refactored). Templates are
+ *    reviewed runner-owned code; capability grows ONLY by adding a reviewed
+ *    template to the private registry.
+ *  - INTEGRITY BINDING (R4): self-consistency is not authenticity. The
+ *    registry (templates, named forms, frozen baseline derivations) is
+ *    MODULE-PRIVATE and deeply frozen at load; NOTHING exports it and no
+ *    render capability crosses the module boundary - callers submit inert
+ *    artifact data and receive results/refusals; rendered SQL never leaves
+ *    the runner. One canonical REGISTRY_DIGEST is computed at load AFTER
+ *    freezing, and every template hash / step digest derives from it.
+ *  - TWO TRUST ANCHORS (R4): Anchor A - the reviewer records the EXPECTED
+ *    REGISTRY_DIGEST from the reviewed source tree (never the code's
+ *    self-report) and qualification/deploy compares. Anchor B - the first
+ *    governed run on a pinned deployment+instance records REGISTRY_DIGEST
+ *    into the migration identity; every later run and every boot compares
+ *    and refuses on drift with the observed mismatch.
+ *  - SINGLE-STATEMENT CONSTRUCTION (R4): asserted at module load over the
+ *    private frozen registry - no template shape or named form may contain
+ *    a statement separator (module refuses to load otherwise). Only
+ *    validated canonical identifiers reach statement position; every
+ *    literal is $n-bound through the extended protocol; one driver call
+ *    per rendered statement.
  *  - RUNNER-OWNED GUARD PRIMITIVES (TL reconciliation): assertions (named
  *    zero-row SELECT guards that HARD-FAIL inside the runner transaction),
  *    table locks, and the xact advisory lock are declared as structured step
@@ -41,7 +50,6 @@
  *  - ROLE SEPARATION (Neon dual-URL): direct schema-owner endpoint only;
  *    '-pooler' hosts are refused. */
 import { createHash, randomBytes } from 'node:crypto';
-import { parse as parseSql, toSql } from 'pgsql-ast-parser';
 import { GRAPH_DDL, OTP_DDL, type Connectable, type Queryable } from '../repo/postgres.js';
 
 /** A runner-owned NAMED guard primitive (independent security, 2026-09-18):
@@ -84,11 +92,11 @@ export interface MigrationStep {
 /** Named expression forms: the ONLY way an expression enters a statement.
  *  Free-text expressions do not exist (expression indexes are covered
  *  without caller text). */
-export const NAMED_EXPRESSIONS: Readonly<Record<string, string>> = {
+const NAMED_EXPRESSIONS: Readonly<Record<string, string>> = {
   EXPR_NORM_PHONE: 'btrim(phone)',
   EXPR_NONE: '',
 };
-export const NAMED_PREDICATES: Readonly<Record<string, string>> = {
+const NAMED_PREDICATES: Readonly<Record<string, string>> = {
   PRED_PHONE_NOT_NULL: 'phone IS NOT NULL',
   PRED_NONE: '',
 };
@@ -167,7 +175,7 @@ const BASELINE_0001_STATEMENTS: readonly string[] = `${GRAPH_DDL};${OTP_DDL}`
     throw new Error(`release-migrations: TEMPLATE integrity refusal - frozen baseline statement deviates from its closed shapes: ${text.slice(0, 80)}`);
   });
 
-export const TEMPLATES: readonly TemplateEntry[] = [
+const TEMPLATES: readonly TemplateEntry[] = [
   {
     name: 'init.schema-baseline.0001',
     description: '0001 graph + OTP schema baseline (frozen DDL constants; IF NOT EXISTS adoption).',
@@ -195,7 +203,7 @@ export const TEMPLATES: readonly TemplateEntry[] = [
 ];
 
 const templateByName = new Map(TEMPLATES.map(t => [t.name, t]));
-export function getTemplate(name: string): TemplateEntry {
+function getTemplate(name: string): TemplateEntry {
   const t = templateByName.get(name);
   if (!t) templateRefusal(`unknown template name ${JSON.stringify(name)} - the registry is closed`);
   return t!;
@@ -203,8 +211,10 @@ export function getTemplate(name: string): TemplateEntry {
 /** Hash-pin: a template's identity is its name + frozen render source +
  *  param schema. Editing a template changes every dependent step digest and
  *  fails the runner/boot history check - registry tamper is refused. */
-export const templateHash = (t: TemplateEntry): string => {
-  const h = createHash('sha256').update(`contake-template/v1\n${t.name}\n${t.render.toString()}\n${canonicalJson({ paramSpec: t.paramSpec, enumValues: t.enumValues ?? {}, writesCatalogs: t.writesCatalogs })}`);
+/** R4: every template hash DERIVES from REGISTRY_DIGEST, so no closed-over
+ *  executable byte can drift without moving every digest anchored on it. */
+const templateHash = (t: TemplateEntry): string => {
+  const h = createHash('sha256').update(`contake-template/v2\n${REGISTRY_DIGEST}\n${t.name}\n${t.render.toString()}\n${canonicalJson({ paramSpec: t.paramSpec, enumValues: t.enumValues ?? {}, writesCatalogs: t.writesCatalogs })}`);
   // Zero-param templates have ONE fixed rendering: pin its exact bytes too, so
   // tampering with the module-level frozen text (not only the render source)
   // moves the hash.
@@ -216,7 +226,7 @@ export const templateHash = (t: TemplateEntry): string => {
 
 /** Validate a step's params against the template schema (exact own-key sets,
  *  per-kind validation) and render the bound statements the runner executes. */
-export function renderStepStatements(m: MigrationStep): readonly RenderedStatement[] {
+function renderStepStatements(m: MigrationStep): readonly RenderedStatement[] {
   const t = getTemplate(m.template);
   const params = m.params ?? {};
   const specKeys = Object.keys(t.paramSpec).sort();
@@ -362,7 +372,72 @@ SELECT kind, body FROM (
  *  change. Writable (data-object) classes accept NEW rows only; any change
  *  to a PRE-EXISTING row (alteration or drop) is a hard fail. NEVER-TOUCH:
  *  ANY delta (add, drop, or alteration) is a hard fail + rollback. */
-export const STATEMENT_CATALOG_MATRIX: Readonly<Record<string, readonly string[]>> = Object.fromEntries(
+/** Key-sorted canonical JSON for the declared-primitive digest component. */
+const canonicalJson = (v: unknown): string => {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(',')}}`;
+};
+
+/** R4 section 1: deep freeze at load - the registry, named forms and frozen
+ *  baseline derivations are module-private AND immutable in-process. */
+const deepFreeze = <T>(o: T): T => {
+  if (o && typeof o === 'object') {
+    for (const k of Object.keys(o as Record<string, unknown>)) deepFreeze((o as Record<string, unknown>)[k]);
+    Object.freeze(o);
+  }
+  return o;
+};
+deepFreeze(NAMED_EXPRESSIONS);
+deepFreeze(NAMED_PREDICATES);
+deepFreeze(TEMPLATES);
+
+/** R4 section 1: ONE canonical serialization of the full frozen blueprint,
+ *  hashed at module load AFTER freezing, from the private state. Anchor A
+ *  records this value from reviewed source; anchor B records it in the
+ *  migration identity at the first pinned governed run. */
+export const REGISTRY_DIGEST: string = createHash('sha256')
+  .update(`contake-registry/v1\n${canonicalJson(TEMPLATES.map(t => ({
+    name: t.name,
+    description: t.description,
+    paramSpec: t.paramSpec,
+    enumValues: t.enumValues ?? {},
+    writesCatalogs: t.writesCatalogs,
+    renderSource: t.render.toString(),
+    rendered: Object.keys(t.paramSpec).length === 0 ? t.render({}).map(st => ({ text: st.text, values: st.values })) : null,
+  })))}`)
+  .digest('hex');
+
+/** R4 section 4: single-statement construction guarantee. Exported ONLY as a
+ *  pure assertion over caller-supplied forms (no registry content leaves the
+ *  module) so the evidence suite can observe the refusal on tampered forms;
+ *  module load runs it over the private frozen registry below. */
+export function assertSingleStatementForms(forms: readonly string[], ctx: string): void {
+  for (const f of forms) {
+    if (f.includes(';')) {
+      throw new Error(
+        `release-migrations: LOAD INTEGRITY refusal - statement separator in ${ctx}: ${JSON.stringify(f.slice(0, 100))} - ` +
+        `the runner module refuses to load with a multi-statement shape (fail-closed)`,
+      );
+    }
+  }
+}
+{
+  // Load-time assertion over the private frozen registry: every template
+  // shape (rendered with schema-valid sample params) and every named form.
+  const sample: Record<string, Record<string, string>> = {
+    'ddl.create-index': { index: 'sa_idx', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
+  };
+  for (const t of TEMPLATES) {
+    const rendered = t.render(t.name === 'ddl.create-index' ? sample['ddl.create-index']! : {});
+    assertSingleStatementForms(rendered.map(st => st.text), `template '${t.name}'`);
+  }
+  assertSingleStatementForms(Object.values(NAMED_EXPRESSIONS), 'NAMED_EXPRESSIONS');
+  assertSingleStatementForms(Object.values(NAMED_PREDICATES), 'NAMED_PREDICATES');
+}
+
+const STATEMENT_CATALOG_MATRIX: Readonly<Record<string, readonly string[]>> = Object.fromEntries(
   TEMPLATES.map(t => [t.name, t.writesCatalogs]),
 );
 const NEVER_TOUCH_KINDS: ReadonlySet<string> = new Set([
@@ -541,13 +616,6 @@ export function validateAssertion(a: MigrationAssertion): void {
   buildAssertionQuery(a); // throws on invalid identifiers/kinds/keys
 }
 
-/** Key-sorted canonical JSON for the declared-primitive digest component. */
-const canonicalJson = (v: unknown): string => {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
-  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
-  const o = v as Record<string, unknown>;
-  return `{${Object.keys(o).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(',')}}`;
-};
 
 /** Integrity digest over the EXACT artifact text + declared primitives:
  *  version + name + sql + canonical primitive declaration. Editing anything
@@ -574,7 +642,7 @@ export const stepDigest = (m: MigrationStep): string => {
     templateRefusal(`step '${m.version}' params do not exactly match template '${t.name}' schema`);
   }
   return createHash('sha256').update(
-    `contake-migration/v7\n${m.version}\n${m.name}\n${m.template}\n${templateHash(t)}\n${canonicalJson({
+    `contake-migration/v8\n${REGISTRY_DIGEST}\n${m.version}\n${m.name}\n${m.template}\n${templateHash(t)}\n${canonicalJson({
       params, assertions: m.assertions ?? [], lockTables: m.lockTables ?? [], xactLockKey: m.xactLockKey ?? null,
     })}`,
   ).digest('hex');
@@ -636,6 +704,7 @@ CREATE TABLE IF NOT EXISTS public.contake_db_identity(
 );
 ALTER TABLE public.contake_db_identity ADD COLUMN IF NOT EXISTS ext_baseline jsonb;
 ALTER TABLE public.contake_db_identity ADD COLUMN IF NOT EXISTS migration_role text;
+ALTER TABLE public.contake_db_identity ADD COLUMN IF NOT EXISTS registry_digest text;
 `;
 
 export interface DbIdentity { deploymentLabel: string; instanceId: string }
@@ -771,9 +840,11 @@ export async function runMigrations(
         if (pre.firstRun) {
           identity = { deploymentLabel: opts.deployment, instanceId: randomBytes(8).toString('hex') };
           stampedNow = true;
+          // R4 Anchor B: the first pinned governed run records REGISTRY_DIGEST
+          // into the migration identity (a TOFU event, operator-attended).
           await client.query(
-            `INSERT INTO public.contake_db_identity(id, deployment_label, instance_id, ext_baseline) VALUES(1, $1, $2, $3::jsonb)`,
-            [identity.deploymentLabel, identity.instanceId, currentExt],
+            `INSERT INTO public.contake_db_identity(id, deployment_label, instance_id, ext_baseline, registry_digest) VALUES(1, $1, $2, $3::jsonb, $4)`,
+            [identity.deploymentLabel, identity.instanceId, currentExt, REGISTRY_DIGEST],
           );
         } else {
           identity = pre.identity!;
@@ -787,6 +858,21 @@ export async function runMigrations(
               `release-migrations: EXTENSION BASELINE refusal - installed extension set differs from the pinned ` +
               `bootstrap baseline (pinned ${JSON.stringify(pinned)} vs current ${currentExt}) - ` +
               `extensions change out of band only via a reviewed re-pin (fail-closed)`,
+            );
+          }
+          // R4 Anchor B: DB-anchored registry digest. Drift means the running
+          // blueprint no longer matches the one this environment anchored -
+          // refuse with the observed mismatch (fail-closed).
+          const anchor = await client.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
+          const anchored = anchor.rows[0]?.['d'];
+          if (anchored === null || anchored === undefined) {
+            // One-time adoption for pre-R4 deployments.
+            await client.query(`UPDATE public.contake_db_identity SET registry_digest = $1 WHERE id = 1`, [REGISTRY_DIGEST]);
+          } else if (String(anchored) !== REGISTRY_DIGEST) {
+            throw new Error(
+              `release-migrations: ANCHOR refusal - DB-anchored REGISTRY_DIGEST drift ` +
+              `(anchored ${String(anchored).slice(0, 16)}... vs actual ${REGISTRY_DIGEST.slice(0, 16)}...): the running registry ` +
+              `no longer matches the blueprint this deployment+instance anchored at its first governed run (fail-closed)`,
             );
           }
         }
@@ -972,6 +1058,24 @@ export async function assertSchemaCurrent(
         `release-migrations: DEFAULT PRIVILEGE refusal - migration role '${migRole}' lacks the PUBLIC function-EXECUTE ` +
         `revocation (observed default ACL: ${acl || 'none'}) - a persisting code object could be callable by any role. ` +
         `Run the release-migration job to re-apply hardening - refusing to boot (fail-closed)`,
+      );
+    }
+  }
+  // R4 Anchor B at boot: the DB-anchored registry digest must match the
+  // running blueprint, with the observed mismatch on drift (fail-closed).
+  {
+    const anchor = await conn.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
+    const anchored = anchor.rows[0]?.['d'];
+    if (anchored === null || anchored === undefined) {
+      throw new Error(
+        'release-migrations: no DB-anchored REGISTRY_DIGEST - this database predates the R4 integrity anchor. ' +
+        'Run the release-migration job once to adopt it - refusing to boot (fail-closed)',
+      );
+    }
+    if (String(anchored) !== REGISTRY_DIGEST) {
+      throw new Error(
+        `release-migrations: ANCHOR refusal - DB-anchored REGISTRY_DIGEST drift ` +
+        `(anchored ${String(anchored).slice(0, 16)}... vs actual ${REGISTRY_DIGEST.slice(0, 16)}...) - refusing to boot (fail-closed)`,
       );
     }
   }

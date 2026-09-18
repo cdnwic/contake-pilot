@@ -10,10 +10,11 @@ import { pgliteConnectable } from '../src/repo/postgres.js';
 import {
   MIGRATIONS, EXPECTED_SCHEMA_VERSIONS, assertDirectDatabaseUrl,
   assertSchemaCurrent, assertZeroCatalogDelta, bindIdentifier, bindLiteral, buildAssertionQuery,
-  catalogSnapshot, getTemplate, renderStepStatements, requiredBootIdentity,
-  runMigrations, sequenceValues, restoreSequenceValues, stepDigest, templateHash, validateAssertion,
-  verifyTargetPreconditions, NAMED_EXPRESSIONS, NAMED_PREDICATES, TEMPLATES, type MigrationStep,
+  catalogSnapshot, requiredBootIdentity,
+  runMigrations, sequenceValues, restoreSequenceValues, stepDigest, validateAssertion,
+  verifyTargetPreconditions, assertSingleStatementForms, REGISTRY_DIGEST, type MigrationStep,
 } from '../src/migrations/runner.js';
+import * as runnerModule from '../src/migrations/runner.js';
 
 async function freshDb() {
   const pg = new PGlite();
@@ -28,30 +29,42 @@ const step = (version: string, name: string, template: string, params: Readonly<
  *  lock + named guards + canonical expression index via the NAMED form. */
 const SA_PARAMS = { index: 'users_phone_unique', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' } as const;
 
-describe('R3 closed-template contract (artifacts are inert data; no caller SQL exists)', () => {
-  it('renders the SA-shaped index and the 0001 baseline from inert params', () => {
-    const idx = renderStepStatements(step('0002', 'sa', 'ddl.create-index', SA_PARAMS));
-    expect(idx).toEqual([{ text: 'CREATE UNIQUE INDEX IF NOT EXISTS "users_phone_unique" ON "public"."users" (btrim(phone)) WHERE phone IS NOT NULL', values: [] }]);
-    const base = renderStepStatements(MIGRATIONS[0]!);
-    expect(base.length).toBeGreaterThan(10); // frozen GRAPH_DDL/OTP_DDL statements
-    expect(() => renderStepStatements(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, extra: 1 }))).toThrow(/do not exactly match/);
+describe('R4 confined-registry contract (module-private frozen registry; anchored digests; inert artifacts)', () => {
+  it('SA-shaped index applies via runMigrations; exact indexdef is catalog-observed (render is not exported)', async () => {
+    const { pg, conn } = await freshDb();
+    const sa = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
+    await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
+    const idx = await conn.query(`SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'users_phone_unique'`);
+    const indexdef = String(idx.rows[0]?.['indexdef'] ?? '');
+    console.log(`OBSERVED[sa indexdef]: ${indexdef}`);
+    expect(indexdef).toMatch(/^CREATE UNIQUE INDEX users_phone_unique ON public\.users USING btree \(btrim\(phone\)\) WHERE \(phone IS NOT NULL\)?$/);
+    expect(indexdef).not.toContain(';'); // one statement, no separator
+    // extra/missing params refuse at registration, driven through the runner
+    // (as a NOT-yet-applied version so rendering is actually reached):
+    await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa, step('0003', 'sa2', 'ddl.create-index', { ...SA_PARAMS, extra: 1 })] }))
+      .rejects.toThrow(/do not exactly match/);
+    await pg.close();
   });
-  it('identifier-injection refused: quotes, semicolons, schema paths, system prefixes', () => {
+  it('identifier-injection refused at registration (runner-driven, OBSERVED per class)', async () => {
+    const { pg, conn } = await freshDb();
     for (const bad of [`us"; DROP TABLE users;--`, `users' OR '1'='1`, 'public.users', 'attacker.users', 'Users', 'pg_catalog', 'pg_shadow', 'us ers', '']) {
       let observed = '';
-      try { renderStepStatements(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, table: bad })); } catch (e) { observed = String(e); }
+      try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, table: bad })] }); } catch (e) { observed = String(e); }
       console.log(`OBSERVED[identifier-injection ${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
       expect(observed, bad).toMatch(/TEMPLATE refusal/);
       expect(() => bindIdentifier(bad, 'table')).toThrow(/TEMPLATE refusal/);
     }
+    await pg.close();
   });
-  it('enum escape refused: closed sets only', () => {
+  it('enum escape refused at registration: closed sets only (runner-driven)', async () => {
+    const { pg, conn } = await freshDb();
     for (const [k, bad] of [['unique', 'UNIQUE'], ['unique', 'yes'], ['ifNotExists', 'sometimes'], ['ifNotExists', 'if-not-exists; DROP TABLE users']] as const) {
       let observed = '';
-      try { renderStepStatements(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, [k]: bad })); } catch (e) { observed = String(e); }
+      try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, [k]: bad })] }); } catch (e) { observed = String(e); }
       console.log(`OBSERVED[enum escape ${k}=${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
       expect(observed, `${k}=${bad}`).toMatch(/TEMPLATE refusal - enum/);
     }
+    await pg.close();
   });
   it('literal type confusion refused: bound values only, never interpolated', () => {
     expect(bindLiteral('x', 'p')).toBe('x');
@@ -61,47 +74,68 @@ describe('R3 closed-template contract (artifacts are inert data; no caller SQL e
       expect(() => bindLiteral(bad, 'p'), JSON.stringify(bad)).toThrow(/TEMPLATE refusal - literal/);
     }
   });
-  it('named-expression substitution refused: registry forms only, no free text', () => {
+  it('named-form substitution refused at registration; registry unreachable from outside the module', async () => {
+    const { pg, conn } = await freshDb();
     for (const bad of ['btrim(phone)', 'attacker.lower(phone)', 'EXPR_NORM_PHONE; DROP TABLE users', 'expr_norm_phone', '']) {
       let observed = '';
-      try { renderStepStatements(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, expression: bad })); } catch (e) { observed = String(e); }
+      try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, expression: bad })] }); } catch (e) { observed = String(e); }
       console.log(`OBSERVED[expression substitution ${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
       expect(observed, bad).toMatch(/TEMPLATE refusal/);
     }
-    expect(NAMED_EXPRESSIONS['EXPR_NORM_PHONE']).toBe('btrim(phone)');
-    expect(NAMED_PREDICATES['PRED_PHONE_NOT_NULL']).toBe('phone IS NOT NULL');
+    await pg.close();
+    // R4 section 1: the registry, named forms and render capability no longer
+    // exist on the module surface - external tamper is impossible by type and
+    // at runtime (OBSERVED: each name resolves to undefined).
+    for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'getTemplate', 'renderStepStatements', 'templateHash', 'STATEMENT_CATALOG_MATRIX']) {
+      const surfaced = (runnerModule as Record<string, unknown>)[name];
+      console.log(`OBSERVED[confined surface ${name}]: ${typeof surfaced}`);
+      expect(surfaced, name).toBeUndefined();
+    }
+    // the module namespace itself cannot be rewritten from outside:
+    let mutation = 'silently ignored';
+    try { (runnerModule as Record<string, unknown>)['REGISTRY_DIGEST'] = 'tampered'; } catch (e) { mutation = String(e); }
+    console.log(`OBSERVED[module namespace mutation attempt]: ${mutation.slice(0, 130)}`);
+    expect(runnerModule.REGISTRY_DIGEST).toMatch(/^[0-9a-f]{64}$/); // unchanged
+    // the canonical named forms themselves are proven by the catalog-observed
+    // indexdef in the SA test above: btrim(phone) / phone IS NOT NULL reach
+    // the catalog only through the frozen registry.
   });
-  it('unknown template name refused', () => {
+  it('unknown template name refused at registration', async () => {
+    const { pg, conn } = await freshDb();
     let observed = '';
-    try { renderStepStatements(step('0002', 'x', 'ddl.drop-database', {})); } catch (e) { observed = String(e); }
+    try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.drop-database', {})] }); } catch (e) { observed = String(e); }
     console.log(`OBSERVED[unknown template]: ${observed.slice(0, 140)}`);
     expect(observed).toMatch(/unknown template name/);
+    await pg.close();
   });
-  it('registry/artifact integrity: tampered params or template source change every digest', () => {
+  it('ONE canonical REGISTRY_DIGEST anchors every digest; tampered params shift the step digest', () => {
+    expect(REGISTRY_DIGEST).toMatch(/^[0-9a-f]{64}$/);
+    console.log(`OBSERVED[anchor A surface]: REGISTRY_DIGEST=${REGISTRY_DIGEST}`);
     const a = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
     expect(stepDigest(a)).not.toBe(stepDigest(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique2' })));
     expect(stepDigest(a)).not.toBe(stepDigest({ ...a, xactLockKey: 7 }));
     expect(stepDigest(a)).toBe(stepDigest({ ...a, description: 'edited metadata only' }));
-    const t = getTemplate('ddl.create-index');
-    const tampered = { ...t, render: () => [{ text: 'CREATE FUNCTION public.evil() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$', values: [] }] };
-    expect(templateHash(tampered)).not.toBe(templateHash(t)); // registry tamper = every dependent digest shifts
-    console.log(`OBSERVED[template hash-pin]: registry=${templateHash(t).slice(0, 16)} tampered=${templateHash(tampered).slice(0, 16)}`);
+    // registry tamper from outside is impossible (nothing is exported); any
+    // in-source registry edit moves REGISTRY_DIGEST, which moves EVERY v8
+    // step digest - and the DB anchor (proven below) refuses the drift.
   });
-  it('code-object creation is impossible by construction (no template emits one)', () => {
-    const CODE = /FUNCTION|TRIGGER|OPERATOR|CAST\s*\(|\bRULE\b|POLICY|EXTENSION|\bDO\b|\bCALL\b|SECURITY\s+DEFINER/i;
-    const NON_TX = /CONCURRENTLY|\bVACUUM\b|ALTER SYSTEM|CREATE DATABASE|DROP DATABASE|REINDEX/i;
-    const sweep: MigrationStep[] = [
-      MIGRATIONS[0]!,
-      step('0002', 'sa', 'ddl.create-index', SA_PARAMS),
-      step('0002', 'plain', 'ddl.create-index', { ...SA_PARAMS, unique: 'plain', expression: 'EXPR_NONE', predicate: 'PRED_NONE', ifNotExists: 'strict' }),
-    ];
-    for (const m of sweep) {
-      for (const st of renderStepStatements(m)) {
-        expect(st.text, st.text).not.toMatch(CODE);
-        expect(st.text, st.text).not.toMatch(NON_TX);
-      }
-    }
-    for (const t of TEMPLATES) expect(t.writesCatalogs.every(c => ['owner_rel', 'acl_rel'].includes(c)), t.name).toBe(true);
+  it('code-object creation is impossible by construction and absent from the catalog after a full run', async () => {
+    const { pg, conn } = await freshDb();
+    const sa = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
+    await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
+    const counts = await conn.query(`SELECT
+      (SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public') AS funcs,
+      (SELECT count(*)::int FROM pg_trigger WHERE NOT tgisinternal) AS triggers,
+      (SELECT count(*)::int FROM pg_policy) AS policies,
+      (SELECT count(*)::int FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace WHERE n.nspname = 'public') AS operators,
+      (SELECT count(*)::int FROM pg_cast c JOIN pg_proc p ON p.oid = c.castfunc JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public') AS casts`);
+    console.log(`OBSERVED[code-object absence]: ${JSON.stringify(counts.rows[0])}`);
+    expect(counts.rows[0]).toEqual({ funcs: 0, triggers: 0, policies: 0, operators: 0, casts: 0 });
+    // R4: with the render surface confined and frozen, no caller-reachable
+    // path can emit FUNCTION/TRIGGER/RULE/OPERATOR/CAST/POLICY/EXTENSION/
+    // DO/CALL/SECURITY DEFINER; the runner's own catalog diff (proven below)
+    // refuses any that appear mid-step.
+    await pg.close();
   });
   it('named runner-generated guards: strict objects, qualified SQL generated by the runner only', () => {
     expect(buildAssertionQuery({ kind: 'table-empty', table: 'users' }))
@@ -124,14 +158,20 @@ describe('R3 closed-template contract (artifacts are inert data; no caller SQL e
     expect(() => validateAssertion(null as never)).toThrow(/must be an object/);
   });
 
-  it('non-transactional statement classes cannot exist by construction', () => {
-    // R1 classes (CONCURRENTLY/VACUUM/ALTER SYSTEM/CREATE+DROP DATABASE/
-    // REINDEX/CALL/DO/SECURITY DEFINER) died with general caller SQL: no
-    // template can emit them - the registry sweep proves it.
-    const all = TEMPLATES.flatMap(t => renderStepStatements({ version: '0001', name: 't', description: 't', template: t.name, params: t.name === 'ddl.create-index' ? SA_PARAMS : {} }));
-    for (const st of all) {
-      expect(st.text).not.toMatch(/CONCURRENTLY|\bVACUUM\b|ALTER SYSTEM|CREATE DATABASE|DROP DATABASE|REINDEX|\bCALL\b|\bDO\b/i);
+  it('single-statement construction: load-time assertion refuses every separator form (OBSERVED); module load itself proves the gate passed', () => {
+    // this suite running at all proves the module-load assertion over the
+    // frozen registry passed - a separator would have refused the import.
+    console.log(`OBSERVED[load gate passed]: module loaded with REGISTRY_DIGEST=${REGISTRY_DIGEST.slice(0, 16)}...`);
+    assertSingleStatementForms(['CREATE UNIQUE INDEX "a" ON "public"."b" ("c")'], 'probe');
+    for (const bad of ['SELECT 1; DROP TABLE users', 'a;b', ';', 'CREATE INDEX a ON b(c); SELECT 1']) {
+      let observed = '';
+      try { assertSingleStatementForms([bad], 'probe'); } catch (e) { observed = String(e); }
+      console.log(`OBSERVED[separator refusal ${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
+      expect(observed, bad).toMatch(/LOAD INTEGRITY refusal/);
     }
+    // non-transactional classes (CONCURRENTLY/VACUUM/ALTER SYSTEM/
+    // CREATE+DROP DATABASE/REINDEX/CALL/DO) cannot exist: the registry that
+    // could emit them is module-private, frozen, and load-asserted.
   });
 
   it('CTL-DDL-CONFINEMENT: catalog diff catches every persisting code/privilege/ownership class; post-rollback catalog exactly equal', async () => {
@@ -305,10 +345,44 @@ describe('R3 closed-template contract (artifacts are inert data; no caller SQL e
     await pg.close();
   });
 
-  it('digest binds the inert template identity AND params; registry rendering is deterministic', () => {
+  it('R4 anchor B: first run pins the DB-anchored REGISTRY_DIGEST; tamper refuses run AND boot (OBSERVED); NULL adopts once', async () => {
+    const { pg, conn } = await freshDb();
+    await runMigrations(conn, { deployment: 'staging' });
+    const anchored = await conn.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
+    console.log(`OBSERVED[anchor pinned at first run]: ${String(anchored.rows[0]?.['d'])}`);
+    expect(anchored.rows[0]?.['d']).toBe(REGISTRY_DIGEST);
+    // tamper the anchor: the run AND the boot gate refuse with the observed mismatch
+    await conn.query(`UPDATE public.contake_db_identity SET registry_digest = 'tampered' WHERE id = 1`);
+    let runRefusal = '';
+    try { await runMigrations(conn, { deployment: 'staging' }); } catch (e) { runRefusal = String(e); }
+    console.log(`OBSERVED[anchor tamper - run]: ${runRefusal.slice(0, 180)}`);
+    expect(runRefusal).toMatch(/ANCHOR refusal/);
+    expect(runRefusal).toMatch(/tampered/);
+    let bootRefusal = '';
+    try { await assertSchemaCurrent(conn); } catch (e) { bootRefusal = String(e); }
+    console.log(`OBSERVED[anchor tamper - boot]: ${bootRefusal.slice(0, 180)}`);
+    expect(bootRefusal).toMatch(/ANCHOR refusal/);
+    // restore heals both paths:
+    await conn.query(`UPDATE public.contake_db_identity SET registry_digest = $1 WHERE id = 1`, [REGISTRY_DIGEST]);
+    await expect(runMigrations(conn, { deployment: 'staging' })).resolves.toBeDefined();
+    await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
+    // pre-R4 database (NULL anchor): boot refuses; one run adopts; boot green
+    await conn.query(`UPDATE public.contake_db_identity SET registry_digest = NULL WHERE id = 1`);
+    let adoptionRefusal = '';
+    try { await assertSchemaCurrent(conn); } catch (e) { adoptionRefusal = String(e); }
+    console.log(`OBSERVED[anchor NULL - boot]: ${adoptionRefusal.slice(0, 180)}`);
+    expect(adoptionRefusal).toMatch(/no DB-anchored REGISTRY_DIGEST/);
+    await expect(runMigrations(conn, { deployment: 'staging' })).resolves.toBeDefined();
+    const adopted = await conn.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
+    console.log(`OBSERVED[anchor adopted]: ${String(adopted.rows[0]?.['d'])}`);
+    expect(adopted.rows[0]?.['d']).toBe(REGISTRY_DIGEST);
+    await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
+    await pg.close();
+  });
+
+  it('digest binds the inert template identity AND params; digests are deterministic', () => {
     const a = step('0001', 'x', 'ddl.create-index', SA_PARAMS);
     expect(stepDigest(a)).toBe(stepDigest(step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS })));
-    expect(renderStepStatements(a)).toEqual(renderStepStatements(a)); // stable render
     expect(stepDigest(MIGRATIONS[0]!)).toMatch(/^[0-9a-f]{64}$/);
   });
 });

@@ -408,3 +408,59 @@ entirely; the R2 canonical diff survives only at secondary scope.
   sequence restore contract (capture/drift/restore/PROPAGATING failure),
   >2^53 exactness, pre-existing-object alteration matrix, default-privilege
   lockdown.
+
+## R4 minimal integrity correction (trust-head ruling R4, 2026-09-18)
+
+R4 is the binding correction inside R3: self-consistency is not authenticity,
+so every digest check names its anchor. The R3 closed-template contract is
+unchanged in shape; what changes is where the registry lives and what a digest
+is anchored to.
+
+1. The template registry, named forms, and all render capability are
+   module-private and deeply frozen at load. Nothing outside the runner module
+   can read, replace, or mutate a template or a named form; no rendered SQL
+   leaves the module. The only exported integrity surfaces are
+   `REGISTRY_DIGEST` (a hash, for reviewer recording) and
+   `assertSingleStatementForms` (a pure assertion over caller-supplied forms).
+   The staging DATA registry follows the same confinement with
+   `DATA_REGISTRY_DIGEST`.
+2. ONE canonical `REGISTRY_DIGEST` over the full frozen blueprint (template
+   identities, parameter schemas, render source, named forms, zero-param
+   rendered bytes); every v8 step digest derives from it. The seed side has
+   one canonical `DATA_REGISTRY_DIGEST` over the full frozen DATA blueprint.
+3. Two trust anchors: anchor A - the reviewer records the expected digest
+   from reviewed source; anchor B - the database anchors the digest at the
+   first pinned governed run (`contake_db_identity.registry_digest`) and at
+   boot. Any later run or boot compares the anchored digest and refuses drift
+   with the observed mismatch; a missing anchor (pre-R4 database) is adopted
+   by exactly one governed run while the boot gate refuses until then. The
+   seed persists and compares `staging_seed_state.data_registry_digest` on
+   every rerun - DATA drift refuses even when every row is byte-identical.
+4. The parser dependency is removed (`pgsql-ast-parser` deleted from the
+   manifest and lockfile; the runner header rewritten). Single-statement
+   construction is guaranteed by a load-time assertion over every template
+   shape (rendered with schema-valid sample params) and every named form; a
+   statement separator refuses the module at load. Statements are
+   identifier-only structure with bound literals, executed as one driver call.
+5. The authenticity chain is explicit: source-head SHA, frozen lockfile,
+   clean literal-blueprint build, dist hashes, instance pin, DB anchor. The
+   in-process freeze covers runtime mutation; loader/build tamper is caught
+   by the named chain outside the process.
+
+### R4 evidence
+
+- `apps/api/tests/release-migrations.test.ts` (31 tests): the R4 gate suite -
+  catalog-observed SA index (exact pg_indexes indexdef), runner-driven
+  registration refusals for every parameter-injection class, export-surface
+  impossibility (registry/named forms/render resolve to undefined; module
+  namespace immutable), load-time separator refusal with OBSERVED text,
+  anchor B unit proofs (pin, tamper refusal at run AND boot with observed
+  mismatch, restore, NULL adoption) - plus the runner suite unchanged.
+- `apps/api/tests/staging-seed.test.ts` (18 tests): adds the DATA anchor
+  proofs - pinned at first seed, drift refusal with identical rows (OBSERVED),
+  restore, NULL adoption.
+- `apps/api/evidence-realpg-release-migrations.mts` phases 1-4 on real
+  PostgreSQL 14 (122 checks): R3 coverage plus anchor A surface recording,
+  confined-surface proofs, named-form tamper load refusal, anchor B tamper
+  refusal at run AND boot on real PG, and DATA anchor drift with identical
+  rows after a REAL cluster restart.

@@ -20,11 +20,12 @@
 import { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
 import {
-  MIGRATIONS, TEMPLATES, assertDirectDatabaseUrl, assertSchemaCurrent, assertZeroCatalogDelta, catalogSnapshot,
-  renderStepStatements, restoreSequenceValues, runMigrations, sequenceValues, stepDigest, templateHash,
+  MIGRATIONS, REGISTRY_DIGEST, assertDirectDatabaseUrl, assertSchemaCurrent, assertSingleStatementForms, assertZeroCatalogDelta, catalogSnapshot,
+  restoreSequenceValues, runMigrations, sequenceValues, stepDigest,
   type MigrationStep,
 } from './src/migrations/runner.js';
-import { runStagingSeed } from './src/migrations/staging-seed.js';
+import * as runnerModule from './src/migrations/runner.js';
+import { DATA_REGISTRY_DIGEST, runStagingSeed } from './src/migrations/staging-seed.js';
 
 const phase = process.argv[2];
 const host = process.argv[3] ?? '/tmp';
@@ -212,6 +213,18 @@ if (phase === 'phase1') {
   check('seeded rows durable across restart', Number(u.rows[0]?.['n']) === 5, u.rows[0]?.['n']);
   const r = await runStagingSeed(db, { marker: '1', credentials: CREDS });
   check('exact rerun still verified after restart', r.alreadyApplied === true);
+  // R4 DATA anchor on REAL PG: pinned at first seed; drift with IDENTICAL
+  // rows refuses the rerun on the anchor alone; restore heals.
+  const da = await db.query(`SELECT data_registry_digest AS d FROM staging_seed_state WHERE id = 1`);
+  check('R4: DATA registry digest pinned at first seed (OBSERVED)', da.rows[0]?.['d'] === DATA_REGISTRY_DIGEST, da.rows[0]?.['d']);
+  await db.query(`UPDATE staging_seed_state SET data_registry_digest = 'tampered' WHERE id = 1`);
+  let dataDrift = '';
+  try { await runStagingSeed(db, { marker: '1', credentials: CREDS }); } catch (e) { dataDrift = String(e); }
+  console.error(`OBSERVED[data anchor drift - identical rows]: ${dataDrift.slice(0, 220)}`);
+  check('R4: DATA anchor drift refuses rerun even with identical rows (OBSERVED)', /DATA ANCHOR refusal/.test(dataDrift), dataDrift.slice(0, 180));
+  await db.query(`UPDATE staging_seed_state SET data_registry_digest = $1 WHERE id = 1`, [DATA_REGISTRY_DIGEST]);
+  const healed = await runStagingSeed(db, { marker: '1', credentials: CREDS });
+  check('R4: DATA anchor restore heals the rerun', healed.alreadyApplied === true);
   await db.end();
 } else if (phase === 'phase3') {
   // v1.5: least-privilege migration role + attacker regressions on REAL PG.
@@ -273,34 +286,71 @@ if (phase === 'phase1') {
   // parse, so every code-object / DML / ALTER-OWNER shape is inexpressible;
   // typed-param injection dies in the closed binders. OBSERVED refusal text
   // for every attack.
-  const registryAttacks: [string, MigrationStep][] = [
-    ['caller SQL as template name', { version: '9', name: 'x', description: 'x', template: `CREATE OPERATOR public.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = f)`, params: {} }],
-    ['DO block as template name', { version: '9', name: 'x', description: 'x', template: `DO $$ BEGIN RAISE NOTICE 'x'; END $$`, params: {} }],
-    ['mutating CTE as template name', { version: '9', name: 'x', description: 'x', template: `WITH d AS (DELETE FROM public.users RETURNING *) SELECT 1`, params: {} }],
-    ['ALTER OWNER as template name', { version: '9', name: 'x', description: 'x', template: `ALTER TABLE public.users OWNER TO postgres`, params: {} }],
-    ['typed-param injection: quote/semicolon identifier', saStep({ table: 'users"; DROP TABLE users;--' }, { version: '9' })],
-    ['typed-param injection: schema-path identifier', saStep({ table: 'attacker.users' }, { version: '9' })],
-    ['typed-param injection: pg_ system prefix', saStep({ index: 'pg_evil' }, { version: '9' })],
-    ['typed-param injection: enum escape', saStep({ unique: 'concurrently' }, { version: '9' })],
-    ['typed-param injection: non-string literal', saStep({ index: 1 as never }, { version: '9' })],
-    ['typed-param injection: free-text expression', saStep({ expression: 'attacker.lower(phone)' }, { version: '9' })],
-    ['typed-param injection: free-text predicate', saStep({ predicate: 'true' }, { version: '9' })],
-    ['typed-param injection: extra param (schema drift)', saStep({ extra: 'x' }, { version: '9' })],
-    ['typed-param injection: missing param', { version: '9', name: 'x', description: 'x', template: 'ddl.create-index', params: { index: 'x' } as never }],
+  // R4: there is no exported render - every attack is driven THROUGH
+  // runMigrations as a not-yet-applied version (registration-time refusal).
+  const registryAttacks: [string, MigrationStep, RegExp][] = [
+    ['caller SQL as template name', { version: '0002', name: 'x', description: 'x', template: `CREATE OPERATOR public.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = f)`, params: {} }, /unknown template name/],
+    ['DO block as template name', { version: '0002', name: 'x', description: 'x', template: `DO $$ BEGIN RAISE NOTICE 'x'; END $$`, params: {} }, /unknown template name/],
+    ['mutating CTE as template name', { version: '0002', name: 'x', description: 'x', template: `WITH d AS (DELETE FROM public.users RETURNING *) SELECT 1`, params: {} }, /unknown template name/],
+    ['ALTER OWNER as template name', { version: '0002', name: 'x', description: 'x', template: `ALTER TABLE public.users OWNER TO postgres`, params: {} }, /unknown template name/],
+    ['typed-param injection: quote/semicolon identifier', saStep({ table: 'users"; DROP TABLE users;--' }, { version: '0002' }), /TEMPLATE refusal/],
+    ['typed-param injection: schema-path identifier', saStep({ table: 'attacker.users' }, { version: '0002' }), /TEMPLATE refusal/],
+    ['typed-param injection: pg_ system prefix', saStep({ index: 'pg_evil' }, { version: '0002' }), /TEMPLATE refusal/],
+    ['typed-param injection: enum escape', saStep({ unique: 'concurrently' }, { version: '0002' }), /TEMPLATE refusal/],
+    ['typed-param injection: non-string literal', saStep({ index: 1 as never }, { version: '0002' }), /TEMPLATE refusal/],
+    ['typed-param injection: free-text expression', saStep({ expression: 'attacker.lower(phone)' }, { version: '0002' }), /TEMPLATE refusal/],
+    ['typed-param injection: free-text predicate', saStep({ predicate: 'true' }, { version: '0002' }), /TEMPLATE refusal/],
+    ['typed-param injection: extra param (schema drift)', saStep({ extra: 'x' }, { version: '0002' }), /TEMPLATE refusal/],
+    ['typed-param injection: missing param', { version: '0002', name: 'x', description: 'x', template: 'ddl.create-index', params: { index: 'x' } as never }, /TEMPLATE refusal/],
   ];
-  for (const [label, bad] of registryAttacks) {
+  for (const [label, bad, re] of registryAttacks) {
     let refused = false; let observed = '';
-    try { renderStepStatements(bad); } catch (e) { refused = true; observed = String(e); }
+    try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, bad] }); } catch (e) { refused = true; observed = String(e); }
     console.error(`OBSERVED[registry attack ${label}]: ${observed.slice(0, 200)}`);
-    check(`attacker regression refused: ${label}`, refused && /TEMPLATE refusal/.test(observed), observed.slice(0, 160));
+    check(`attacker regression refused at registration: ${label}`, refused && re.test(observed), observed.slice(0, 160));
   }
   // Registry/artifact tamper: param edits move the step digest; render-source
   // edits move the template hash (hash-pinned registry, fail-closed).
   const pinnedDigest = stepDigest(saStep({}, { version: '0002' }));
   check('param tamper moves the step digest', stepDigest(saStep({ index: 'evil_idx' }, { version: '0002' })) !== pinnedDigest);
-  const realTemplate = TEMPLATES.find(t => t.name === 'ddl.create-index')!;
-  const tamperedTemplate = { ...realTemplate, render: () => [{ text: 'CREATE FUNCTION public.evil() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$', values: [] as unknown[] }] };
-  check('registry render tamper moves the template hash', templateHash(tamperedTemplate) !== templateHash(realTemplate));
+  // R4 anchor A surface: ONE canonical REGISTRY_DIGEST over the frozen
+  // blueprint is exported for the reviewer to record from reviewed source;
+  // every v8 step digest derives from it (OBSERVED).
+  console.error(`OBSERVED[anchor A]: REGISTRY_DIGEST=${REGISTRY_DIGEST}`);
+  check('R4 anchor A: canonical REGISTRY_DIGEST surfaced for reviewer recording (OBSERVED)', /^[0-9a-f]{64}$/.test(REGISTRY_DIGEST), REGISTRY_DIGEST);
+  check('R4 anchor A: a wrong expected digest is detectably different', REGISTRY_DIGEST !== 'deadbeef'.repeat(8));
+  // R4 section 1: the registry/named forms/render capability are not on the
+  // module surface - external mutation is IMPOSSIBLE (OBSERVED undefined).
+  for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'getTemplate', 'renderStepStatements', 'templateHash']) {
+    const surfaced = (runnerModule as Record<string, unknown>)[name];
+    console.error(`OBSERVED[confined surface ${name}]: ${typeof surfaced}`);
+    check(`R4: registry surface confined - ${name} not exported`, surfaced === undefined, typeof surfaced);
+  }
+  // R4 section 4: tampered named forms carrying a statement separator are
+  // refused by the load-time assertion (OBSERVED refusal text).
+  for (const badForm of ['phone IS NOT NULL; DROP TABLE users', 'btrim(phone); SELECT 1']) {
+    let sepObserved = '';
+    try { assertSingleStatementForms([badForm], 'named-form tamper'); } catch (e) { sepObserved = String(e); }
+    console.error(`OBSERVED[named-form tamper load refusal]: ${sepObserved.slice(0, 180)}`);
+    check('R4: named-form tamper refused by the load-time assertion (OBSERVED)', /LOAD INTEGRITY refusal/.test(sepObserved), sepObserved.slice(0, 150));
+  }
+  // R4 anchor B on REAL PG: pinned at the first governed run above; tampering
+  // the anchor refuses BOTH the run and the boot gate with the observed
+  // mismatch; restore heals.
+  const ab = await mig.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
+  check('R4 anchor B: DB-anchored digest pinned at first governed run (OBSERVED)', ab.rows[0]?.['d'] === REGISTRY_DIGEST, ab.rows[0]?.['d']);
+  await mig.query(`UPDATE public.contake_db_identity SET registry_digest = 'tampered' WHERE id = 1`);
+  let abRun = '';
+  try { await runMigrations(mig, { deployment: 'staging' }); } catch (e) { abRun = String(e); }
+  console.error(`OBSERVED[anchor B tamper - run]: ${abRun.slice(0, 200)}`);
+  check('R4 anchor B: run refuses anchored drift on REAL PG (OBSERVED)', /ANCHOR refusal/.test(abRun), abRun.slice(0, 160));
+  let abBoot = '';
+  try { await assertSchemaCurrent(mig, undefined, { deployment: 'staging', instanceId: rr.identity.instanceId }); } catch (e) { abBoot = String(e); }
+  console.error(`OBSERVED[anchor B tamper - boot]: ${abBoot.slice(0, 200)}`);
+  check('R4 anchor B: boot gate refuses anchored drift on REAL PG (OBSERVED)', /ANCHOR refusal/.test(abBoot), abBoot.slice(0, 160));
+  await mig.query(`UPDATE public.contake_db_identity SET registry_digest = $1 WHERE id = 1`, [REGISTRY_DIGEST]);
+  await assertSchemaCurrent(mig, undefined, { deployment: 'staging', instanceId: rr.identity.instanceId });
+  check('R4 anchor B: restore heals the boot gate', true);
 
   // R3 section-3 boot-gate tamper proofs on REAL PG: edited applied history
   // fails the boot gate; restoring the pinned digest makes it green again.
@@ -351,19 +401,27 @@ if (phase === 'phase1') {
   // R3: non-transactional / code classes CANNOT EXIST BY CONSTRUCTION - no
   // template emits them (full-registry render sweep), no template NAME can
   // request them, and the closed enums carry no escape value.
-  const allRendered = TEMPLATES.flatMap(t => renderStepStatements(t.name === 'ddl.create-index'
-    ? { version: '0', name: 'x', description: 'x', template: t.name, params: { ...SA_PARAMS } }
-    : { version: '0', name: 'x', description: 'x', template: t.name, params: {} }));
-  check('conf: full-registry render sweep emits no non-transactional/code class',
-    allRendered.every(st => !/CONCURRENTLY|\bVACUUM\b|ALTER SYSTEM|CREATE DATABASE|DROP DATABASE|REINDEX|\bCALL\b|\bDO\b|SECURITY DEFINER/i.test(st.text)));
-  for (const label of ['create-index-concurrently', 'vacuum', 'alter-system', 'create-database', 'call', 'do', 'security-definer-function']) {
-    let refused = false;
-    try { renderStepStatements({ version: '9', name: 'x', description: 'x', template: `ddl.${label}`, params: {} }); } catch { refused = true; }
-    check(`conf: no template exists for non-tx class: ${label}`, refused);
+  // R4: the registry cannot be rendered from outside at all - non-tx/code
+  // classes are inexpressible. Confined surface + catalog-observed absence
+  // on the LIVE database + runner-driven registration refusals.
+  for (const name of ['TEMPLATES', 'renderStepStatements', 'getTemplate']) {
+    check(`conf: registry confined - ${name} not exported`, (runnerModule as Record<string, unknown>)[name] === undefined);
   }
-  let concRefused = false;
-  try { renderStepStatements(saStep({ unique: 'concurrently' }, { version: '9' })); } catch { concRefused = true; }
-  check('conf: enum escape toward CONCURRENTLY refused by the closed enum', concRefused);
+  const codeObjs = await mig.query(`SELECT
+    (SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public') AS f,
+    (SELECT count(*)::int FROM pg_trigger WHERE NOT tgisinternal) AS t,
+    (SELECT count(*)::int FROM pg_policy) AS p`);
+  console.error(`OBSERVED[code-object absence on live db]: ${JSON.stringify(codeObjs.rows[0])}`);
+  check('conf: catalog-observed absence of code objects after the governed run',
+    Number(codeObjs.rows[0]?.['f']) === 0 && Number(codeObjs.rows[0]?.['t']) === 0 && Number(codeObjs.rows[0]?.['p']) === 0, codeObjs.rows[0]);
+  for (const label of ['create-index-concurrently', 'vacuum', 'alter-system', 'create-database', 'call', 'do', 'security-definer-function']) {
+    let refused = false; let ntxObs = '';
+    try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, { version: '0002', name: 'x', description: 'x', template: `ddl.${label}`, params: {} }] }); } catch (e) { refused = true; ntxObs = String(e); }
+    check(`conf: no template exists for non-tx class: ${label}`, refused && /unknown template name/.test(ntxObs), ntxObs.slice(0, 120));
+  }
+  let concRefused = false; let concObs = '';
+  try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, saStep({ unique: 'concurrently' }, { version: '0002' })] }); } catch (e) { concRefused = true; concObs = String(e); }
+  check('conf: enum escape toward CONCURRENTLY refused by the closed enum', concRefused && /TEMPLATE refusal - enum/.test(concObs), concObs.slice(0, 120));
 
   // (2)+(3)+(5) NAMED ATTACK: SECURITY DEFINER trigger function planted under
   // the migration role must not survive to fire under runtime-role INSERT;

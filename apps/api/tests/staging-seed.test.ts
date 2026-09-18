@@ -12,7 +12,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { pgliteConnectable, type Connectable } from '../src/repo/postgres.js';
 import { runMigrations } from '../src/migrations/runner.js';
 import {
-  assertNoForbidden, deriveFixtureIdentifiers, deriveForbiddenIdentifiers, runStagingSeed,
+  assertNoForbidden, DATA_REGISTRY_DIGEST, deriveFixtureIdentifiers, deriveForbiddenIdentifiers, runStagingSeed,
 } from '../src/migrations/staging-seed.js';
 import { hashPasswordPure } from '../src/auth.js';
 import { scryptSync, timingSafeEqual } from 'node:crypto';
@@ -171,6 +171,34 @@ describe('staging synthetic seed', () => {
     // Drift one seeded row outside the seed transaction.
     await conn.query(`UPDATE tasks SET data = jsonb_set(data, '{name}', '"mutated"')`);
     await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS })).rejects.toThrow(/RERUN INTEGRITY/);
+    await pg.close();
+  });
+
+  it('R4 DATA anchor: digest pinned at first seed; drift refuses rerun even with identical rows; NULL adopts once', async () => {
+    const { pg, conn } = await stagingDb();
+    await runStagingSeed(conn, { marker: '1', credentials: CREDS });
+    const pinned = await conn.query(`SELECT data_registry_digest AS d FROM staging_seed_state WHERE id = 1`);
+    console.log(`OBSERVED[data anchor pinned]: ${String(pinned.rows[0]?.['d'])}`);
+    expect(pinned.rows[0]?.['d']).toBe(DATA_REGISTRY_DIGEST);
+    // drift the anchor WITHOUT touching any row: the manifest stays
+    // byte-identical, yet the rerun must refuse on the anchor alone.
+    await conn.query(`UPDATE staging_seed_state SET data_registry_digest = 'tampered' WHERE id = 1`);
+    let driftRefusal = '';
+    try { await runStagingSeed(conn, { marker: '1', credentials: CREDS }); } catch (e) { driftRefusal = String(e); }
+    console.log(`OBSERVED[data anchor drift - identical rows]: ${driftRefusal.slice(0, 200)}`);
+    expect(driftRefusal).toMatch(/DATA ANCHOR refusal/);
+    expect(driftRefusal).toMatch(/tampered/);
+    // restore heals; the rerun is an idempotent no-op again
+    await conn.query(`UPDATE staging_seed_state SET data_registry_digest = $1 WHERE id = 1`, [DATA_REGISTRY_DIGEST]);
+    const r = await runStagingSeed(conn, { marker: '1', credentials: CREDS });
+    expect(r.alreadyApplied).toBe(true);
+    // pre-R4 database (NULL anchor): one rerun adopts, then stable
+    await conn.query(`UPDATE staging_seed_state SET data_registry_digest = NULL WHERE id = 1`);
+    const r2 = await runStagingSeed(conn, { marker: '1', credentials: CREDS });
+    expect(r2.alreadyApplied).toBe(true);
+    const adopted = await conn.query(`SELECT data_registry_digest AS d FROM staging_seed_state WHERE id = 1`);
+    console.log(`OBSERVED[data anchor adopted]: ${String(adopted.rows[0]?.['d'])}`);
+    expect(adopted.rows[0]?.['d']).toBe(DATA_REGISTRY_DIGEST);
     await pg.close();
   });
 

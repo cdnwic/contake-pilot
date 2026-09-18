@@ -125,7 +125,7 @@ interface DataTemplateEntry {
 }
 
 const DATA_IDENT = /^[a-z_][a-z0-9_]*$/;
-export const DATA_TEMPLATES: readonly DataTemplateEntry[] = [
+const DATA_TEMPLATES: readonly DataTemplateEntry[] = [
   { name: 'data.users.upsert', table: 'users', columns: ['user_id', 'org_id', 'email', 'phone', 'data'], conflict: 'user_id', update: ['org_id', 'email', 'phone', 'data'] },
   { name: 'data.channels.upsert', table: 'channels', columns: ['id', 'org_id', 'address', 'data'], conflict: 'id', update: ['org_id', 'address', 'data'] },
   { name: 'data.events.upsert', table: 'events', columns: ['id', 'org_id', 'version', 'data'], conflict: 'id', update: ['org_id', 'version', 'data'] },
@@ -150,15 +150,7 @@ export const DATA_TEMPLATES: readonly DataTemplateEntry[] = [
   }
 }
 
-export const dataTemplateHash = (t: DataTemplateEntry): string =>
-  createHash('sha256').update(`contake-data-template/v1\n${t.name}\n${canonicalJson({ table: t.table, columns: t.columns, conflict: t.conflict, update: t.update })}`).digest('hex');
-
-/** Pinned registry fingerprint, bound into the staging inventory. */
-export const DATA_REGISTRY_SHA256 = createHash('sha256')
-  .update(canonicalJson(DATA_TEMPLATES.map(t => [t.name, dataTemplateHash(t)])))
-  .digest('hex');
-
-export function getDataTemplate(name: string): DataTemplateEntry {
+function getDataTemplate(name: string): DataTemplateEntry {
   const t = DATA_TEMPLATES.find(x => x.name === name);
   if (!t) throw new Error(`seed:staging: DATA refusal - unknown template name "${name}" - the registry is closed (fail-closed)`);
   return t;
@@ -175,7 +167,7 @@ function bindDataLiteral(v: unknown): string | number | boolean | null {
   throw new Error(`seed:staging: DATA refusal - a ${v === undefined ? 'undefined' : k} value cannot be bound; literals are bound parameters, never interpolated`);
 }
 
-export function renderDataStatement(templateName: string, values: readonly unknown[]): { text: string; values: (string | number | boolean | null)[] } {
+function renderDataStatement(templateName: string, values: readonly unknown[]): { text: string; values: (string | number | boolean | null)[] } {
   const t = getDataTemplate(templateName);
   if (values.length !== t.columns.length) {
     throw new Error(`seed:staging: DATA refusal - template '${t.name}' takes exactly ${t.columns.length} bound values (${t.columns.join(', ')}), got ${values.length}`);
@@ -188,6 +180,47 @@ export function renderDataStatement(templateName: string, values: readonly unkno
     text: `INSERT INTO "public"."${t.table}"(${cols}) VALUES (${ph}) ON CONFLICT ("${t.conflict}") DO UPDATE SET ${set}`,
     values: bound,
   };
+}
+
+/** R4 section 1: the DATA registry is module-private and deeply frozen at
+ *  load; no render capability leaves this module. */
+{
+  const deepFreezeData = <T>(o: T): T => {
+    if (o && typeof o === 'object') {
+      for (const k of Object.keys(o as Record<string, unknown>)) deepFreezeData((o as Record<string, unknown>)[k]);
+      Object.freeze(o);
+    }
+    return o;
+  };
+  deepFreezeData(DATA_TEMPLATES);
+}
+
+/** R4 section 1: ONE canonical serialization of the frozen DATA blueprint,
+ *  hashed at module load AFTER freezing. Persisted into staging_seed_state
+ *  at the first seed and compared on every rerun (anchor B for data). */
+export const DATA_REGISTRY_DIGEST: string = createHash('sha256')
+  .update(`contake-data-registry/v1\n${canonicalJson(DATA_TEMPLATES)}`)
+  .digest('hex');
+
+// R4 section 4: single-statement construction guarantee over the frozen DATA
+// family - rendered shapes (with schema-valid sentinel values) may never
+// contain a statement separator; failure refuses the module at load.
+{
+  const sentinels: Record<string, unknown[]> = {
+    'data.users.upsert': ['u', 'o', null, null, '{}'],
+    'data.channels.upsert': ['c', 'o', 'a', '{}'],
+    'data.events.upsert': ['e', 'o', 1, '{}'],
+    'data.resources.upsert': ['r', 'e', 1, '{}'],
+    'data.tasks.upsert': ['t', 'e', 1, '{}'],
+    'data.dependencies.upsert': ['d', 'a', 'b', '{}'],
+    'data.whitelist.upsert': ['p', 'o', 's', '{}'],
+  };
+  for (const t of DATA_TEMPLATES) {
+    const st = renderDataStatement(t.name, sentinels[t.name]!);
+    if (st.text.includes(';')) {
+      throw new Error(`seed:staging: LOAD INTEGRITY refusal - statement separator in DATA template '${t.name}' - the module refuses to load (fail-closed)`);
+    }
+  }
 }
 
 /** Explicit bookkeeping tables owned by the runner/seed (excluded from the
@@ -274,6 +307,7 @@ CREATE TABLE IF NOT EXISTS staging_seed_state(
   manifest_sha256 text NOT NULL,
   applied_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE staging_seed_state ADD COLUMN IF NOT EXISTS data_registry_digest text;
 `;
 
 export interface LiveManifest { rows: { table: string; pk: string; digest: string }[]; emptyTables: string[] }
@@ -361,8 +395,20 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
 
     // Gate 3: EXACT rerun (canonical live-row digests must match the stored
     // manifest) or newly initialized empty DB; anything else is dirty/foreign.
-    const state = await client.query(`SELECT seed_instance_id, inventory_sha256, manifest_sha256 FROM staging_seed_state WHERE id = 1`);
+    const state = await client.query(`SELECT seed_instance_id, inventory_sha256, manifest_sha256, data_registry_digest FROM staging_seed_state WHERE id = 1`);
     if (state.rows[0]) {
+      // R4 anchor B for the DATA family: the persisted registry digest is
+      // compared on EVERY rerun - drift refuses even when rows are identical.
+      const anchoredData = state.rows[0]['data_registry_digest'];
+      if (anchoredData === null || anchoredData === undefined) {
+        await client.query(`UPDATE staging_seed_state SET data_registry_digest = $1 WHERE id = 1`, [DATA_REGISTRY_DIGEST]);
+      } else if (String(anchoredData) !== DATA_REGISTRY_DIGEST) {
+        throw new Error(
+          `seed:staging: DATA ANCHOR refusal - persisted DATA registry digest drift ` +
+          `(anchored ${String(anchoredData).slice(0, 16)}... vs actual ${DATA_REGISTRY_DIGEST.slice(0, 16)}...): the running DATA ` +
+          `registry no longer matches the blueprint this staging database anchored - refusing even though row state may match (fail-closed)`,
+        );
+      }
       const live = await computeLiveManifest(client);
       const liveManifest = manifestDigest(live);
       if (liveManifest !== String(state.rows[0]['manifest_sha256'])) {
@@ -390,7 +436,7 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
           rowDigests: live.rows,
           emptyTables: live.emptyTables,
           manifestSha256: liveManifest,
-          dataRegistrySha256: DATA_REGISTRY_SHA256,
+          dataRegistrySha256: DATA_REGISTRY_DIGEST,
           absenceProof: {
             fixtureIdentifiersChecked: fixtureForbidden.length,
             forbiddenIdentifiersChecked: envForbidden.length,
@@ -564,7 +610,7 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
       rowDigests,
       emptyTables: live.emptyTables,
       manifestSha256,
-      dataRegistrySha256: DATA_REGISTRY_SHA256,
+      dataRegistrySha256: DATA_REGISTRY_DIGEST,
       absenceProof: {
         fixtureIdentifiersChecked: fixtureForbidden.length,
         forbiddenIdentifiersChecked: envForbidden.length,
@@ -582,8 +628,8 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
     }
 
     await client.query(
-      `INSERT INTO staging_seed_state(id, seed_instance_id, inventory_sha256, manifest_sha256) VALUES(1, $1, $2, $3)`,
-      [inventory.seedInstanceId, inventory.inventorySha256, manifestSha256],
+      `INSERT INTO staging_seed_state(id, seed_instance_id, inventory_sha256, manifest_sha256, data_registry_digest) VALUES(1, $1, $2, $3, $4)`,
+      [inventory.seedInstanceId, inventory.inventorySha256, manifestSha256, DATA_REGISTRY_DIGEST],
     );
     await client.query('COMMIT');
 
