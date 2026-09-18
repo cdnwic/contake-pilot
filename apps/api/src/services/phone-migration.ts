@@ -1,12 +1,12 @@
-/** users-phone duplicate preflight + FORWARD migration (QA 21:06 stop-ship;
- *  narrowed SA v8 scope, TL 2026-09-18): for deployments whose users data
+/** users-phone duplicate preflight + FORWARD migration (QA 21:06 stop-ship,
+ *  architecture separation 2026-09-18: the bespoke backup/restore CLI is
+ *  DECOUPLED from the Super Admin gate - it lives on the separate infra
+ *  track; this module is preflight + normalize + canonical index +
+ *  locked maintenance migration ONLY. Full history preserved in git).
+ *  v2 2026-09-18 after QA/security review): for deployments whose users data
  *  predates the users_phone_unique partial unique index on btrim(phone).
  *  The index is NOT created at bootstrap (preservation-first): it is created
- *  ONLY by this module, after a clean preflight, on the resolved database.
- *  The bespoke backup/restore CLI is DECOUPLED from this gate (architecture
- *  separation 2026-09-18): it lives on the separate infra track, preserved
- *  in git history. This module is preflight + normalize + canonical index +
- *  locked maintenance migration + the standard forward runner ONLY.
+ *  ONLY by this tool, after a clean preflight, on the resolved database.
  *
  *  Guarantees:
  *  - PREFLIGHT IS READ-ONLY and models EVERY distinct normalized phone
@@ -17,19 +17,34 @@
  *    creation pending an explicit operator decision - the tool never
  *    silently picks the column (or any) winner, never deletes, never mutates.
  *  - usersWithPhone counts a row when EITHER representation carries a phone.
+ *  - REVERSIBLE: backup captures every users row PLUS the users_phone_unique
+ *    index state (existence + definition); restore writes the rows back in
+ *    one transaction, restores the index state (recreate or verified drop),
+ *    and VERIFIES the final state against the backup header, failing loud
+ *    on mismatch.
  *  - NORMALIZATION is ONE REAL TRANSACTION (BEGIN/COMMIT, ROLLBACK on any
  *    failure) trimming the column and the embedded JSON to their own values.
- *  - RESOLVED-DB-ONLY: functions touch ONLY the passed connection; the
- *    runner (scripts/users-phone-migrate.mjs) requires an explicit
- *    --database-url (no default, no ambient env).
- *  - IDEMPOTENT: normalize/createIndex/migrate are safe to re-run.
- *  - REAL WRITE EXCLUSION: migrateUsersPhone takes
+ *  - RESOLVED-DB-ONLY: functions touch ONLY the passed connection; the CLI
+ *    requires an explicit --database-url (no default, no ambient env).
+ *  - IDEMPOTENT: normalize/createIndex/restore are safe to re-run.
+ *
+ *  v4 (QA + security 2026-09-18):
+ *  - AUTHENTICATED ARTIFACTS: every row carries rowSha256 = sha256 over the
+ *    CANONICAL full row (user_id, org_id, email, phone, data; recursively
+ *    key-sorted JSON); the header carries manifestSha256 binding the header
+ *    fields, the index state AND the ordered row digest set. Both are
+ *    verified BEFORE any mutation and again post-restore inside the tx.
+ *  - CLOSED INDEX SCHEMA: the backup stores the index state as a boolean
+ *    plus the definition as EVIDENCE ONLY. Restore NEVER executes SQL from
+ *    the artifact; it recreates exactly one hardcoded canonical statement
+ *    (CANONICAL_INDEX_SQL) and verifies the live definition against it
+ *    (normalized compare). An artifact whose evidence definition is not the
+ *    canonical shape (appended SQL, different expression/predicate/table/
+ *    schema) is REFUSED before any mutation.
+ *  - REAL WRITE EXCLUSION: restoreUsers and migrateUsersPhone take
  *    LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE for the whole transaction
  *    (blocks application INSERT/UPDATE/DELETE, which take ROW EXCLUSIVE),
  *    plus the advisory lock serializing concurrent migration runs.
- *  - ONE DOCUMENTED LOCK ORDER for the maintenance migration:
- *    pg_advisory_xact_lock(MIGRATION_LOCK_KEY) FIRST, then
- *    LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE.
  *  - QUIESCENCE GATE (documented, operator-carried): even with the table
  *    lock, the migration window REQUIRES application writers quiesced
  *    (maintenance mode / writers scaled down) - the lock blocks writers
@@ -37,16 +52,50 @@
  *    writers is itself an operational incident. MIGRATION_LOCK_KEY is
  *    exported for any future writer-side enforcement.
  *
+ *  v5 (QA + security 2026-09-18):
+ *  - AUTHENTICATED ARTIFACTS (MAC): every backup header carries keyId,
+ *    env and macSha256 = HMAC-SHA256 over the FULL canonical artifact
+ *    (header-without-mac + every row line, in order). The key is
+ *    EXTERNAL - provisioned from managed secrets (vault/secret-manager
+ *    env), NEVER committed, NEVER passed via argv, NEVER stored in the
+ *    artifact. Restore verifies keyId (key-version), env (cross-env
+ *    replay) and the MAC BEFORE any mutation; rehashed-but-unsigned
+ *    tampering cannot pass. NO LIVE KEYS are created by this change.
+ *  - ONE DOCUMENTED LOCK ORDER for backup, restore AND maintenance:
+ *    pg_advisory_xact_lock(MIGRATION_LOCK_KEY) FIRST, then
+ *    LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE. Backup additionally
+ *    runs in REPEATABLE READ so rows + index state are one consistent
+ *    snapshot that concurrent row/schema mutation cannot disturb.
+ *  - DURABLE CLI PUBLICATION (v6): temp-write 0600, fsync, TEMP readback
+ *    validation BEFORE publish, atomic no-clobber hard-link (EEXIST if the
+ *    destination appeared) or explicit overwrite via atomic rename-replace,
+ *    containing-directory fsync, temp/final cleanup on every failure.
+ *  - REPLAY/FRESHNESS is exposed ONLY as an EXPLICIT MANDATORY OPERATOR
+ *    GATE (security 2026-09-18): backupId + createdAt are validated
+ *    (shape + canonical finite timestamp) and bound into the MAC so the
+ *    evidence is trustworthy, and the CLI prints them before applying a
+ *    restore - but NO mechanical freshness/replay prevention is claimed:
+ *    a human operator MUST approve every restore against the SAME
+ *    deployment/database ID the artifact was MACed for.
+ *  - AUTHORITATIVE DEPLOYMENT/KEY CONFIG is a LIVE OPERATOR GATE: the
+ *    deployment ID and key version are verified at run time against the
+ *    managed per-deployment allowlists (CONTAKE_BACKUP_ALLOWED_ENVS /
+ *    CONTAKE_BACKUP_ALLOWED_KEY_IDS) - a runtime gate, not a source claim.
+ *  - PER-DEPLOYMENT KEYS: each deployed database gets its OWN managed MAC
+ *    key + keyId + unique env ID; keys are never shared across deployments.
+ *  - NO OVERWRITE (v7): backup publication is no-clobber only; overwrite
+ *    support was removed entirely (no indeterminate post-fsync states).
+ *
  *  OPERATOR GATES for later live use (carried; NO live action now):
  *  1. explicit approval to run the read-only preflight against the live DB;
  *  2. an explicit operator decision per collision/inconsistency group
  *     (which identity wins, per row) - never automatic;
- *  3. an approved atomic migration window for normalize + index creation,
- *     with application-write quiescence;
- *  4. idempotent post-migration verification (preflight clean, index
- *     present, restart re-check). Snapshot/restore rehearsal is owned by
- *     the SEPARATE infra track, not this module. */
-import { createHash } from 'node:crypto';
+ *  3. verified backup + restore rehearsal on a SCRATCH copy before any live
+ *     mutation;
+ *  4. an approved atomic migration window for normalize + index creation;
+ *  5. idempotent post-migration verification (preflight clean, index
+ *     present, restart re-check). */
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Connectable } from '../repo/postgres.js';
 
 export interface PhoneMember {
@@ -104,9 +153,8 @@ const norm = (v: string | null): string | null => {
 const hashData = (data: unknown): string => createHash('sha256').update(JSON.stringify(data)).digest('hex');
 
 
-/** THE ONLY index this module will ever create. The live definition is
- *  verified against this canonical statement after creation (normalized
- *  compare, not byte compare). */
+/** THE ONLY index this tool will ever create. Stored artifact SQL is NEVER
+ *  executed (security 2026-09-18): restore recreates this exact statement. */
 export const CANONICAL_INDEX_SQL =
   `CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users USING btree (btrim(phone)) WHERE phone IS NOT NULL`;
 /** Normalized-compare form (lowercase, no schema qualifier, no parens,
@@ -294,67 +342,4 @@ export async function migrateUsersPhone(conn: Connectable): Promise<MaintenanceR
     }
     return { migrated: true as const, normalized: ids.length, indexPresent: idx.existed, finalPreflight: fin };
   });
-}
-
-/** Standard migration RUNNER report (QA 2026-09-18): the operationally
- *  reachable entry over the SINGLE locked migrateUsersPhone primitive.
- *  Fail-loud: a blocked run carries the FULL blocking preflight (collision
- *  groups + inconsistent rows + reasons); a failed run carries the error
- *  class/message after the primitive's rollback. */
-export interface MigrationRunReport {
-  kind: 'users-phone-migration-run';
-  ranAt: string;
-  migrated: boolean;
-  /** Rows normalized (null when blocked/failed before normalization). */
-  normalized: number | null;
-  /** Independently re-verified AFTER the primitive commits. */
-  indexPresent: boolean;
-  /** The blocking preflight on a blocked run; the final clean preflight on
-   *  a migrated run; null on a thrown failure. */
-  preflight: PreflightReport | null;
-  /** Error message on a thrown failure (rolled back); null otherwise. */
-  error: string | null;
-}
-
-export interface MigrationRunOutcome {
-  /** 0 = migrated clean (idempotent rerun included); 1 = blocked or failed.
-   *  Usage errors (missing/unknown flags) are the wrapper's 64. */
-  exitCode: 0 | 1;
-  report: MigrationRunReport;
-}
-
-/** The standard migration entry (QA 2026-09-18): ONE operationally
- *  reachable path invoking the SINGLE locked migrateUsersPhone primitive on
- *  the RESOLVED connection only. Nonzero status on ANY non-clean outcome:
- *  blocked (full fail-loud preflight evidence) or failed (rolled back).
- *  Final verification: the primitive's under-lock final preflight + index
- *  definition check, PLUS an independent post-commit index probe here. */
-export async function runUsersPhoneMigration(conn: Connectable, now: () => Date = () => new Date()): Promise<MigrationRunOutcome> {
-  const ranAt = now().toISOString();
-  const base = { kind: 'users-phone-migration-run' as const, ranAt };
-  try {
-    const r = await migrateUsersPhone(conn);
-    if (!r.migrated) {
-      return {
-        exitCode: 1,
-        report: { ...base, migrated: false, normalized: null, indexPresent: await usersPhoneIndexExists(conn).catch(() => false), preflight: r.preflight, error: null },
-      };
-    }
-    const indexPresent = await usersPhoneIndexExists(conn); // independent post-commit verification
-    if (!indexPresent) {
-      return {
-        exitCode: 1,
-        report: { ...base, migrated: false, normalized: r.normalized, indexPresent: false, preflight: r.finalPreflight, error: 'post-commit verification failed: users_phone_unique missing after a reported-successful migration' },
-      };
-    }
-    return {
-      exitCode: 0,
-      report: { ...base, migrated: true, normalized: r.normalized, indexPresent, preflight: r.finalPreflight, error: null },
-    };
-  } catch (e) {
-    return {
-      exitCode: 1,
-      report: { ...base, migrated: false, normalized: null, indexPresent: await usersPhoneIndexExists(conn).catch(() => false), preflight: null, error: e instanceof Error ? e.message : String(e) },
-    };
-  }
 }

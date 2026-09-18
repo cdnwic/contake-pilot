@@ -16,7 +16,7 @@ import type { GraphRepository } from '../src/repo/graph-repository.js';
 import type { Connectable } from '../src/repo/postgres.js';
 import {
   createUsersPhoneIndex, MIGRATION_LOCK_KEY, migrateUsersPhone,
-  normalizeUsersPhones, preflightUsersPhone, runUsersPhoneMigration, usersPhoneIndexExists,
+  normalizeUsersPhones, preflightUsersPhone, usersPhoneIndexExists,
 } from '../src/services/phone-migration.js';
 
 const pgOnly = REPO_IMPL === 'memory' ? describe.skip : describe;
@@ -271,121 +271,6 @@ pgOnly('real write exclusion (security 2026-09-18 v4)', () => {
     } finally {
       clientA.release();
       await poolB.end();
-    }
-  });
-});
-
-pgOnly('standard migration runner (QA FAIL 2026-09-18: the forward migration must be operationally reachable)', () => {
-  it('clean run: exit 0, invokes the locked primitive, index independently verified, final preflight clean; idempotent rerun', async () => {
-    await insertLegacy(conn, 'u-r1', 'org-1', '  +15550102011  ', '  +15550102011  ');
-    const out = await runUsersPhoneMigration(conn);
-    expect(out.exitCode).toBe(0);
-    expect(out.report.kind).toBe('users-phone-migration-run');
-    expect(/^\d{4}-\d{2}-\d{2}T/.test(out.report.ranAt)).toBe(true);
-    expect(out.report.migrated).toBe(true);
-    expect(out.report.normalized).toBe(1);
-    expect(out.report.indexPresent).toBe(true); // post-commit independent probe
-    expect(out.report.preflight?.blocking).toBe(false); // final preflight carried
-    expect(out.report.error).toBeNull();
-    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-r1'`)).rows[0]!['phone']).toBe('+15550102011');
-    expect(await usersPhoneIndexExists(conn)).toBe(true);
-    const again = await runUsersPhoneMigration(conn); // idempotent rerun
-    expect(again.exitCode).toBe(0);
-    expect(again.report.normalized).toBe(0);
-  });
-
-  it('blocked run (collision): exit 1, NOTHING written, no index, fail-loud FULL preflight evidence', async () => {
-    await insertLegacy(conn, 'u-rc1', 'org-1', '+15550102021', '+15550102021');
-    await insertLegacy(conn, 'u-rc2', 'org-2', ' +15550102021', '+15550102021');
-    const out = await runUsersPhoneMigration(conn);
-    expect(out.exitCode).toBe(1); // nonzero status
-    expect(out.report.migrated).toBe(false);
-    expect(out.report.error).toBeNull();
-    const pre = out.report.preflight!;
-    expect(pre.blocking).toBe(true);
-    expect(pre.blockingReasons.join(' ')).toContain('collision');
-    const g = pre.collisionGroups.find(x => x.normalizedPhone === '+15550102021');
-    expect(g?.members.map(m => m.userId).sort()).toEqual(['u-rc1', 'u-rc2']); // fail-loud detail
-    expect(g?.members.map(m => m.orgId).sort()).toEqual(['org-1', 'org-2']);
-    expect(await usersPhoneIndexExists(conn)).toBe(false);
-    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-rc2'`)).rows[0]!['phone']).toBe(' +15550102021'); // untouched
-  });
-
-  it('blocked run (inconsistency): exit 1 with inconsistentRows evidence, nothing written', async () => {
-    await insertLegacy(conn, 'u-ri1', 'org-1', '+15550102031', '+15550102032');
-    const out = await runUsersPhoneMigration(conn);
-    expect(out.exitCode).toBe(1);
-    expect(out.report.migrated).toBe(false);
-    expect(out.report.preflight!.inconsistentRows.map(m => m.userId)).toEqual(['u-ri1']);
-    expect(out.report.preflight!.blockingReasons.join(' ')).toContain('inconsistent');
-    expect(await usersPhoneIndexExists(conn)).toBe(false);
-    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-ri1'`)).rows[0]!['phone']).toBe('+15550102031');
-  });
-
-  it('failed run: an injected mid-transaction failure exits 1 with the error and a PROVEN full rollback', async () => {
-    await insertLegacy(conn, 'u-rf1', 'org-1', ' +15550102041 ', '+15550102041');
-    await insertLegacy(conn, 'u-rf2', 'org-1', ' +15550102042 ', '+15550102042');
-    let updates = 0;
-    const failing: Connectable = {
-      query: (text: string, params?: unknown[]) => conn.query(text, params),
-      connect: () => conn.connect().then(client => ({
-        query: (text: string, params?: unknown[]) => {
-          if (/^\s*UPDATE\s+users/i.test(text)) {
-            updates += 1;
-            if (updates === 2) return Promise.reject(new Error('injected runner failure'));
-          }
-          return client.query(text, params);
-        },
-        release: () => client.release(),
-      })),
-    };
-    const out = await runUsersPhoneMigration(failing);
-    expect(out.exitCode).toBe(1);
-    expect(out.report.migrated).toBe(false);
-    expect(out.report.error).toContain('injected runner failure');
-    expect(out.report.preflight).toBeNull();
-    // ENTIRE transaction rolled back: the first row keeps its padded phone, no index
-    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-rf1'`)).rows[0]!['phone']).toBe(' +15550102041 ');
-    expect(await usersPhoneIndexExists(conn)).toBe(false);
-  });
-
-  it('exact DB targeting: the runner touches ONLY the resolved database; an independent second database is untouched', async () => {
-    let conn2: Connectable;
-    let close2: () => Promise<void>;
-    if (REPO_IMPL === 'realpg') {
-      const { Pool } = await import('pg');
-      await conn.query(`DROP DATABASE IF EXISTS users_phone_target_probe`);
-      await conn.query(`CREATE DATABASE users_phone_target_probe`);
-      const u = new URL(process.env['DATABASE_URL'] as string);
-      u.pathname = '/users_phone_target_probe';
-      const pool2 = new Pool({ connectionString: u.toString() });
-      conn2 = pool2 as unknown as Connectable;
-      const { PostgresGraphRepository } = await import('../src/repo/postgres.js');
-      await PostgresGraphRepository.create(conn2);
-      close2 = async () => {
-        await pool2.end();
-        await conn.query(`DROP DATABASE IF EXISTS users_phone_target_probe`);
-      };
-    } else {
-      const { PGlite } = await import('@electric-sql/pglite');
-      const { pgliteConnectable, PostgresGraphRepository } = await import('../src/repo/postgres.js');
-      const raw2 = new PGlite();
-      conn2 = pgliteConnectable(raw2);
-      await PostgresGraphRepository.create(conn2);
-      close2 = () => raw2.close();
-    }
-    try {
-      await insertLegacy(conn, 'u-t1', 'org-1', ' +15550102051 ', '+15550102051');
-      await insertLegacy(conn2, 'u-t2', 'org-1', ' +15550102052 ', '+15550102052');
-      const out = await runUsersPhoneMigration(conn); // resolved DB = conn ONLY
-      expect(out.exitCode).toBe(0);
-      expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-t1'`)).rows[0]!['phone']).toBe('+15550102051');
-      expect(await usersPhoneIndexExists(conn)).toBe(true);
-      // the OTHER database is untouched: padded row kept, no index
-      expect((await conn2.query(`SELECT phone FROM users WHERE user_id='u-t2'`)).rows[0]!['phone']).toBe(' +15550102052 ');
-      expect(await usersPhoneIndexExists(conn2)).toBe(false);
-    } finally {
-      await close2();
     }
   });
 });
