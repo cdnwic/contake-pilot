@@ -48,6 +48,26 @@
  *    writers is itself an operational incident. MIGRATION_LOCK_KEY is
  *    exported for any future writer-side enforcement.
  *
+ *  v5 (QA + security 2026-09-18):
+ *  - AUTHENTICATED ARTIFACTS (MAC): every backup header carries keyId,
+ *    env and macSha256 = HMAC-SHA256 over the FULL canonical artifact
+ *    (header-without-mac + every row line, in order). The key is
+ *    EXTERNAL - provisioned from managed secrets (vault/secret-manager
+ *    env), NEVER committed, NEVER passed via argv, NEVER stored in the
+ *    artifact. Restore verifies keyId (key-version), env (cross-env
+ *    replay) and the MAC BEFORE any mutation; rehashed-but-unsigned
+ *    tampering cannot pass. NO LIVE KEYS are created by this change.
+ *  - ONE DOCUMENTED LOCK ORDER for backup, restore AND maintenance:
+ *    pg_advisory_xact_lock(MIGRATION_LOCK_KEY) FIRST, then
+ *    LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE. Backup additionally
+ *    runs in REPEATABLE READ so rows + index state are one consistent
+ *    snapshot that concurrent row/schema mutation cannot disturb.
+ *  - DURABLE CLI PUBLICATION: temp-write with restrictive (0600)
+ *    permissions, fsync, atomic rename, then independent readback
+ *    validation (full artifact validation + MAC) before reporting
+ *    success. No partial publication: a failed backup leaves no final
+ *    file. Existing files are never overwritten without --overwrite-backup.
+ *
  *  OPERATOR GATES for later live use (carried; NO live action now):
  *  1. explicit approval to run the read-only preflight against the live DB;
  *  2. an explicit operator decision per collision/inconsistency group
@@ -57,7 +77,7 @@
  *  4. an approved atomic migration window for normalize + index creation;
  *  5. idempotent post-migration verification (preflight clean, index
  *     present, restart re-check). */
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { Connectable } from '../repo/postgres.js';
 
 export interface PhoneMember {
@@ -150,6 +170,29 @@ export const normalizeIndexDef = (def: string): string =>
 const CANONICAL_INDEX_NORMALIZED = normalizeIndexDef(CANONICAL_INDEX_SQL);
 /** Advisory lock key serializing concurrent migration runs. */
 export const MIGRATION_LOCK_KEY = 7263849598301;
+
+/** External MAC credentials for artifact authentication. The KEY ITSELF
+ *  comes ONLY from managed secrets (vault / secret-manager env): never
+ *  committed, never passed via argv, never stored inside the artifact.
+ *  keyId identifies the key VERSION (rotation); env binds the artifact to
+ *  one environment/domain (cross-env replay is refused). */
+export interface ArtifactAuth {
+  key: string | Buffer;
+  keyId: string;
+  env: string;
+}
+
+const requireAuth = (auth: ArtifactAuth | undefined): ArtifactAuth => {
+  if (!auth || (typeof auth.key === 'string' ? auth.key.length === 0 : auth.key.length === 0) || !auth.keyId || !auth.env) {
+    throw new Error('artifact auth: external MAC key, keyId and env are REQUIRED (key from managed secrets only - never committed, never argv, never stored in the artifact)');
+  }
+  return auth;
+};
+
+/** HMAC-SHA256 over the FULL canonical artifact content: the header
+ *  without its MAC field plus every row line, in order. */
+export const artifactMac = (key: string | Buffer, headerSansMac: Record<string, unknown>, rows: Record<string, unknown>[]): string =>
+  createHmac('sha256', key).update(canonical({ header: headerSansMac, rows })).digest('hex');
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 const bool = (v: unknown): boolean => v === true;
 
@@ -218,10 +261,10 @@ export async function preflightUsersPhone(conn: Connectable, now: () => Date = (
  *  (Connectable.connect(): node-pg checks out a single client; PGlite's
  *  adapter serializes the lease behind its single-connection mutex), so
  *  BEGIN/COMMIT/ROLLBACK never hop connections. */
-export async function withTx<T>(conn: Connectable, fn: (c: { query: Connectable['query'] }) => Promise<T>): Promise<T> {
+export async function withTx<T>(conn: Connectable, fn: (c: { query: Connectable['query'] }) => Promise<T>, begin = 'BEGIN'): Promise<T> {
   const client = await conn.connect();
   try {
-    await client.query('BEGIN');
+    await client.query(begin);
     const out = await fn(client);
     await client.query('COMMIT');
     return out;
@@ -245,6 +288,12 @@ export interface BackupHeader {
   usersPhoneUniqueIndex: { existed: boolean; definition: string | null };
   /** sha256 manifest binding header + index state + ordered row digests. */
   manifestSha256: string;
+  /** Key VERSION id (rotation) - not the key itself. */
+  keyId: string;
+  /** Environment/domain binding (cross-env replay refused). */
+  env: string;
+  /** HMAC-SHA256 over the full canonical artifact (external key). */
+  macSha256: string;
 }
 
 const indexState = async (c: { query: Connectable['query'] }): Promise<{ existed: boolean; definition: string | null }> => {
@@ -253,20 +302,33 @@ const indexState = async (c: { query: Connectable['query'] }): Promise<{ existed
   return { existed: def !== undefined, definition: def ?? null };
 };
 
-/** Full backup: header (row count + index state) then every users row as
- *  JSONL with a per-row sha256. */
-export async function backupUsers(conn: Connectable, sink: (line: string) => void, now: () => Date = () => new Date()): Promise<number> {
-  const r = await conn.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
-  const rows = r.rows as unknown as BackupRow[];
-  const digests = rows.map(rowDigest);
-  const base = {
-    type: 'users-phone-backup-header' as const, version: 2 as const, createdAt: now().toISOString(),
-    rowCount: rows.length, usersPhoneUniqueIndex: await indexState(conn),
-  };
-  const header: BackupHeader = { ...base, manifestSha256: manifestDigest(base, digests) };
-  sink(JSON.stringify(header));
-  for (const [i, row] of rows.entries()) sink(JSON.stringify({ ...row, rowSha256: digests[i] }));
-  return rows.length;
+/** Full AUTHENTICATED backup on ONE leased connection: BEGIN ISOLATION
+ *  LEVEL REPEATABLE READ, then the ONE documented lock order (advisory
+ *  FIRST, then LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE) so rows +
+ *  index state are a consistent snapshot and concurrent row/schema
+ *  mutation BLOCKS for the backup's duration. Emits a v2 header (row
+ *  count, index state as existence + evidence, manifest, keyId, env, MAC)
+ *  then every users row as JSONL with a canonical full-row digest. */
+export async function backupUsers(conn: Connectable, sink: (line: string) => void, opts: { now?: () => Date; auth: ArtifactAuth }): Promise<number> {
+  const auth = requireAuth(opts.auth);
+  const now = opts.now ?? (() => new Date());
+  return withTx(conn, async c => {
+    await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`); // 1st: advisory
+    await c.query(`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`); // 2nd: table (blocks row AND schema mutation)
+    const r = await c.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
+    const rows = r.rows as unknown as BackupRow[];
+    const digests = rows.map(rowDigest);
+    const base = {
+      type: 'users-phone-backup-header' as const, version: 2 as const, createdAt: now().toISOString(),
+      rowCount: rows.length, usersPhoneUniqueIndex: await indexState(c),
+    };
+    const headerSansMac = { ...base, manifestSha256: manifestDigest(base, digests), keyId: auth.keyId, env: auth.env };
+    const rowLines = rows.map((row, i) => ({ ...row, rowSha256: digests[i]! }));
+    const header: BackupHeader = { ...headerSansMac, macSha256: artifactMac(auth.key, headerSansMac, rowLines) };
+    sink(JSON.stringify(header));
+    for (const rl of rowLines) sink(JSON.stringify(rl));
+    return rows.length;
+  }, 'BEGIN ISOLATION LEVEL REPEATABLE READ');
 }
 
 interface ValidatedArtifact {
@@ -278,7 +340,7 @@ interface ValidatedArtifact {
  *  2026-09-18): header type/version, rowCount == actual rows, unique user
  *  ids, required fields, and every row's sha256 against its data. ANY
  *  violation refuses the restore - nothing is ever written. */
-export function validateBackupArtifact(lines: string[]): ValidatedArtifact {
+export function validateBackupArtifact(lines: string[], auth: ArtifactAuth): ValidatedArtifact {
   const parsed = lines.filter(l => l.trim() !== '').map((l, i) => {
     try { return JSON.parse(l) as Record<string, unknown>; }
     catch { throw new Error(`restore: line ${i + 1} is not valid JSON`); }
@@ -286,6 +348,21 @@ export function validateBackupArtifact(lines: string[]): ValidatedArtifact {
   const header = parsed[0] as unknown as BackupHeader | undefined;
   if (!header || header.type !== 'users-phone-backup-header') throw new Error('restore: first line is not a users-phone backup header');
   if (header.version !== 2) throw new Error(`restore: unsupported backup version ${String(header.version)}`);
+  // AUTHENTICATION FIRST (QA/security 2026-09-18): unsigned artifacts,
+  // key-version mismatches, cross-environment replays and any
+  // rehashed-but-unkeyed substitution are refused before anything else.
+  if (typeof header.keyId !== 'string' || typeof header.env !== 'string' ||
+      typeof header.macSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(header.macSha256)) {
+    throw new Error('restore: unsigned artifact (missing keyId/env/macSha256) - refused');
+  }
+  requireAuth(auth);
+  if (header.keyId !== auth.keyId) throw new Error(`restore: key version mismatch (artifact keyId "${header.keyId}" != provided "${auth.keyId}")`);
+  if (header.env !== auth.env) throw new Error(`restore: cross-environment replay refused (artifact env "${header.env}" != provided "${auth.env}")`);
+  const rowsForMac = parsed.slice(1) as Record<string, unknown>[];
+  const { macSha256, ...headerSansMac } = header as unknown as Record<string, unknown> & { macSha256: string };
+  const expected = artifactMac(auth.key, headerSansMac, rowsForMac);
+  const macA = Buffer.from(expected, 'utf8'); const macB = Buffer.from(macSha256, 'utf8');
+  if (macA.length !== macB.length || !timingSafeEqual(macA, macB)) throw new Error('restore: artifact MAC mismatch - wrong key or tampered artifact');
   if (typeof header.rowCount !== 'number' || header.rowCount < 0) throw new Error('restore: header rowCount missing/invalid');
   if (typeof header.usersPhoneUniqueIndex?.existed !== 'boolean') throw new Error('restore: header index state missing/invalid');
   if (header.usersPhoneUniqueIndex.existed && typeof header.usersPhoneUniqueIndex.definition !== 'string') {
@@ -342,11 +419,13 @@ export interface RestoreResult {
  *  - final verification inside the tx: exact row count, exact id set, and
  *    per-row org_id/email/phone/data-sha256 against the artifact, plus the
  *    index definition/absence. */
-export async function restoreUsers(conn: Connectable, lines: string[]): Promise<RestoreResult> {
-  const { header, rows } = validateBackupArtifact(lines); // BEFORE any mutation
+export async function restoreUsers(conn: Connectable, lines: string[], auth: ArtifactAuth): Promise<RestoreResult> {
+  const { header, rows } = validateBackupArtifact(lines, auth); // BEFORE any mutation
   const artifactIds = new Set(rows.map(r => r.user_id));
   return withTx(conn, async c => {
-    // real write exclusion for the whole restore (blocks app writers)
+    // ONE documented lock order (security 2026-09-18): advisory FIRST...
+    await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`);
+    // ...then the table lock: real write exclusion (blocks app writers)
     await c.query(`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`);
     // schema first: make the target state reachable
     await c.query(`DROP INDEX IF EXISTS users_phone_unique`); // before colliding rows load

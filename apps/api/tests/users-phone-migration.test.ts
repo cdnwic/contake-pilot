@@ -15,9 +15,27 @@ import { makeTestRepo, REPO_IMPL } from './helpers/repo.js';
 import type { GraphRepository } from '../src/repo/graph-repository.js';
 import type { Connectable } from '../src/repo/postgres.js';
 import {
-  backupUsers, CANONICAL_INDEX_SQL, createUsersPhoneIndex, manifestDigest, MIGRATION_LOCK_KEY, migrateUsersPhone,
-  normalizeUsersPhones, preflightUsersPhone, restoreUsers, rowDigest, usersPhoneIndexExists,
+  artifactMac, backupUsers, CANONICAL_INDEX_SQL, createUsersPhoneIndex, manifestDigest, MIGRATION_LOCK_KEY, migrateUsersPhone,
+  normalizeUsersPhones, preflightUsersPhone, restoreUsers, rowDigest, usersPhoneIndexExists, validateBackupArtifact,
 } from '../src/services/phone-migration.js';
+import type { ArtifactAuth } from '../src/services/phone-migration.js';
+
+/** Ephemeral TEST-ONLY credentials (generated per suite run would also be
+ *  fine; this constant is NOT a real secret - live keys come only from the
+ *  managed secret store per CLI custody rules). */
+const TEST_AUTH: ArtifactAuth = { key: 'test-only-ephemeral-mac-key-0001', keyId: 'test-key-v1', env: 'test-env' };
+const TEST_AUTH_V2: ArtifactAuth = { ...TEST_AUTH, keyId: 'test-key-v2' };
+
+/** Re-MAC a (possibly tampered) artifact with the TEST key: produces a
+ *  MAC-AUTHENTIC artifact so the INNER verification layers (row digests,
+ *  manifest, closed schema) are what fire - each layer tested on its own. */
+const reMac = (lines: string[], auth: ArtifactAuth = TEST_AUTH): string[] => {
+  const parsed = lines.map(l => JSON.parse(l) as Record<string, unknown>);
+  const { macSha256, ...sans } = parsed[0]!;
+  void macSha256;
+  parsed[0] = { ...sans, macSha256: artifactMac(auth.key, sans, parsed.slice(1)) };
+  return parsed.map(l => JSON.stringify(l));
+};
 
 const pgOnly = REPO_IMPL === 'memory' ? describe.skip : describe;
 
@@ -173,11 +191,11 @@ pgOnly('backup / restore reversal', () => {
     // variant A: backup WITH index present
     expect((await createUsersPhoneIndex(conn)).created).toBe(true);
     const linesA: string[] = [];
-    await backupUsers(conn, l => linesA.push(l));
+    await backupUsers(conn, l => linesA.push(l), { auth: TEST_AUTH });
     expect(JSON.parse(linesA[0]!).usersPhoneUniqueIndex.existed).toBe(true);
     await conn.query(`DROP INDEX users_phone_unique`);
     await conn.query(`UPDATE users SET phone=' +19999999999 ' WHERE user_id='u-bak'`);
-    const rA = await restoreUsers(conn, linesA);
+    const rA = await restoreUsers(conn, linesA, TEST_AUTH);
     expect(rA.verified).toBe(true);
     expect(rA.indexRestored).toBe(true);
     expect(await usersPhoneIndexExists(conn)).toBe(true);
@@ -185,10 +203,10 @@ pgOnly('backup / restore reversal', () => {
     // variant B: backup WITHOUT index -> restore DROPS it (verified)
     await conn.query(`DROP INDEX users_phone_unique`);
     const linesB: string[] = [];
-    await backupUsers(conn, l => linesB.push(l));
+    await backupUsers(conn, l => linesB.push(l), { auth: TEST_AUTH });
     expect(JSON.parse(linesB[0]!).usersPhoneUniqueIndex.existed).toBe(false);
     await conn.query(`CREATE UNIQUE INDEX users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
-    const rB = await restoreUsers(conn, linesB);
+    const rB = await restoreUsers(conn, linesB, TEST_AUTH);
     expect(rB.verified).toBe(true);
     expect(rB.indexRestored).toBe(false);
     expect(await usersPhoneIndexExists(conn)).toBe(false);
@@ -198,12 +216,12 @@ pgOnly('backup / restore reversal', () => {
     await insertLegacy(conn, 'u-file', 'org-1', ' +15550100088 ', '+15550100088');
     const file = join(mkdtempSync(join(tmpdir(), 'phone-bak-')), 'users-backup.jsonl');
     const lines: string[] = [];
-    const n = await backupUsers(conn, l => lines.push(l));
+    const n = await backupUsers(conn, l => lines.push(l), { auth: TEST_AUTH });
     writeFileSync(file, lines.join('\n'));
     expect(n).toBeGreaterThan(0);
     await normalizeUsersPhones(conn);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-file'`)).rows[0]!['phone']).toBe('+15550100088');
-    const r = await restoreUsers(conn, readFileSync(file, 'utf8').split('\n').filter(Boolean));
+    const r = await restoreUsers(conn, readFileSync(file, 'utf8').split('\n').filter(Boolean), TEST_AUTH);
     expect(r.restoredRows).toBe(n);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-file'`)).rows[0]!['phone']).toBe(' +15550100088 ');
   });
@@ -234,7 +252,7 @@ void repo;
 pgOnly('restore artifact validation + full-restore contract (security 2026-09-18)', () => {
   const backupNow = async (): Promise<string[]> => {
     const lines: string[] = [];
-    await backupUsers(conn, l => lines.push(l));
+    await backupUsers(conn, l => lines.push(l), { auth: TEST_AUTH });
     return lines;
   };
 
@@ -247,7 +265,7 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
       if (row.user_id === 'u-c1') row.data = { ...row.data, name: 'tampered' }; // hash now stale
       return JSON.stringify(row);
     });
-    await expect(restoreUsers(conn, tampered)).rejects.toThrow(/row digest mismatch/);
+    await expect(restoreUsers(conn, reMac(tampered), TEST_AUTH)).rejects.toThrow(/row digest mismatch/);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-c1'`)).rows[0]!['phone']).toBe(' +15550101001 ');
     expect((await conn.query(`SELECT data->>'name' AS n FROM users WHERE user_id='u-c1'`)).rows[0]!['n']).toBe('u-c1');
   });
@@ -255,10 +273,10 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
   it('truncated artifact (rowCount mismatch) and duplicate ids: refused before mutation', async () => {
     await insertLegacy(conn, 'u-t1', 'org-1', '+15550101011', '+15550101011');
     const lines = await backupNow();
-    await expect(restoreUsers(conn, lines.slice(0, -1))).rejects.toThrow(/rowCount|truncated/);
+    await expect(restoreUsers(conn, lines.slice(0, -1), TEST_AUTH)).rejects.toThrow(/MAC mismatch|rowCount|truncated/);
     const dup = [...lines, lines[1]!]; // duplicate a row line
     // rowCount now matches? no: rowCount smaller than lines -> still mismatch OR duplicate id
-    await expect(restoreUsers(conn, dup)).rejects.toThrow(/rowCount|duplicate user_id/);
+    await expect(restoreUsers(conn, dup, TEST_AUTH)).rejects.toThrow(/MAC mismatch|rowCount|duplicate user_id/);
     expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id='u-t1'`)).rows[0]!['n']).toBe(1);
   });
 
@@ -266,7 +284,7 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
     await insertLegacy(conn, 'u-k1', 'org-1', '+15550101021', '+15550101021');
     const lines = await backupNow();
     await insertLegacy(conn, 'u-extra', 'org-1', '+15550101022', '+15550101022'); // created after backup
-    const r = await restoreUsers(conn, lines);
+    const r = await restoreUsers(conn, lines, TEST_AUTH);
     expect(r.removedPostBackupRows).toEqual(['u-extra']);
     expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id='u-extra'`)).rows[0]!['n']).toBe(0);
     expect(r.verified).toBe(true);
@@ -281,7 +299,7 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
     // current DB: rows removed, index created clean
     await conn.query(`DELETE FROM users WHERE user_id IN ('u-l1','u-l2')`);
     await conn.query(`CREATE UNIQUE INDEX users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
-    const r = await restoreUsers(conn, lines);
+    const r = await restoreUsers(conn, lines, TEST_AUTH);
     expect(r.verified).toBe(true);
     expect(r.indexRestored).toBe(false);
     expect(await usersPhoneIndexExists(conn)).toBe(false);
@@ -299,7 +317,7 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
       return JSON.stringify(h);
     });
     await conn.query(`UPDATE users SET phone=' +19990000000 ' WHERE user_id='u-r1'`);
-    await expect(restoreUsers(conn, tampered)).rejects.toThrow(/non-canonical index definition/);
+    await expect(restoreUsers(conn, reMac(tampered), TEST_AUTH)).rejects.toThrow(/non-canonical index definition/);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-r1'`)).rows[0]!['phone']).toBe(' +19990000000 ');
     expect(await usersPhoneIndexExists(conn)).toBe(true);
   });
@@ -320,12 +338,14 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
     const rows = [...parsed.slice(1), colliding].map(r => ({ user_id: r.user_id, org_id: r.org_id, email: r.email, phone: r.phone, data: r.data }));
     const digests = rows.map(rowDigest);
     const base = { type: parsed[0].type, version: parsed[0].version, createdAt: parsed[0].createdAt, rowCount: rows.length, usersPhoneUniqueIndex: parsed[0].usersPhoneUniqueIndex };
-    const resigned = [JSON.stringify({ ...base, manifestSha256: manifestDigest(base, digests) }),
-      ...rows.map((r, i) => JSON.stringify({ ...r, rowSha256: digests[i] }))];
+    const sansMac = { ...base, manifestSha256: manifestDigest(base, digests), keyId: TEST_AUTH.keyId, env: TEST_AUTH.env };
+    const rowLines = rows.map((r, i) => ({ ...r, rowSha256: digests[i] }));
+    const resigned = [JSON.stringify({ ...sansMac, macSha256: artifactMac(TEST_AUTH.key, sansMac, rowLines) }),
+      ...rowLines.map(r => JSON.stringify(r))];
     await conn.query(`DELETE FROM users WHERE user_id IN ('u-r2','u-r2b','u-keep')`);
     await conn.query(`DROP INDEX IF EXISTS users_phone_unique`);
     await insertLegacy(conn, 'u-keep', 'org-9', '+15550109999', '+15550109999');
-    await expect(restoreUsers(conn, resigned)).rejects.toThrow();
+    await expect(restoreUsers(conn, resigned, TEST_AUTH)).rejects.toThrow();
     // rollback proof: no artifact row landed, no index was left behind
     expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id IN ('u-r2','u-r2b')`)).rows[0]!['n']).toBe(0);
     expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id='u-keep'`)).rows[0]!['n']).toBe(1);
@@ -363,7 +383,7 @@ pgOnly('locked maintenance transaction (security 2026-09-18)', () => {
 pgOnly('artifact authentication + closed index schema (QA/security 2026-09-18 v4)', () => {
   const backupNow = async (): Promise<string[]> => {
     const lines: string[] = [];
-    await backupUsers(conn, l => lines.push(l));
+    await backupUsers(conn, l => lines.push(l), { auth: TEST_AUTH });
     return lines;
   };
   /** Recompute row digests + manifest over (possibly tampered) content:
@@ -371,8 +391,10 @@ pgOnly('artifact authentication + closed index schema (QA/security 2026-09-18 v4
   const resign = (rows: { user_id: string; org_id: string; email: string | null; phone: string | null; data: unknown }[], header: Record<string, unknown>): string[] => {
     const digests = rows.map(rowDigest);
     const base = { type: header['type'], version: header['version'], createdAt: header['createdAt'], rowCount: rows.length, usersPhoneUniqueIndex: header['usersPhoneUniqueIndex'] } as Parameters<typeof manifestDigest>[0];
-    return [JSON.stringify({ ...base, manifestSha256: manifestDigest(base, digests) }),
-      ...rows.map((r, i) => JSON.stringify({ ...r, rowSha256: digests[i] }))];
+    const sansMac = { ...base, manifestSha256: manifestDigest(base, digests), keyId: TEST_AUTH.keyId, env: TEST_AUTH.env };
+    const rowLines = rows.map((r, i) => ({ ...r, rowSha256: digests[i]! }));
+    return [JSON.stringify({ ...sansMac, macSha256: artifactMac(TEST_AUTH.key, sansMac, rowLines) }),
+      ...rowLines.map(r => JSON.stringify(r))];
   };
 
   it('per-row digest covers EVERY authoritative column: tampering user_id/org_id/email/phone/data with a stale digest refuses pre-mutation', async () => {
@@ -390,7 +412,7 @@ pgOnly('artifact authentication + closed index schema (QA/security 2026-09-18 v4
       const row = JSON.parse(tampered[1]!);
       mutate(row);
       tampered[1] = JSON.stringify(row);
-      await expect(restoreUsers(conn, tampered), `column ${col}`).rejects.toThrow(/row digest mismatch/);
+      await expect(restoreUsers(conn, reMac(tampered), TEST_AUTH), `column ${col}`).rejects.toThrow(/row digest mismatch/);
     }
     // DB untouched by every refusal
     expect((await conn.query(`SELECT org_id FROM users WHERE user_id='u-a1'`)).rows[0]!['org_id']).toBe('org-1');
@@ -402,17 +424,17 @@ pgOnly('artifact authentication + closed index schema (QA/security 2026-09-18 v4
     const lines = await backupNow();
     expect(lines.length).toBeGreaterThanOrEqual(3);
     const swapped = [lines[0]!, lines[2]!, lines[1]!, ...lines.slice(3)];
-    await expect(restoreUsers(conn, swapped)).rejects.toThrow(/manifest digest mismatch/);
+    await expect(restoreUsers(conn, reMac(swapped), TEST_AUTH)).rejects.toThrow(/manifest digest mismatch/);
   });
 
   it('manifest binds header + index state: createdAt or index-existence substitution refuses', async () => {
     await insertLegacy(conn, 'u-h1', 'org-1', '+15550101021', '+15550101021');
     const lines = await backupNow();
     const h1 = { ...JSON.parse(lines[0]!), createdAt: '2001-01-01T00:00:00.000Z' };
-    await expect(restoreUsers(conn, [JSON.stringify(h1), ...lines.slice(1)])).rejects.toThrow(/manifest digest mismatch/);
+    await expect(restoreUsers(conn, reMac([JSON.stringify(h1), ...lines.slice(1)]), TEST_AUTH)).rejects.toThrow(/manifest digest mismatch/);
     const h2raw = JSON.parse(lines[0]!);
     h2raw.usersPhoneUniqueIndex = { existed: true, definition: CANONICAL_INDEX_SQL };
-    await expect(restoreUsers(conn, [JSON.stringify(h2raw), ...lines.slice(1)])).rejects.toThrow(/manifest digest mismatch/);
+    await expect(restoreUsers(conn, reMac([JSON.stringify(h2raw), ...lines.slice(1)]), TEST_AUTH)).rejects.toThrow(/manifest digest mismatch/);
   });
 
   it('closed index schema: resigned evidence definitions with appended SQL / different expression / predicate / table / schema are REFUSED and NEVER executed', async () => {
@@ -431,7 +453,7 @@ pgOnly('artifact authentication + closed index schema (QA/security 2026-09-18 v4
     for (const [name, def] of Object.entries(variants)) {
       const h = { ...header, usersPhoneUniqueIndex: { existed: true, definition: def } };
       const resigned = resign([{ user_id: row.user_id, org_id: row.org_id, email: row.email, phone: row.phone, data: row.data }], h);
-      await expect(restoreUsers(conn, resigned), name).rejects.toThrow(/non-canonical index definition/);
+      await expect(restoreUsers(conn, resigned, TEST_AUTH), name).rejects.toThrow(/non-canonical index definition/);
     }
     // proof nothing executed: no pwned table, original row intact
     expect((await conn.query(`SELECT count(*)::int AS n FROM information_schema.tables WHERE table_name='pwned'`)).rows[0]!['n']).toBe(0);
@@ -450,7 +472,7 @@ pgOnly('artifact authentication + closed index schema (QA/security 2026-09-18 v4
 });
 
 pgOnly('real write exclusion (security 2026-09-18 v4)', () => {
-  it('migrateUsersPhone + restoreUsers take the advisory lock AND LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE (recorded query stream)', async () => {
+  it('backup + restore + migrate ALL take the ONE documented lock order: advisory FIRST, then LOCK TABLE users SHARE ROW EXCLUSIVE (recorded query stream)', async () => {
     const recorded: string[] = [];
     const rec: Connectable = {
       query: (text: string, params?: unknown[]) => { recorded.push(text); return conn.query(text, params as never); },
@@ -462,11 +484,22 @@ pgOnly('real write exclusion (security 2026-09-18 v4)', () => {
     await migrateUsersPhone(rec);
     expect(recorded.some(q => q.includes(`pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`))).toBe(true);
     expect(recorded.some(q => q === 'LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE')).toBe(true);
+    const adv = recorded.findIndex(q => q.includes(`pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`));
+    const tbl = recorded.findIndex(q => q === 'LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE');
+    expect(adv).toBeGreaterThanOrEqual(0);
+    expect(tbl).toBeGreaterThan(adv); // ONE documented order: advisory FIRST
     recorded.length = 0;
     const lines: string[] = [];
-    await backupUsers(conn, l => lines.push(l));
-    await restoreUsers(rec, lines);
-    expect(recorded.some(q => q === 'LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE')).toBe(true);
+    await backupUsers(rec, l => lines.push(l), { auth: TEST_AUTH });
+    expect(recorded[0]).toBe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    expect(recorded[1]).toContain(`pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`);
+    expect(recorded[2]).toBe('LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE');
+    recorded.length = 0;
+    await restoreUsers(rec, lines, TEST_AUTH);
+    const adv2 = recorded.findIndex(q => q.includes(`pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`));
+    const tbl2 = recorded.findIndex(q => q === 'LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE');
+    expect(adv2).toBeGreaterThanOrEqual(0);
+    expect(tbl2).toBeGreaterThan(adv2);
   });
 
   const realPgOnly = REPO_IMPL === 'realpg' ? it : it.skip;
@@ -478,9 +511,10 @@ pgOnly('real write exclusion (security 2026-09-18 v4)', () => {
       await conn.query(`DELETE FROM users WHERE user_id='u-w1'`);
       await clientA.query('BEGIN');
       await clientA.query('LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE');
-      await poolB.query(`SET statement_timeout = 1500`);
+      await poolB.query(`SET lock_timeout = 1200`);
+      await poolB.query(`SET statement_timeout = 2000`);
       await expect(poolB.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-w1','org-1',NULL,'+15550101051','{}')`))
-        .rejects.toThrow(/statement timeout|canceling statement/i);
+        .rejects.toThrow(/lock timeout|statement timeout|canceling statement/i);
       await clientA.query('COMMIT');
       await poolB.query(`SET statement_timeout = 0`);
       await poolB.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-w1','org-1',NULL,'+15550101051','{}')`);
@@ -500,9 +534,12 @@ pgOnly('CLI v4 (security 2026-09-18)', () => {
     if (!distReady()) return; // build artifact absent in this lane - reported as skip
     const { execFileSync } = await import('node:child_process');
     const backupFile = join(mkdtempSync(join(tmpdir(), 'upm-cli-')), 'backup.jsonl');
-    const out = execFileSync(process.execPath, ['scripts/users-phone-migrate.mjs', '--database-url', process.env['DATABASE_URL'] as string, '--backup', backupFile, '--maintenance'], { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8' });
+    const out = execFileSync(process.execPath, ['scripts/users-phone-migrate.mjs', '--database-url', process.env['DATABASE_URL'] as string, '--backup', backupFile, '--maintenance'],
+      { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8',
+        env: { ...process.env, CONTAKE_BACKUP_MAC_KEY: TEST_AUTH.key, CONTAKE_BACKUP_KEY_ID: TEST_AUTH.keyId, CONTAKE_BACKUP_ENV: TEST_AUTH.env } });
     expect(out).toMatch(/index present=true/);
     expect(out).toMatch(/final preflight clean=true/);
+    expect(out).toMatch(/readback verified/);
     expect(await usersPhoneIndexExists(conn)).toBe(true);
   });
 
@@ -524,5 +561,236 @@ pgOnly('CLI v4 (security 2026-09-18)', () => {
       expect(r.err, flag).toMatch(/REMOVED in v4/);
     }
     expect(await usersPhoneIndexExists(conn)).toBe(false);
+  });
+});
+
+pgOnly('artifact MAC authentication (QA/security 2026-09-18 v5)', () => {
+  const backupNow = async (auth: ArtifactAuth = TEST_AUTH): Promise<string[]> => {
+    const lines: string[] = [];
+    await backupUsers(conn, l => lines.push(l), { auth });
+    return lines;
+  };
+
+  it('wrong key: MAC mismatch, refused BEFORE any mutation', async () => {
+    await insertLegacy(conn, 'u-k1', 'org-1', '+15550102001', '+15550102001');
+    const lines = await backupNow();
+    await expect(restoreUsers(conn, lines, { ...TEST_AUTH, key: 'some-other-key-9999' }))
+      .rejects.toThrow(/MAC mismatch/);
+    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-k1'`)).rows[0]!['phone']).toBe('+15550102001');
+  });
+
+  it('unsigned artifact (keyId/env/mac stripped): refused even with digests + manifest intact', async () => {
+    await insertLegacy(conn, 'u-k2', 'org-1', '+15550102011', '+15550102011');
+    const lines = await backupNow();
+    const h = JSON.parse(lines[0]!);
+    delete h.keyId; delete h.env; delete h.macSha256;
+    await expect(restoreUsers(conn, [JSON.stringify(h), ...lines.slice(1)], TEST_AUTH))
+      .rejects.toThrow(/unsigned artifact/);
+  });
+
+  it('rehashed substitution (attacker recomputes row digests + manifest WITHOUT the key): MAC mismatch', async () => {
+    await insertLegacy(conn, 'u-k3', 'org-1', '+15550102021', '+15550102021');
+    const lines = await backupNow();
+    const parsed = lines.map(l => JSON.parse(l));
+    const forged = { ...parsed[1], phone: '+19998887777', data: { ...parsed[1].data, isSuperAdmin: true } };
+    const rows = [forged].map(r => ({ user_id: r.user_id, org_id: r.org_id, email: r.email, phone: r.phone, data: r.data }));
+    const digests = rows.map(rowDigest);
+    const base = { type: parsed[0].type, version: parsed[0].version, createdAt: parsed[0].createdAt, rowCount: 1, usersPhoneUniqueIndex: parsed[0].usersPhoneUniqueIndex };
+    // attacker rehashes EVERYTHING they can - but keeps the old MAC
+    const tampered = [JSON.stringify({ ...base, manifestSha256: manifestDigest(base, digests), keyId: parsed[0].keyId, env: parsed[0].env, macSha256: parsed[0].macSha256 }),
+      JSON.stringify({ ...forged, rowSha256: digests[0] })];
+    await expect(restoreUsers(conn, tampered, TEST_AUTH)).rejects.toThrow(/MAC mismatch/);
+    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-k3'`)).rows[0]!['phone']).toBe('+15550102021');
+  });
+
+  it('cross-environment replay: artifact MACed for env A refused in env B', async () => {
+    await insertLegacy(conn, 'u-k4', 'org-1', '+15550102031', '+15550102031');
+    const lines = await backupNow({ ...TEST_AUTH, env: 'staging' });
+    await expect(restoreUsers(conn, lines, { ...TEST_AUTH, env: 'production' }))
+      .rejects.toThrow(/cross-environment replay/);
+  });
+
+  it('key-version mismatch: artifact keyId v1 refused against provided keyId v2', async () => {
+    await insertLegacy(conn, 'u-k5', 'org-1', '+15550102041', '+15550102041');
+    const lines = await backupNow();
+    await expect(restoreUsers(conn, lines, TEST_AUTH_V2)).rejects.toThrow(/key version mismatch/);
+  });
+
+  it('backup REFUSES without complete external auth (custody guard)', async () => {
+    await expect(backupUsers(conn, () => undefined, { auth: undefined as unknown as ArtifactAuth })).rejects.toThrow(/external MAC key/);
+    await expect(backupUsers(conn, () => undefined, { auth: { key: '', keyId: 'k', env: 'e' } })).rejects.toThrow(/external MAC key/);
+  });
+
+  it('MAC + digests verify post-restore in-tx (restore of authenticated artifact still VERIFIES)', async () => {
+    await insertLegacy(conn, 'u-k6', 'org-1', ' +15550102051 ', '+15550102051');
+    const lines = await backupNow();
+    const r = await restoreUsers(conn, lines, TEST_AUTH);
+    expect(r.verified).toBe(true);
+    // artifact lines validate independently too (readback path)
+    expect(validateBackupArtifact(lines, TEST_AUTH).rows.some(r => r.user_id === 'u-k6')).toBe(true);
+  });
+});
+
+pgOnly('backup snapshot consistency + publication (QA/security 2026-09-18 v5)', () => {
+  const realPgOnly = REPO_IMPL === 'realpg' ? it : it.skip;
+
+  realPgOnly('two-connection: concurrent writer AND index creation BLOCK during backup, fail clean under statement_timeout, succeed after', async () => {
+    const { Pool } = await import('pg');
+    const poolB = new Pool({ connectionString: process.env['DATABASE_URL'], max: 1 });
+    let holdBackup = false;
+    let pendingIndex: Promise<void> | undefined;
+    const rec: Connectable = {
+      query: (text: string, params?: unknown[]) => conn.query(text, params as never),
+      connect: async () => {
+        const client = await conn.connect();
+        return {
+          query: async (text: string, params?: unknown[]) => {
+            const out = await client.query(text, params as never);
+            if (text === 'LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE') {
+              // lock now held: prove writer + DDL block before proceeding
+              // writer: fails CLEAN under lock_timeout/statement_timeout
+              await poolB.query(`SET lock_timeout = 1200`);
+              await poolB.query(`SET statement_timeout = 2000`);
+              await expect(poolB.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-cb1','org-1',NULL,'+15550102061','{}')`))
+                .rejects.toThrow(/lock timeout|statement timeout|canceling statement/i);
+              // schema mutation: PROVEN PENDING while the backup lock is
+              // held (CREATE INDEX lock waits ignore lock_timeout on this
+              // PG build, so assert in-flight instead of interrupt)
+              let indexDone = false;
+              const pending = poolB.query(`CREATE UNIQUE INDEX users_phone_concurrent_probe ON users(btrim(phone))`)
+                .then(() => { indexDone = true; });
+              await new Promise(r => setTimeout(r, 600));
+              expect(indexDone).toBe(false); // still BLOCKED by the backup's table lock
+              pendingIndex = pending;
+              holdBackup = true;
+            }
+            return out;
+          },
+          release: () => client.release(),
+        };
+      },
+    } as unknown as Connectable;
+    try {
+      const lines: string[] = [];
+      await backupUsers(rec, l => lines.push(l), { auth: TEST_AUTH });
+      expect(holdBackup).toBe(true);
+      expect(lines.length).toBeGreaterThanOrEqual(1);
+      // after backup commits: both succeed
+      await poolB.query(`SET lock_timeout = 0`);
+      await poolB.query(`SET statement_timeout = 0`);
+      await poolB.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-cb1','org-1',NULL,'+15550102061','{}')`);
+      expect(pendingIndex).toBeDefined();
+      await pendingIndex; // the blocked CREATE INDEX now completes
+      await poolB.query(`DROP INDEX users_phone_concurrent_probe`);
+    } finally {
+      await poolB.query(`DELETE FROM users WHERE user_id='u-cb1'`).catch(() => undefined);
+      await poolB.end();
+    }
+  });
+
+  realPgOnly('two-connection serialization: a second locked operation WAITS behind the first (advisory first), then proceeds', async () => {
+    const { Pool } = await import('pg');
+    const poolB = new Pool({ connectionString: process.env['DATABASE_URL'], max: 1 });
+    const bQueries: string[] = [];
+    const recB: Connectable = {
+      query: (text: string, params?: unknown[]) => { bQueries.push(text); return poolB.query(text, params as never); },
+      connect: async () => {
+        const client = await poolB.connect();
+        return { query: (text: string, params?: unknown[]) => { bQueries.push(text); return client.query(text, params as never); }, release: () => client.release() };
+      },
+    } as unknown as Connectable;
+    // operation A: holds the lock pair for ~800ms
+    let aHolding = false;
+    const recA: Connectable = {
+      query: (text: string, params?: unknown[]) => conn.query(text, params as never),
+      connect: async () => {
+        const client = await conn.connect();
+        return {
+          query: async (text: string, params?: unknown[]) => {
+            const out = await client.query(text, params as never);
+            if (text === 'LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE') {
+              aHolding = true;
+              await new Promise(r => setTimeout(r, 800));
+              aHolding = false;
+            }
+            return out;
+          },
+          release: () => client.release(),
+        };
+      },
+    } as unknown as Connectable;
+    try {
+      const a = backupUsers(recA, () => undefined, { auth: TEST_AUTH });
+      await new Promise(r => setTimeout(r, 200)); // let A take the locks
+      const b = backupUsers(recB, () => undefined, { auth: TEST_AUTH });
+      await new Promise(r => setTimeout(r, 300)); // B must be WAITING at its advisory lock
+      expect(aHolding).toBe(true);
+      expect(bQueries.filter(q => q.includes('LOCK TABLE')).length).toBe(0); // B has NOT passed its advisory lock
+      await Promise.all([a, b]);
+      expect(bQueries.some(q => q.includes('LOCK TABLE'))).toBe(true); // B proceeded after A released
+    } finally {
+      await poolB.end();
+    }
+  });
+});
+
+pgOnly('CLI durable publication (QA/security 2026-09-18 v5)', () => {
+  const realPgOnly = REPO_IMPL === 'realpg' ? it : it.skip;
+  const distReady = () => { try { return readFileSync(new URL('../dist/services/phone-migration.js', import.meta.url), 'utf8').includes('macSha256'); } catch { return false; } };
+  const cliEnv = () => ({ ...process.env, CONTAKE_BACKUP_MAC_KEY: TEST_AUTH.key, CONTAKE_BACKUP_KEY_ID: TEST_AUTH.keyId, CONTAKE_BACKUP_ENV: TEST_AUTH.env });
+  const runCli = async (argv: string[], env: NodeJS.ProcessEnv = cliEnv()) => {
+    const { execFileSync } = await import('node:child_process');
+    try {
+      const out = execFileSync(process.execPath, ['scripts/users-phone-migrate.mjs', ...argv], { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', env, stdio: 'pipe' });
+      return { code: 0, out, err: '' };
+    } catch (e) {
+      const err = e as { status?: number; stdout?: string; stderr?: string };
+      return { code: err.status ?? -1, out: String(err.stdout ?? ''), err: String(err.stderr ?? '') };
+    }
+  };
+
+  realPgOnly('backup publishes durably: 0600 file, readback verified message, independently re-validates', async () => {
+    if (!distReady()) return;
+    await insertLegacy(conn, 'u-p1', 'org-1', '+15550102071', '+15550102071');
+    const file = join(mkdtempSync(join(tmpdir(), 'upm-pub-')), 'backup.jsonl');
+    const r = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/readback verified/);
+    const { statSync } = await import('node:fs');
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    expect(validateBackupArtifact(lines, TEST_AUTH).rows.length).toBeGreaterThanOrEqual(1);
+    await conn.query(`DELETE FROM users WHERE user_id='u-p1'`);
+  });
+
+  realPgOnly('no overwrite without --overwrite-backup; no partial publication on failure', async () => {
+    if (!distReady()) return;
+    const dir = mkdtempSync(join(tmpdir(), 'upm-ow-'));
+    const file = join(dir, 'backup.jsonl');
+    writeFileSync(file, 'PRE-EXISTING');
+    const r1 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file]);
+    expect(r1.code).toBe(64);
+    expect(r1.err).toMatch(/already exists/);
+    expect(readFileSync(file, 'utf8')).toBe('PRE-EXISTING');
+    const r2 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file, '--overwrite-backup']);
+    expect(r2.code).toBe(0);
+    // failure path: unreachable DB leaves NO final file
+    const dead = join(dir, 'dead.jsonl');
+    const r3 = await runCli(['--database-url', 'postgres://postgres@127.0.0.1:1/postgres', '--backup', dead]);
+    expect(r3.code).not.toBe(0);
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(dead)).toBe(false);
+  });
+
+  realPgOnly('missing MAC env credentials: exit 64 custody message, nothing written', async () => {
+    if (!distReady()) return;
+    const file = join(mkdtempSync(join(tmpdir(), 'upm-ck-')), 'backup.jsonl');
+    const env = { ...process.env };
+    delete env['CONTAKE_BACKUP_MAC_KEY']; delete env['CONTAKE_BACKUP_KEY_ID']; delete env['CONTAKE_BACKUP_ENV'];
+    const r = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file], env);
+    expect(r.code).toBe(64);
+    expect(r.err).toMatch(/managed secret store/);
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(file)).toBe(false);
   });
 });
