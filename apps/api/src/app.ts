@@ -10,7 +10,7 @@ import {
 } from '@contake/core';
 import { appEvents } from './services/events.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
-import { AuthService, SANDBOX_SESSION_TTL_MS, toPrincipal } from './auth.js';
+import { AuthService, SANDBOX_SESSION_TTL_MS, toPrincipal, devOtpDisclosureEnabled } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
 import { isValidSessionCursor, ReportClientIdConflictError } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
@@ -170,7 +170,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (!phone) fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
     const r = await auth.requestOtp(phone as string);
     if (r.rateLimited) fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
-    return { sent: true, ...(process.env['CONTAKE_DEV_OTP'] !== 'false' ? { devCode: r.devCode } : {}) };
+    return { sent: true, ...(devOtpDisclosureEnabled() ? { devCode: r.devCode } : {}) }; // security 2026-09-18: opt-in only, explicit test mode only
   });
   app.post('/v1/auth/otp/verify', async (req) => {
     const { phone, code } = (req.body ?? {}) as { phone?: string; code?: string };

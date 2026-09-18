@@ -1,6 +1,6 @@
 import { RBAC_MATRIX_VERSION } from '@contake/core';
 import { buildApp } from './app.js';
-import { AuthService, type OtpStateStore } from './auth.js';
+import { AuthService, assertDeployedBoot, type OtpStateStore } from './auth.js';
 import { MemoryGraphRepository } from './repo/memory.js';
 import { PostgresGraphRepository, pgDispatchState, createPgOtpState } from './repo/postgres.js';
 import type { GraphRepository } from './repo/graph-repository.js';
@@ -28,6 +28,13 @@ export const PINNED_MATRIX_VERSION = '1.6';
 if (RBAC_MATRIX_VERSION !== PINNED_MATRIX_VERSION) {
   throw new Error(`RBAC matrix pin mismatch: expected v${PINNED_MATRIX_VERSION}, loaded v${RBAC_MATRIX_VERSION} - refusing to boot`);
 }
+
+// Security (2026-09-18): deployed builds FAIL CLOSED at boot. Refuses to
+// start under explicit test mode (CONTAKE_TEST_MODE/NODE_ENV=test), with dev
+// OTP disclosure opted in (CONTAKE_DEV_OTP=true), or without a strong
+// explicitly managed CONTAKE_AUTH_SECRET. Hermetic tests never import this
+// module (they use buildApp directly), so their fallbacks stay test-only.
+assertDeployedBoot();
 
 // PR-1: env-selected storage adapter. DATABASE_URL set -> Postgres (real
 // transactions, durable dispatch state); unset -> in-memory (test/dev default).

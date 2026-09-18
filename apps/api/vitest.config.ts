@@ -1,6 +1,6 @@
 import { defineConfig } from 'vitest/config';
 export default defineConfig({
-  test: { environment: 'node', include: ['tests/**/*.test.ts', 'tests/**/*.spec.ts'], testTimeout: 30000 },
+  test: { environment: 'node', include: ['tests/**/*.test.ts', 'tests/**/*.spec.ts'], testTimeout: 30000, setupFiles: ['tests/setup.ts'] },
   resolve: {
     alias: {
       '@contake/core': new URL('../../packages/core/src/index.ts', import.meta.url).pathname,

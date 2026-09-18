@@ -125,13 +125,88 @@ export const SANDBOX_SESSION_TTL_MS = 15 * 60 * 1000;
 /** The pilot tenant a super admin enrolls into. */
 export const SUPER_ADMIN_HOME_ORG = 'org-1';
 
+/** Security (2026-09-18, FAIL-closed boot): the known PUBLIC development
+ *  secret. It exists ONLY so hermetic tests can run without provisioning;
+ *  it is reachable solely under explicit test mode (below) and is refused
+ *  as a managed value. A deployed build never sees it: the production entry
+ *  point calls assertDeployedBoot(), which refuses test mode outright. */
+export const DEV_ONLY_AUTH_SECRET = 'contake-dev-secret';
+/** Minimum length for a managed CONTAKE_AUTH_SECRET (entropy floor). */
+export const MIN_AUTH_SECRET_LENGTH = 32;
+
+export class AuthSecretConfigError extends Error {}
+
+/** Explicit nonproduction/test mode. CONTAKE_TEST_MODE=true is the explicit
+ *  operator opt-in; NODE_ENV=test covers the vitest runner. EVERY fallback
+ *  (dev auth secret, dev OTP disclosure) is gated on this, and the deployed
+ *  entry point refuses to boot while it is set - so the fallbacks are
+ *  unavailable in a deployed build. */
+export function isExplicitTestMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env['CONTAKE_TEST_MODE'] === 'true' || env['NODE_ENV'] === 'test';
+}
+
+/** THE ONLY auth-secret resolution path (security 2026-09-18). Precedence:
+ *  1. an explicit constructor argument (tests inject their own secret);
+ *  2. managed env CONTAKE_AUTH_SECRET - must be STRONG (>=32 chars) and
+ *     never the known public dev value, else REFUSED loudly;
+ *  3. the known public dev secret, ONLY under explicit test mode;
+ *  4. otherwise THROW: authentication never starts without a secret.
+ *  Errors name the CLASS of the problem, never the provided value. */
+export function resolveAuthSecret(explicit: string | undefined, env: NodeJS.ProcessEnv = process.env): string {
+  if (explicit !== undefined) return explicit;
+  const managed = env['CONTAKE_AUTH_SECRET'];
+  if (managed !== undefined && managed !== '') {
+    if (managed === DEV_ONLY_AUTH_SECRET) {
+      throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is set to the known PUBLIC development value - refusing it as a managed secret');
+    }
+    if (managed.length < MIN_AUTH_SECRET_LENGTH) {
+      throw new AuthSecretConfigError(`CONTAKE_AUTH_SECRET is weaker than the ${MIN_AUTH_SECRET_LENGTH}-character minimum - refusing to boot with a weak secret`);
+    }
+    return managed;
+  }
+  if (isExplicitTestMode(env)) return DEV_ONLY_AUTH_SECRET;
+  throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is not set - refusing to start authentication without an explicitly managed secret (fail CLOSED; the dev fallback exists only under explicit test mode)');
+}
+
+/** Dev OTP disclosure (security 2026-09-18): OPT-IN ONLY, and only under
+ *  explicit nonproduction/test mode. The previous opt-out default
+ *  (CONTAKE_DEV_OTP !== 'false') disclosed live OTP codes on ANY deployment
+ *  that did not set the flag. Deployed startup refuses to boot while the
+ *  opt-in is set (assertDeployedBoot), so this can never fire in prod. */
+export function devOtpDisclosureEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env['CONTAKE_DEV_OTP'] === 'true' && isExplicitTestMode(env);
+}
+
+/** Deployed-boot gate (security 2026-09-18): the production entry point
+ *  (server.ts) calls this BEFORE wiring anything. Refuses to boot when:
+ *  - explicit test mode is set (every test fallback would be available);
+ *  - dev OTP disclosure was opted into (CONTAKE_DEV_OTP=true);
+ *  - CONTAKE_AUTH_SECRET is missing or weak (fail closed).
+ *  Throws AuthSecretConfigError naming the CLASS only, never a value. */
+export function assertDeployedBoot(env: NodeJS.ProcessEnv = process.env): void {
+  if (isExplicitTestMode(env)) {
+    throw new AuthSecretConfigError('explicit test mode is set (CONTAKE_TEST_MODE=true or NODE_ENV=test) - a deployed build refuses to boot with test fallbacks available');
+  }
+  if (env['CONTAKE_DEV_OTP'] === 'true') {
+    throw new AuthSecretConfigError('CONTAKE_DEV_OTP=true opts into dev OTP disclosure - a deployed build refuses to boot with OTP disclosure enabled');
+  }
+  resolveAuthSecret(undefined, env); // strong managed secret, or throw
+}
+
 export class AuthService {
+  private readonly secret: string;
+
   constructor(
     private readonly repo: GraphRepository,
-    private readonly secret: string = process.env['CONTAKE_AUTH_SECRET'] ?? 'contake-dev-secret',
+    secret?: string,
     private readonly now: () => number = () => Date.now(),
     private readonly otpStore: OtpStateStore = memoryOtpState(),
-  ) {}
+  ) {
+    // Security (2026-09-18): NO silent default. Resolution is fail-closed via
+    // resolveAuthSecret (managed env, strong; dev fallback under explicit
+    // test mode only).
+    this.secret = resolveAuthSecret(secret);
+  }
 
   hashPassword(password: string): string {
     const salt = randomBytes(8).toString('hex');
