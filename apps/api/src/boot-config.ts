@@ -38,7 +38,15 @@ const SECRET_HEX64_CANONICAL = /^[0-9a-f]{64}$/;
 const KNOWN_FALLBACK_SECRETS: ReadonlySet<string> = new Set([
   'contake-dev-secret', // the removed v0 hardcoded fallback
   LOCAL_DEV_AUTH_SECRET,
+  // PERMANENTLY DENIED (independent security, 2026-09-18): real CSPRNG outputs
+  // that were exposed in committed public fixtures/evidence. Shape-valid but
+  // publicly known - must never authenticate anywhere.
+  '37115fa1d12be597cd6c1aba5cbf92508072d305edfc59082cc6c963e1d0a674',
+  'aKhvRtkVHp1roRMXlvPw6QamCfBEPoeRt107EaxlDH8',
 ]);
+
+/** Exported for the denial regression test: every entry must be refused. */
+export const DENIED_SECRETS: ReadonlySet<string> = KNOWN_FALLBACK_SECRETS;
 
 export function isProductionBoot(env: NodeJS.ProcessEnv = process.env): boolean {
   return env['NODE_ENV'] === 'production';

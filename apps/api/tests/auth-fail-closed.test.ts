@@ -8,19 +8,29 @@
  *    unset/unrecognized boots seed-free (production seed-free). */
 import { afterEach, describe, expect, it } from 'vitest';
 import { execSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { buildApp } from '../src/app.js';
 import { AuthService } from '../src/auth.js';
-import { LOCAL_DEV_AUTH_SECRET, MIN_AUTH_SECRET_LENGTH, assertBootPolicy, devOtpEnabled, resolveAuthSecret, resolveSeedMode } from '../src/boot-config.js';
+import { DENIED_SECRETS, LOCAL_DEV_AUTH_SECRET, MIN_AUTH_SECRET_LENGTH, assertBootPolicy, devOtpEnabled, resolveAuthSecret, resolveSeedMode } from '../src/boot-config.js';
 import { makeTestRepo } from './helpers/repo.js';
 
 describe('resolveAuthSecret (fail-closed)', () => {
-  const STRONG = '37115fa1d12be597cd6c1aba5cbf92508072d305edfc59082cc6c963e1d0a674'; // 64 hex (openssl rand -hex 32 shape)
-  const STRONG_B64 = 'aKhvRtkVHp1roRMXlvPw6QamCfBEPoeRt107EaxlDH8'; // 43 base64url, 32 random bytes
+  // Positive fixtures are generated AT TEST RUNTIME (independent security,
+  // 2026-09-18): no fixed accepted-format secret is ever committed.
+  const STRONG = randomBytes(32).toString('hex'); // canonical 64-hex
+  const STRONG_B64 = randomBytes(32).toString('base64url').replace(/=+$/, ''); // 43 base64url (must be REJECTED)
   it('returns the configured secret when non-empty, trimmed, and strong enough', () => {
     expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG, DATABASE_URL: 'postgres://x' })).toBe(STRONG);
     expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: `  ${STRONG}  ` })).toBe(STRONG); // trimmed
+  });
+  it('REFUSES every permanently denied secret (fallbacks + exposed public fixtures)', () => {
+    expect(DENIED_SECRETS.size).toBeGreaterThanOrEqual(4); // 2 fallbacks + 2 exposed
+    for (const denied of DENIED_SECRETS) {
+      expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: denied })).toThrow(/refusing to boot|fallback/);
+      expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: denied, DATABASE_URL: 'postgres://x' })).toThrow(/refusing to boot|fallback/);
+    }
   });
   it('REJECTS known fallback values even when explicitly configured', () => {
     for (const bad of ['contake-dev-secret', LOCAL_DEV_AUTH_SECRET]) {
