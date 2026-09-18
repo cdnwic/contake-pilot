@@ -44,4 +44,10 @@
   constant. Production also requires `DATABASE_URL`, forbids
   `CONTAKE_TEST_MODE=true`, and boots seed-free (`CONTAKE_SEED` forbidden).
   Render declares the secret as a managed `sync:false` env var (no value in
-  the repo); generate it with e.g. `openssl rand -base64 32`.
+  the repo); generate it ONLY with `openssl rand -hex 32` (canonical 64-char
+  lowercase hex of 32 CSPRNG bytes - the single accepted representation;
+  base64/base64url variants are rejected). The documented generator is
+  executed and fed through the built resolver in
+  `tests/auth-fail-closed.test.ts` and `scripts/render-release-check.sh`.
+  The resolver validates shape only - it cannot prove randomness; CSPRNG
+  generation via the documented command is an operational requirement.

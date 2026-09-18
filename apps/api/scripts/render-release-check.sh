@@ -54,4 +54,14 @@ if [ -n "${1:-}" ]; then
   for i in $(seq 1 25); do curl -sf -m 2 "http://127.0.0.1:$PORT/v1/health" >/dev/null 2>&1 && { ok=1; break; }; sleep 1; done
   [ -n "$ok" ] && echo "health 200 on dynamic port $PORT - OK" || { echo 'FAIL: no health'; exit 1; }
 fi
+echo '== documented generators pass the built resolver =='
+# Every backtick-quoted openssl generator in docs/pilot-auth.md is executed
+# and its output fed through the BUILT resolver (dist), so ops docs can never
+# drift from the parser again.
+grep -oE '`openssl rand [^`]+`' docs/pilot-auth.md | tr -d '`' | while read -r gen; do
+  out=$(eval "$gen")
+  GEN_OUT="$out" node -e "const{resolveAuthSecret}=require('./apps/api/dist/boot-config.js');resolveAuthSecret({CONTAKE_AUTH_SECRET:process.env.GEN_OUT})" 2>/dev/null ||   GEN_OUT="$out" node --input-type=module -e "const{resolveAuthSecret}=await import('./apps/api/dist/boot-config.js');resolveAuthSecret({CONTAKE_AUTH_SECRET:process.env.GEN_OUT})"     || { echo "FAIL: documented generator rejected by resolver: $gen"; exit 1; }
+  echo "documented generator accepted: $gen"
+done
+
 echo 'render-release-check: PASS'

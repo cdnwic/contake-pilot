@@ -23,14 +23,16 @@ export const LOCAL_DEV_AUTH_SECRET = 'contake-local-dev-secret-NOT-DEPLOYABLE';
  *  is NOT sufficient - the encoding policy below is the real gate. */
 export const MIN_AUTH_SECRET_LENGTH = 32;
 
-/** Random-encoding policy (independent security review, 2026-09-18): a real
- *  secret is exactly 32 random bytes, represented as either 64 lowercase/upper
- *  hex chars (`openssl rand -hex 32`) or 43 unpadded base64url chars
- *  (`openssl rand -base64 32 | tr '+/' '-_' | tr -d '='`). Anything else -
- *  passphrases, words, padded/truncated encodings, repeated patterns - fails
- *  closed. Generate with the commands above, never by hand. */
-const SECRET_HEX64 = /^[0-9a-fA-F]{64}$/;
-const SECRET_B64URL43 = /^[A-Za-z0-9_-]{43}$/;
+/** Encoding policy (independent security review v2, 2026-09-18): the ONLY
+ *  accepted representation is canonical 64-char lowercase hex of exactly 32
+ *  bytes (decode/re-encode equality holds by construction; uppercase is
+ *  non-canonical and rejected). Generate with `openssl rand -hex 32`, never
+ *  by hand. The runtime validates SHAPE ONLY - it cannot prove randomness;
+ *  CSPRNG generation is an operational requirement enforced by review and by
+ *  the documented-generator release checks, not by this parser. Anything
+ *  else - passphrases, base64 variants, padded/truncated encodings, repeated
+ *  cycles - fails closed. */
+const SECRET_HEX64_CANONICAL = /^[0-9a-f]{64}$/;
 
 /** Values that must NEVER authenticate anything, anywhere. */
 const KNOWN_FALLBACK_SECRETS: ReadonlySet<string> = new Set([
@@ -55,13 +57,18 @@ export function resolveAuthSecret(env: NodeJS.ProcessEnv = process.env): string 
     if (/^(.)\1+$/.test(s)) {
       throw new Error('CONTAKE_AUTH_SECRET is a single repeated character - refusing to boot (fail-closed)');
     }
-    if (!SECRET_HEX64.test(s) && !SECRET_B64URL43.test(s)) {
-      throw new Error('CONTAKE_AUTH_SECRET must be exactly 32 random bytes as 64 hex or 43 unpadded base64url chars (openssl rand -hex 32) - refusing to boot (fail-closed)');
+    if (!SECRET_HEX64_CANONICAL.test(s)) {
+      throw new Error('CONTAKE_AUTH_SECRET must be exactly 32 random bytes as canonical 64-char lowercase hex (openssl rand -hex 32) - refusing to boot (fail-closed)');
     }
-    // Encoding shape alone is not entropy: 'abab...ab' is valid 64-hex and
-    // still a placeholder. Reject low-diversity values outright.
-    if (new Set(s.toLowerCase()).size < 12) {
-      throw new Error('CONTAKE_AUTH_SECRET has too little character diversity (placeholder-grade, e.g. a short cycle repeated) - refusing to boot (fail-closed)');
+    // Shape is not entropy: reject periodic/cyclic values ('abab...',
+    // '0123456789abcdef' x4) and low-diversity placeholders outright.
+    for (let p = 1; p <= 32; p += 1) {
+      if (64 % p === 0 && s === s.slice(0, p).repeat(64 / p)) {
+        throw new Error('CONTAKE_AUTH_SECRET is a repeated cycle (placeholder-grade, format-matching but predictable) - refusing to boot (fail-closed)');
+      }
+    }
+    if (new Set(s).size < 12) {
+      throw new Error('CONTAKE_AUTH_SECRET has too little character diversity (placeholder-grade) - refusing to boot (fail-closed)');
     }
     return s;
   }

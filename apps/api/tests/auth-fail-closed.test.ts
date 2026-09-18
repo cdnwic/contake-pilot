@@ -7,6 +7,8 @@
  *  - seed: a demo seed applies only on an explicit recognized CONTAKE_SEED;
  *    unset/unrecognized boots seed-free (production seed-free). */
 import { afterEach, describe, expect, it } from 'vitest';
+import { execSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { buildApp } from '../src/app.js';
 import { AuthService } from '../src/auth.js';
@@ -29,26 +31,30 @@ describe('resolveAuthSecret (fail-closed)', () => {
   it('REJECTS secrets shorter than the minimum length', () => {
     expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG.slice(0, 31) })).toThrow(/shorter/);
   });
-  it('accepts both sanctioned encodings (64 hex / 43 base64url)', () => {
+  it('accepts ONLY canonical 64-char lowercase hex of 32 bytes (security v2: hex-only)', () => {
     expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG })).toBe(STRONG);
-    expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG_B64 })).toBe(STRONG_B64);
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG.toUpperCase() })).toThrow(/refusing to boot/); // non-canonical case
+    // base64url support REMOVED (canonical decode/re-encode not implemented):
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG_B64 })).toThrow(/refusing to boot/);
   });
-  it('REJECTS secrets failing the random-encoding policy even at sufficient length/diversity', () => {
-    // 32-char mixed passphrase: long and diverse, but NOT 32 random bytes encoded.
+  it('REJECTS secrets failing the encoding policy even at sufficient length/diversity', () => {
+    // 32-char mixed passphrase: long and diverse, but NOT canonical 64-hex.
     expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'Kx9$mQ2vR7nW4pLzT8bYcJ5dFhG3sA6e' })).toThrow(/refusing to boot/);
     // hex but 63/65 chars (truncated/padded).
     expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG.slice(0, 63) })).toThrow();
     expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG + 'f' })).toThrow();
-    // base64url but 44 with padding or standard-b64 alphabet.
+    // padded/standard base64url shapes.
     expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG_B64 + '=' })).toThrow();
     expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG_B64.slice(0, 42) + '+' })).toThrow();
   });
-  it('REJECTS trivially repeated placeholder secrets (no real entropy)', () => {
-    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'a'.repeat(40) })).toThrow(/repeated|encoding|hex|base64url/);
-    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'ab'.repeat(32) })).toThrow(/refusing to boot/);
-    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: '0123456789'.repeat(7) })).toThrow(/refusing to boot/);
-  });
-  it('REQUIRES a secret for NODE_ENV=production even WITHOUT DATABASE_URL (adapter-independent)', () => {
+  it('REJECTS predictable format-matching hex: repeated cycles and ascending patterns', () => {
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'a'.repeat(64) })).toThrow(/refusing to boot/);
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'ab'.repeat(32) })).toThrow(/repeated cycle/);
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: '0123456789abcdef'.repeat(4) })).toThrow(/repeated cycle/); // valid hex, full diversity, still a cycle
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'deadbeef'.repeat(8) })).toThrow(/repeated cycle/);
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'fedcba9876543210'.repeat(4) })).toThrow(/repeated cycle/); // descending cycle
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: '0123456789'.repeat(7) })).toThrow(/refusing to boot/); // wrong shape entirely
+  });  it('REQUIRES a secret for NODE_ENV=production even WITHOUT DATABASE_URL (adapter-independent)', () => {
     expect(() => resolveAuthSecret({ NODE_ENV: 'production' })).toThrow(/CONTAKE_AUTH_SECRET/);
   });
   it('REFUSES postgres-shaped boot when the secret is missing', () => {
@@ -72,6 +78,25 @@ describe('resolveAuthSecret (fail-closed)', () => {
     expect(resolveAuthSecret({})).toBe(LOCAL_DEV_AUTH_SECRET);
     expect(LOCAL_DEV_AUTH_SECRET).toContain('NOT-DEPLOYABLE');
     expect(new AuthService({} as never).issueToken).toBeDefined(); // default ctor stays local-dev
+  });
+});
+
+describe('documented secret generators (doc/parser alignment, QA 2026-09-18)', () => {
+  /** Extracts EVERY backtick-quoted `openssl rand ...` command documented in
+   *  docs/pilot-auth.md, executes it, and passes the output through the real
+   *  resolver. A doc that teaches an output the parser rejects FAILS here. */
+  it('every documented generator produces a resolver-ACCEPTED secret', () => {
+    const doc = readFileSync(new URL('../../../docs/pilot-auth.md', import.meta.url), 'utf8');
+    const cmds = [...doc.matchAll(/`openssl rand [^`]+`/g)].map(m => m[0].slice(1, -1));
+    expect(cmds.length).toBeGreaterThanOrEqual(1);
+    for (const cmd of cmds) {
+      const out = execSync(cmd, { encoding: 'utf8' }).trim();
+      expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: out }), `documented generator rejected: ${cmd}`).toBe(out);
+    }
+  });
+  it('bare padded standard base64 (the previous doc advice) is REJECTED', () => {
+    const out = execSync('openssl rand -base64 32', { encoding: 'utf8' }).trim();
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: out })).toThrow(/refusing to boot/);
   });
 });
 
