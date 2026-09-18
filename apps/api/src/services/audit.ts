@@ -18,24 +18,26 @@ let seq = 0;
 
 /** Every mutation flows through here (QA AC-AUD-1): actor, role, action,
  *  before/after, ChangeRequest linkage, timestamp, device class. */
-export async function audit(
-  repo: GraphRepository,
-  entry: {
-    orgId: ID;
-    eventId: ID;
-    actorUserId: ID;
-    role: ActorRole;
-    action: Action;
-    entityType: AuditEntityType;
-    entityId: ID;
-    before?: unknown;
-    after?: unknown;
-    changeRequestId?: ID;
-    deviceClass?: string;
-  },
-): Promise<void> {
+export interface AuditEntryInput {
+  orgId: ID;
+  eventId: ID;
+  actorUserId: ID;
+  role: ActorRole;
+  action: Action;
+  entityType: AuditEntityType;
+  entityId: ID;
+  before?: unknown;
+  after?: unknown;
+  changeRequestId?: ID;
+  deviceClass?: string;
+}
+
+/** QA lifecycle gate (2026-09-17): record construction split from the append,
+ *  so the impersonation-session lifecycle primitive can carry its audit row
+ *  INTO the adapter-level atomic transition (no separate, losable append). */
+export function buildAuditRecord(entry: AuditEntryInput): AuditLogEntry {
   seq += 1;
-  const record: AuditLogEntry = {
+  return {
     id: `aud_${Date.now().toString(36)}_${seq}`,
     orgId: entry.orgId,
     eventId: entry.eventId,
@@ -50,7 +52,10 @@ export async function audit(
     ...(entry.deviceClass ? { deviceClass: entry.deviceClass } : {}),
     createdAt: new Date().toISOString(),
   };
-  await repo.appendAudit(record);
+}
+
+export async function audit(repo: GraphRepository, entry: AuditEntryInput): Promise<void> {
+  await repo.appendAudit(buildAuditRecord(entry));
 }
 
 /** contracts v1.9: every mutating-endpoint attempt that passes authentication but

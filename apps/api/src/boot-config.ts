@@ -23,6 +23,18 @@ export const LOCAL_DEV_AUTH_SECRET = 'contake-local-dev-secret-NOT-DEPLOYABLE';
  *  is NOT sufficient - the encoding policy below is the real gate. */
 export const MIN_AUTH_SECRET_LENGTH = 32;
 
+/** Boot/config refusal type (SA unification 2026-09-19): names the CLASS of
+ *  the problem only, never a secret value. */
+export class AuthSecretConfigError extends Error {}
+
+/** Explicit test mode (SA hardening, 2026-09-18): CONTAKE_TEST_MODE=true or
+ *  NODE_ENV=test. The dev secret fallback and dev OTP disclosure exist ONLY
+ *  under this mode; the deployed entry point (assertDeployedBoot) refuses to
+ *  boot with it set. */
+export function isExplicitTestMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env['CONTAKE_TEST_MODE'] === 'true' || env['NODE_ENV'] === 'test';
+}
+
 /** Encoding policy (independent security review v2, 2026-09-18): the ONLY
  *  accepted representation is canonical 64-char lowercase hex of exactly 32
  *  bytes (decode/re-encode equality holds by construction; uppercase is
@@ -61,33 +73,55 @@ export function resolveAuthSecret(env: NodeJS.ProcessEnv = process.env): string 
   const s = typeof raw === 'string' ? raw.trim() : '';
   if (s.length > 0) {
     if (KNOWN_FALLBACK_SECRETS.has(s)) {
-      throw new Error('CONTAKE_AUTH_SECRET matches a known fallback/dev value - refusing to boot (fail-closed)');
+      throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET matches a known fallback/dev value - refusing to boot (fail-closed)');
     }
     if (s.length < MIN_AUTH_SECRET_LENGTH) {
-      throw new Error(`CONTAKE_AUTH_SECRET is shorter than ${MIN_AUTH_SECRET_LENGTH} characters - refusing to boot (fail-closed)`);
+      throw new AuthSecretConfigError(`CONTAKE_AUTH_SECRET is shorter than ${MIN_AUTH_SECRET_LENGTH} characters - refusing to boot (fail-closed)`);
     }
     if (/^(.)\1+$/.test(s)) {
-      throw new Error('CONTAKE_AUTH_SECRET is a single repeated character - refusing to boot (fail-closed)');
+      throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is a single repeated character - refusing to boot (fail-closed)');
     }
     if (!SECRET_HEX64_CANONICAL.test(s)) {
-      throw new Error('CONTAKE_AUTH_SECRET must be exactly 32 random bytes as canonical 64-char lowercase hex (openssl rand -hex 32) - refusing to boot (fail-closed)');
+      throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET must be exactly 32 random bytes as canonical 64-char lowercase hex (openssl rand -hex 32) - refusing to boot (fail-closed)');
     }
     // Shape is not entropy: reject periodic/cyclic values ('abab...',
     // '0123456789abcdef' x4) and low-diversity placeholders outright.
     for (let p = 1; p <= 32; p += 1) {
       if (64 % p === 0 && s === s.slice(0, p).repeat(64 / p)) {
-        throw new Error('CONTAKE_AUTH_SECRET is a repeated cycle (placeholder-grade, format-matching but predictable) - refusing to boot (fail-closed)');
+        throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is a repeated cycle (placeholder-grade, format-matching but predictable) - refusing to boot (fail-closed)');
       }
     }
     if (new Set(s).size < 12) {
-      throw new Error('CONTAKE_AUTH_SECRET has too little character diversity (placeholder-grade) - refusing to boot (fail-closed)');
+      throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET has too little character diversity (placeholder-grade) - refusing to boot (fail-closed)');
     }
     return s;
   }
   if (env['DATABASE_URL'] || isProductionBoot(env)) {
-    throw new Error('CONTAKE_AUTH_SECRET is missing or empty in a production-shaped boot (DATABASE_URL and/or NODE_ENV=production) - refusing to boot (fail-closed)');
+    throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is missing or empty in a production-shaped boot (DATABASE_URL and/or NODE_ENV=production) - refusing to boot (fail-closed)');
   }
-  return LOCAL_DEV_AUTH_SECRET;
+  // SA hardening (2026-09-18, carried onto main): the dev fallback exists
+  // ONLY under explicit test mode. Any other boot shape without a managed
+  // secret fails CLOSED - no silent local default.
+  if (isExplicitTestMode(env)) {
+    return LOCAL_DEV_AUTH_SECRET;
+  }
+  throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is not set - refusing to start authentication without an explicitly managed secret (fail CLOSED; the dev fallback exists only under explicit test mode)');
+}
+
+/** Deployed-boot gate (SA hardening 2026-09-18, carried onto main 2026-09-19):
+ *  the production entry point calls this FIRST. A deployed build refuses to
+ *  boot with explicit test mode set (test fallbacks available) or with dev
+ *  OTP disclosure opted in; then the production invariants and the managed
+ *  secret check run. Throws AuthSecretConfigError naming the CLASS only. */
+export function assertDeployedBoot(env: NodeJS.ProcessEnv = process.env): void {
+  if (isExplicitTestMode(env)) {
+    throw new AuthSecretConfigError('explicit test mode is set (CONTAKE_TEST_MODE=true or NODE_ENV=test) - a deployed build refuses to boot with test fallbacks available');
+  }
+  if (env['CONTAKE_DEV_OTP'] === 'true') {
+    throw new AuthSecretConfigError('CONTAKE_DEV_OTP=true opts into dev OTP disclosure - a deployed build refuses to boot with OTP disclosure enabled');
+  }
+  assertBootPolicy(env);
+  resolveAuthSecret(env); // strong managed secret, or throw
 }
 
 /** Production-boot invariants. Throws (refuses boot) on the first violation;
@@ -110,9 +144,11 @@ export function assertBootPolicy(env: NodeJS.ProcessEnv = process.env): void {
 }
 
 /** Exact-opt-in dev OTP exposure: only the literal string 'true' opens it,
- *  and never in a production boot (assertBootPolicy). */
+ *  and ONLY under explicit test mode (SA hardening 2026-09-18: an opt-in
+ *  outside test mode stays closed; a production boot can never be in test
+ *  mode and additionally refuses the flag outright in assertBootPolicy). */
 export function devOtpEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env['CONTAKE_DEV_OTP'] === 'true' && !isProductionBoot(env);
+  return env['CONTAKE_DEV_OTP'] === 'true' && isExplicitTestMode(env);
 }
 
 export type SeedMode = 'demo' | 'camp-demo' | 'all-demo' | undefined;

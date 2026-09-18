@@ -5,8 +5,9 @@ import type {
   WhitelistEntry, WhitelistStatus,
   AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
-import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
-import { ReportClientIdConflictError } from './graph-repository.js';
+import type { ChannelRecord, GraphRepository, ImpersonationEndState, ImpersonationSessionPage, SeedData, UserRecord } from './graph-repository.js';
+import { isCanonicalSandboxSession, paginateSessions, ReportClientIdConflictError } from './graph-repository.js';
+import { SUPERADMIN_SANDBOX_ORG } from '../services/superadmin.js';
 
 /** In-memory GraphRepository (M1). Atomic batch semantics mirror the future
  *  Postgres transaction: validate everything, then commit (QA AC-DOM-7). */
@@ -49,20 +50,77 @@ export class MemoryGraphRepository implements GraphRepository {
     return repo;
   }
 
-  async createUser(u: UserRecord): Promise<UserRecord> { this.users.set(u.userId, u); return u; }
+  async createUser(u: UserRecord): Promise<UserRecord> {
+    // QA lifecycle gate (2026-09-17): storage-level UNIQUE NORMALIZED phone.
+    // Normalization = trim; a phone may belong to exactly ONE user across all
+    // tenants (global credential identity). Mirrors the PG unique index.
+    const phone = u.phone === undefined ? undefined : u.phone.trim();
+    if (phone) {
+      for (const ex of this.users.values()) {
+        if (ex.userId !== u.userId && ex.phone === phone) {
+          throw Object.assign(new Error('duplicate key value violates unique constraint "users_phone_unique"'), { code: '23505' });
+        }
+      }
+    }
+    const rec = u.phone === undefined ? u : { ...u, phone };
+    this.users.set(rec.userId, rec);
+    return rec;
+  }
   async getUser(userId: ID): Promise<UserRecord | undefined> { return this.users.get(userId); }
+  async getUserWithStorageOrg(userId: ID): Promise<{ record: UserRecord; storageOrgId: ID } | undefined> {
+    const record = this.users.get(userId);
+    return record && { record, storageOrgId: record.orgId }; // memory: the record IS the only representation
+  }
   async findUserByEmail(email: string): Promise<UserRecord | undefined> {
     return [...this.users.values()].find(u => u.email === email);
   }
   async findUserByPhone(phone: string): Promise<UserRecord | undefined> {
-    return [...this.users.values()].find(u => u.phone === phone);
+    const normalized = phone.trim();
+    return [...this.users.values()].find(u => u.phone === normalized);
   }
   async updateUser(userId: ID, patch: Partial<UserRecord>): Promise<UserRecord | undefined> {
     const cur = this.users.get(userId);
     if (!cur) return undefined;
     const next = { ...cur, ...patch, userId: cur.userId, orgId: cur.orgId };
+    if (next.phone !== undefined) next.phone = next.phone.trim();
+    if (next.phone) {
+      for (const ex of this.users.values()) {
+        if (ex.userId !== userId && ex.phone === next.phone) {
+          throw Object.assign(new Error('duplicate key value violates unique constraint "users_phone_unique"'), { code: '23505' });
+        }
+      }
+    }
     this.users.set(userId, next);
     return next;
+  }
+
+  // ---- QA lifecycle gate (2026-09-17): impersonation session lifecycle ----
+  async transitionImpersonationSession(
+    userId: ID, expected: 'active', next: ImpersonationEndState,
+    at: string, auditEntry: AuditLogEntry, endBy: string,
+  ): Promise<'transitioned' | 'not-active' | 'not-found'> {
+    const cur = this.users.get(userId);
+    // QA hardening (2026-09-18): only CANONICAL sandbox sessions transition;
+    // non-sandbox or malformed legacy records are not-found (route -> 404),
+    // never mutated, never deleted.
+    if (!cur || !isCanonicalSandboxSession(cur, SUPERADMIN_SANDBOX_ORG)) return 'not-found';
+    if ((cur.sessionState ?? 'active') !== expected) return 'not-active';
+    // Single-threaded check+set+append: one atomic unit, audit can never be
+    // lost after the state flip nor written without it.
+    this.users.set(userId, { ...cur, active: false, sessionState: next, sessionEndedAt: at, sessionEndBy: endBy });
+    this.auditLog.push(auditEntry);
+    return 'transitioned';
+  }
+
+  async listImpersonationSessions(opts: {
+    state?: 'active' | 'stopped' | 'expired' | 'revoked';
+    limit: number;
+    cursor?: string;
+  }): Promise<ImpersonationSessionPage> {
+    // QA hardening v2: shared pipeline (exact PG parity); memory records are
+    // their own storage representation.
+    const rows = [...this.users.values()].map(record => ({ record, storageOrgId: record.orgId }));
+    return paginateSessions(rows, SUPERADMIN_SANDBOX_ORG, opts);
   }
   async listUsers(orgId: ID): Promise<UserRecord[]> { return [...this.users.values()].filter(u => u.orgId === orgId); }
 

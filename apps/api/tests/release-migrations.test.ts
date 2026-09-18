@@ -32,7 +32,7 @@ const SA_PARAMS = { index: 'users_phone_unique', table: 'users', unique: 'unique
 describe('R4 confined-registry contract (module-private frozen registry; anchored digests; inert artifacts)', () => {
   it('SA-shaped index applies via runMigrations; exact indexdef is catalog-observed (render is not exported)', async () => {
     const { pg, conn } = await freshDb();
-    const sa = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
+    const sa = step('0004', 'sa', 'ddl.create-index', SA_PARAMS);
     await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
     const idx = await conn.query(`SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'users_phone_unique'`);
     const indexdef = String(idx.rows[0]?.['indexdef'] ?? '');
@@ -41,7 +41,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     expect(indexdef).not.toContain(';'); // one statement, no separator
     // extra/missing params refuse at registration, driven through the runner
     // (as a NOT-yet-applied version so rendering is actually reached):
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa, step('0003', 'sa2', 'ddl.create-index', { ...SA_PARAMS, extra: 1 })] }))
+    await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa, step('0005', 'sa2', 'ddl.create-index', { ...SA_PARAMS, extra: 1 })] }))
       .rejects.toThrow(/do not exactly match/);
     await pg.close();
   });
@@ -124,7 +124,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
   });
   it('code-object creation is impossible by construction and absent from the catalog after a full run', async () => {
     const { pg, conn } = await freshDb();
-    const sa = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
+    const sa = step('0004', 'sa', 'ddl.create-index', SA_PARAMS);
     await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
     const counts = await conn.query(`SELECT
       (SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public') AS funcs,
@@ -431,7 +431,7 @@ describe('release-migration runner', () => {
     const { GRAPH_DDL } = await import('../src/repo/postgres.js');
     for (const stmt of GRAPH_DDL.split(';').map(s => s.trim()).filter(Boolean)) await conn.query(stmt);
     const r = await runMigrations(conn, { deployment: 'production-pilot' });
-    expect(r.appliedNow).toEqual(['0001']);
+    expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     await pg.close();
   });
@@ -507,10 +507,10 @@ describe('release-migration runner', () => {
 
   it('param-level edit of an applied step (tampered artifact bytes) fails rerun AND boot', async () => {
     const { pg, conn } = await freshDb();
-    const implA = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
+    const implA = step('0004', 'sa', 'ddl.create-index', SA_PARAMS);
     const r = await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implA] });
-    expect(r.appliedNow).toEqual(['0001', '0002']);
-    const implB = step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique_v2' });
+    expect(r.appliedNow).toEqual(['0001', '0002', '0003', '0004']);
+    const implB = step('0004', 'sa', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique_v2' });
     let observed = '';
     try { await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implB] }); } catch (e) { observed = String(e); }
     console.log(`OBSERVED[tampered artifact refused]: ${observed.slice(0, 160)}`);
@@ -551,34 +551,36 @@ describe('release-migration runner', () => {
     const { pg, conn } = await freshDb();
     await runMigrations(conn, { deployment: 'staging' });
     await conn.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u1', 'o1', '+972555111111', '{}')`);
-    const guarded = step('0002', 'guarded-index', 'ddl.create-index', SA_PARAMS, {
+    const guarded = step('0004', 'guarded-index', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique_guarded' }, {
       xactLockKey: 4242,
       lockTables: ['users'],
       assertions: [{ kind: 'table-empty', table: 'users' }],
     });
     await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, guarded] })).rejects.toThrow(/ASSERTION refusal - guard 'table-empty'/);
-    const idx = await conn.query(`SELECT to_regclass('users_phone_unique') AS r`);
+    const idx = await conn.query(`SELECT to_regclass('users_phone_unique_guarded') AS r`);
     expect(idx.rows[0]?.['r']).toBeNull(); // artifact never applied
-    const v = await conn.query(`SELECT count(*)::int AS n FROM schema_migrations WHERE version = '0002'`);
+    const v = await conn.query(`SELECT count(*)::int AS n FROM schema_migrations WHERE version = '0004'`);
     expect(Number(v.rows[0]?.['n'])).toBe(0);
     await pg.close();
   });
 
   it('SA-shaped declarative step (locks + guards + canonical index) applies and is recorded', async () => {
     const { pg, conn } = await freshDb();
-    const sa = step('0002', 'users-phone-unique-index', 'ddl.create-index', SA_PARAMS, {
+    const sa = step('0004', 'users-phone-index-v2', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique_v2' }, {
       xactLockKey: 123456,
       lockTables: ['users'],
       assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim' }],
     });
     const r = await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
-    expect(r.appliedNow).toEqual(['0001', '0002']);
-    const idx = await conn.query(`SELECT to_regclass('users_phone_unique') AS r`);
-    expect(idx.rows[0]?.['r']).toBe('users_phone_unique');
+    expect(r.appliedNow).toEqual(['0001', '0002', '0003', '0004']);
+    const idx = await conn.query(`SELECT to_regclass('users_phone_unique_v2') AS r`);
+    expect(idx.rows[0]?.['r']).toBe('users_phone_unique_v2');
     await expect(assertSchemaCurrent(conn, [...MIGRATIONS, sa])).resolves.toBeUndefined();
-    // duplicate normalized phones would block a rerun-shaped step on another db
+    // duplicate normalized phones block the shipped 0002 guard on another db
+    // (planted BEFORE the index exists - post-index such an insert is
+    // rejected by the index itself):
     const { pg: pg2, conn: conn2 } = await freshDb();
-    await runMigrations(conn2, { deployment: 'staging' });
+    await runMigrations(conn2, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
     await conn2.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('a', 'o', '+972555111111', '{}'), ('b', 'o', ' +972555111111 ', '{}')`);
     await expect(runMigrations(conn2, { deployment: 'staging', migrations: [...MIGRATIONS, sa] })).rejects.toThrow(/ASSERTION refusal - guard 'no-duplicates'/);
     await pg2.close();

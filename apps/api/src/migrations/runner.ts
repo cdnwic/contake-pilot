@@ -226,6 +226,29 @@ const TEMPLATES: readonly TemplateEntry[] = [
     shapes: ['CREATE {unique}INDEX {ifNotExists}{index} ON {table} ({expression}){predicate}'],
     sample: { index: 'sa_idx', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
   },
+  {
+    name: 'data.normalize-users-phone',
+    description:
+      'SA lane DATA family: trim users.phone AND the embedded data.phone JSON key, each to its OWN btrim value ' +
+      '(value-preserving; never picks a representation winner, never deletes). Writes ROW DATA only - no catalog classes.',
+    params: {
+      table: { kind: 'identifier', quote: 'schema' },
+      column: { kind: 'identifier', quote: 'bare' },
+      jsonColumn: { kind: 'identifier', quote: 'bare' },
+      // The JSON key enters ONLY as this closed enum literal (no free text):
+      jsonKey: { kind: 'enum', values: ['phone'], fragments: { phone: `'phone'` } },
+    },
+    writesCatalogs: [],
+    shapes: [
+      'UPDATE {table} SET {column} = pg_catalog.btrim({column}), ' +
+      '{jsonColumn} = CASE WHEN ({jsonColumn}->>{jsonKey}) IS NOT NULL ' +
+      'THEN pg_catalog.jsonb_set({jsonColumn}, ARRAY[{jsonKey}], pg_catalog.to_jsonb(pg_catalog.btrim({jsonColumn}->>{jsonKey})), false) ' +
+      'ELSE {jsonColumn} END ' +
+      'WHERE ({column} IS NOT NULL AND {column} <> pg_catalog.btrim({column})) ' +
+      'OR (({jsonColumn}->>{jsonKey}) IS NOT NULL AND ({jsonColumn}->>{jsonKey}) <> pg_catalog.btrim({jsonColumn}->>{jsonKey}))',
+    ],
+    sample: { table: 'users', column: 'phone', jsonColumn: 'data', jsonKey: 'phone' },
+  },
 ];
 
 /** R5 section 1: the ONE assembly mechanism over the inert data. Runner code
@@ -708,24 +731,39 @@ export const MIGRATIONS: readonly MigrationStep[] = [
     template: 'init.schema-baseline.0001',
     params: {},
   },
-  // SA lane plug-in contract (backend compatibility confirmed 2026-09-18;
-  // TL reconciliation: declarative-only, guards as runner primitives):
-  // register as '0002' when the SA track lands:
-  // {
-  //   version: '0002', name: 'users-phone-unique-index',
-  //   description: 'users_phone_unique canonical partial unique index (SA lane)',
-  //   xactLockKey: <SA migration lock key>,
-  //   lockTables: ['users'],
-  //   assertions: [
-  //     { name: 'no_duplicate_normalized_phones', query: `SELECT phone FROM users WHERE phone IS NOT NULL GROUP BY btrim(phone) HAVING count(*) > 1` },
-  //     { name: 'no_inconsistent_rows', query: `<SA inconsistency guard SELECT>` },
-  //   ],
-  //   sql: `CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`,
-  // }
-  // Blocking guards hard-fail and roll back; normalization itself is set-based
-  // DML in the artifact when SA ships it. The companion read-only structured
-  // preflight remains operator evidence outside the migration. No second
-  // runner may be introduced.
+  // SA lane plug-in (landed 2026-09-19, declarative-only per the R3
+  // contract; supersedes the commented sketch): migrateUsersPhone is
+  // re-expressed as TWO inert-data steps - one step = one template, and
+  // artifact SQL no longer exists. 0002 normalizes ROW DATA through the
+  // closed DATA template family (never general DML); 0003 creates the
+  // canonical expression index through named forms. Both steps carry the SA
+  // migration xact lock + users table lock + the collision guard as runner
+  // primitives. The companion read-only structured preflight
+  // (cross-representation collision/inconsistency reporting) remains
+  // operator evidence OUTSIDE the migration artifact - the closed guard
+  // union intentionally cannot express it.
+  {
+    version: '0002',
+    name: 'users-phone-normalize',
+    description:
+      'SA lane: trim users.phone and data.phone JSON to their own btrim values ' +
+      '(fail-loud on normalized column-phone collisions; never deletes, never picks a representation winner).',
+    template: 'data.normalize-users-phone',
+    params: { table: 'users', column: 'phone', jsonColumn: 'data', jsonKey: 'phone' },
+    xactLockKey: 7263849598301, // 'users-phone-migration'
+    lockTables: ['users'],
+    assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim', skipNulls: true }],
+  },
+  {
+    version: '0003',
+    name: 'users-phone-unique-index',
+    description: 'users_phone_unique canonical partial unique index on btrim(phone) (SA lane).',
+    template: 'ddl.create-index',
+    params: { index: 'users_phone_unique', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
+    xactLockKey: 7263849598301, // 'users-phone-migration'
+    lockTables: ['users'],
+    assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim', skipNulls: true }],
+  },
 ];
 
 export const EXPECTED_SCHEMA_VERSIONS: readonly string[] = MIGRATIONS.map(m => m.version);

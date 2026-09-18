@@ -5,8 +5,9 @@ import type {
   ResourceNode, StatusReport, StatusToken, TaskNode, TaskResourceLink,
   WhitelistEntry, WhitelistStatus, AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
-import type { ChannelRecord, GraphRepository, SeedData, UserRecord } from './graph-repository.js';
-import { ReportClientIdConflictError } from './graph-repository.js';
+import type { ChannelRecord, GraphRepository, ImpersonationEndState, ImpersonationSessionPage, SeedData, UserRecord } from './graph-repository.js';
+import { ReportClientIdConflictError, isCanonicalSandboxSession, paginateSessions,} from './graph-repository.js';
+import { SUPERADMIN_SANDBOX_ORG } from '../services/superadmin.js';
 import type { DispatchStateStore } from '../services/dispatch.js';
 import type { AuthAuditEntry, OtpCodeEntry, OtpStateStore, OtpVerifyState } from '../auth.js';
 
@@ -92,6 +93,12 @@ CREATE INDEX IF NOT EXISTS tasks_event_id ON tasks(event_id);
 CREATE INDEX IF NOT EXISTS resources_event_id ON resources(event_id);
 CREATE INDEX IF NOT EXISTS channels_address ON channels(address);
 CREATE UNIQUE INDEX IF NOT EXISTS reports_client_report_id_unique ON reports(client_report_id);
+-- users_phone_unique is intentionally NOT created at bootstrap (QA 2026-09-18,
+-- preservation-first): a legacy deployment may hold colliding/padded phones;
+-- the unique index is created ONLY by the reviewed forward migration
+-- (migration 0003 via the shared release-migration runner's closed template
+-- registry, after 0002 normalization). Snapshot/backup/restore belongs to
+-- the separate infra track (architecture separation 2026-09-18), not here.
 CREATE INDEX IF NOT EXISTS notification_jobs_idem ON notification_jobs(idempotency_key);
 CREATE INDEX IF NOT EXISTS audit_log_org_id ON audit_log(org_id);
 CREATE INDEX IF NOT EXISTS change_requests_event_id ON change_requests(event_id);
@@ -177,22 +184,33 @@ export class PostgresGraphRepository implements GraphRepository {
 
   // ---- users & channels -----------------------------------------------------
   async createUser(u: UserRecord): Promise<UserRecord> {
+    // QA lifecycle gate (2026-09-17): storage-level UNIQUE NORMALIZED phone
+    // (users_phone_unique partial index on btrim(phone)). Normalization =
+    // trim at the repository boundary; a phone belongs to exactly ONE user
+    // across all tenants. A colliding insert/upsert fails loud (23505).
+    const phone = u.phone === undefined ? undefined : u.phone.trim();
+    const rec = u.phone === undefined ? u : { ...u, phone };
     await this.q(
       `INSERT INTO users(user_id, org_id, email, phone, data) VALUES($1,$2,$3,$4,$5)
        ON CONFLICT (user_id) DO UPDATE SET org_id=EXCLUDED.org_id, email=EXCLUDED.email, phone=EXCLUDED.phone, data=EXCLUDED.data`,
-      [u.userId, u.orgId, u.email ?? null, u.phone ?? null, JSON.stringify(u)]);
-    return u;
+      [rec.userId, rec.orgId, rec.email ?? null, rec.phone ?? null, JSON.stringify(rec)]);
+    return rec;
   }
   async getUser(userId: ID): Promise<UserRecord | undefined> {
     const r = await this.q(`SELECT data FROM users WHERE user_id=$1`, [userId]);
     return r.rows[0]?.['data'] as UserRecord | undefined;
+  }
+  async getUserWithStorageOrg(userId: ID): Promise<{ record: UserRecord; storageOrgId: ID } | undefined> {
+    const r = await this.q(`SELECT org_id, data FROM users WHERE user_id=$1`, [userId]);
+    const row = r.rows[0];
+    return row && { record: row['data'] as UserRecord, storageOrgId: row['org_id'] as ID };
   }
   async findUserByEmail(email: string): Promise<UserRecord | undefined> {
     const r = await this.q(`SELECT data FROM users WHERE email=$1 LIMIT 1`, [email]);
     return r.rows[0]?.['data'] as UserRecord | undefined;
   }
   async findUserByPhone(phone: string): Promise<UserRecord | undefined> {
-    const r = await this.q(`SELECT data FROM users WHERE phone=$1 LIMIT 1`, [phone]);
+    const r = await this.q(`SELECT data FROM users WHERE phone=$1 LIMIT 1`, [phone.trim()]);
     return r.rows[0]?.['data'] as UserRecord | undefined;
   }
   async updateUser(userId: ID, patch: Partial<UserRecord>): Promise<UserRecord | undefined> {
@@ -201,6 +219,7 @@ export class PostgresGraphRepository implements GraphRepository {
       const cur = r.rows[0]?.['data'] as UserRecord | undefined;
       if (!cur) return undefined;
       const next = { ...cur, ...patch, userId: cur.userId, orgId: cur.orgId };
+      if (next.phone !== undefined) next.phone = next.phone.trim();
       await c.query(`UPDATE users SET email=$2, phone=$3, data=$4 WHERE user_id=$1`,
         [userId, next.email ?? null, next.phone ?? null, JSON.stringify(next)]);
       return next;
@@ -209,6 +228,46 @@ export class PostgresGraphRepository implements GraphRepository {
   async listUsers(orgId: ID): Promise<UserRecord[]> {
     const r = await this.q(`SELECT data FROM users WHERE org_id=$1`, [orgId]);
     return r.rows.map(row => row['data'] as UserRecord);
+  }
+
+  // ---- QA lifecycle gate (2026-09-17): impersonation session lifecycle ----
+  async transitionImpersonationSession(
+    userId: ID, expected: 'active', next: ImpersonationEndState,
+    at: string, auditEntry: AuditLogEntry, endBy: string,
+  ): Promise<'transitioned' | 'not-active' | 'not-found'> {
+    return this.inTx(async c => {
+      const r = await c.query(`SELECT org_id, data FROM users WHERE user_id=$1 FOR UPDATE`, [userId]);
+      const row0 = r.rows[0];
+      const cur = row0?.['data'] as UserRecord | undefined;
+      // QA hardening v2 (2026-09-18, QA+security): only CANONICAL sandbox
+      // sessions transition - authoritative org_id column AND embedded
+      // data.orgId must BOTH be the sandbox org; non-sandbox or malformed
+      // legacy records are not-found (route -> 404), never mutated/deleted.
+      if (!cur || !isCanonicalSandboxSession(cur, SUPERADMIN_SANDBOX_ORG, row0?.['org_id'] as ID)) return 'not-found';
+      if ((cur.sessionState ?? 'active') !== expected) return 'not-active';
+      // Row lock held: state flip + immutable audit row commit together.
+      const nextU: UserRecord = { ...cur, active: false, sessionState: next, sessionEndedAt: at, sessionEndBy: endBy };
+      await c.query(`UPDATE users SET data=$2 WHERE user_id=$1`, [userId, JSON.stringify(nextU)]);
+      await c.query(`INSERT INTO audit_log(org_id, data) VALUES($1,$2)`, [auditEntry.orgId, JSON.stringify(auditEntry)]);
+      return 'transitioned';
+    });
+  }
+
+  async listImpersonationSessions(opts: {
+    state?: 'active' | 'stopped' | 'expired' | 'revoked';
+    limit: number;
+    cursor?: string;
+  }): Promise<ImpersonationSessionPage> {
+    // QA hardening v2 (2026-09-18, QA+security): SQL is ONLY a superset
+    // prefilter (both org representations already sandbox + impersonation
+    // marker present); the SHARED canonical pipeline (same code as the
+    // memory adapter) owns filter/state/sort/cursor/page - exact parity.
+    const r = await this.q(
+      `SELECT org_id, data FROM users
+       WHERE org_id = $1 AND (data->>'orgId') = $1 AND (data->>'impersonationOf') IS NOT NULL`,
+      [SUPERADMIN_SANDBOX_ORG]);
+    const rows = (r.rows as { org_id: ID; data: UserRecord }[]).map(row => ({ record: row.data, storageOrgId: row.org_id }));
+    return paginateSessions(rows, SUPERADMIN_SANDBOX_ORG, opts);
   }
 
   // whitelist onboarding (v1.18 §15): upsert on phone, org-scoped list.

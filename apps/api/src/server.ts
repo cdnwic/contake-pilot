@@ -6,7 +6,7 @@ import { PostgresGraphRepository, pgDispatchState, createPgOtpState } from './re
 import { assertSchemaCurrent, requiredBootIdentity } from './migrations/runner.js';
 import type { GraphRepository } from './repo/graph-repository.js';
 import { applySeed, seedDemo } from './seed.js';
-import { assertBootPolicy, resolveAuthSecret, resolveSeedMode } from './boot-config.js';
+import { assertBootPolicy, assertDeployedBoot, resolveAuthSecret, resolveSeedMode } from './boot-config.js';
 import { createRealtime } from './realtime.js';
 import { createDispatcher, type DispatchStateStore, type MessageProvider } from './services/dispatch.js';
 import { createTwilioProvider, twilioConfigFromEnv } from './services/twilio.js';
@@ -31,6 +31,13 @@ if (RBAC_MATRIX_VERSION !== PINNED_MATRIX_VERSION) {
   throw new Error(`RBAC matrix pin mismatch: expected v${PINNED_MATRIX_VERSION}, loaded v${RBAC_MATRIX_VERSION} - refusing to boot`);
 }
 
+// Security (2026-09-18): deployed builds FAIL CLOSED at boot. Refuses to
+// start under explicit test mode (CONTAKE_TEST_MODE/NODE_ENV=test), with dev
+// OTP disclosure opted in (CONTAKE_DEV_OTP=true), or without a strong
+// explicitly managed CONTAKE_AUTH_SECRET. Hermetic tests never import this
+// module (they use buildApp directly), so their fallbacks stay test-only.
+assertDeployedBoot();
+
 // PR-1: env-selected storage adapter. DATABASE_URL set -> Postgres (real
 // transactions, durable dispatch state); unset -> in-memory (test/dev default).
 let repo: GraphRepository;
@@ -46,8 +53,9 @@ let otpState: OtpStateStore | undefined;
 //                          mode only, re-anchoring free - restart fresh before a demo)
 // Auth secret policy: CONTAKE_AUTH_SECRET is REQUIRED (non-empty) whenever
 // DATABASE_URL is set; a postgres/production boot with it missing or empty
-// REFUSES to boot (resolveAuthSecret throws before any DB work). Memory/dev
-// uses an explicit non-deployable local constant.
+// REFUSES to boot (resolveAuthSecret throws before any DB work). The
+// non-deployable local fallback exists ONLY under explicit test mode, which
+// assertDeployedBoot refuses for any deployed boot.
 const jerusalemToday = (): string => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
 // Fail-closed FIRST, before any DB/network work: production invariants, then
 // the secret. A violating boot dies here.

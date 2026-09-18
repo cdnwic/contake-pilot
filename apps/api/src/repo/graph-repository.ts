@@ -15,6 +15,116 @@ export interface UserRecord extends Principal {
   /** Dev-grade password hash (scrypt). OTP codes are kept separately. */
   passwordHash?: string;
   active: boolean;
+  /** Server-authorized Super Admin (pilot owner). Set ONLY by the backend
+   *  super-admin enrollment path (phone allowlist); re-read from the repo on
+   *  every authenticated request - never derivable from frontend state. */
+  isSuperAdmin?: boolean;
+  /** Set on synthetic sandbox identities minted by super-admin test
+   *  impersonation: the impersonator's userId. Regular users never have it. */
+  impersonationOf?: ID;
+  /** QA lifecycle gate (2026-09-17): impersonation SESSION metadata, minted
+   *  only on sandbox identities. createdAt/expiresAt are ISO instants;
+   *  expiresAt is server-enforced on every authentication (recommended
+   *  15-minute session TTL). sessionState is the lifecycle provenance:
+   *  active -> stopped (self/admin stop) | expired (server-side TTL) |
+   *  revoked (admin revoke-by-id). Inactive identities and their audits are
+   *  PRESERVED - nothing is ever deleted. */
+  createdAt?: string;
+  expiresAt?: string;
+  sessionState?: 'active' | 'stopped' | 'expired' | 'revoked';
+  sessionEndedAt?: string;
+  /** Who ended the session: a userId for stop/revoke, 'server' for TTL expiry. */
+  sessionEndBy?: string;
+}
+
+/** QA hardening v2 (2026-09-18, QA+security): CANONICAL sandbox
+ *  impersonation-session shape. A user record is a listable/transitionable
+ *  impersonation session ONLY when EVERY canonical condition holds:
+ *  - storage org column AND embedded data.orgId BOTH equal the canonical
+ *    sandbox org (cross-representation adversaries are invisible);
+ *  - impersonationOf is present and TRIMMED non-empty;
+ *  - createdAt/expiresAt are canonical timestamps: strict fixed-width ISO-Z
+ *    (...T hh:mm:ss.sssZ), parse finite, and EXACTLY round-trip through
+ *    Date -> ISO (rejects impossible dates, non-leap Feb 29, second 60);
+ *  - expiresAt > createdAt;
+ *  - sessionState is known; active carries NO end metadata; ended states
+ *    carry canonical sessionEndedAt + TRIMMED non-empty sessionEndBy.
+ *  Non-canonical records (non-sandbox or malformed legacy) are INVISIBLE to
+ *  the session surface (404), are REJECTED at authentication, and are never
+ *  mutated or deleted by it.
+ *  The predicate is shared verbatim by BOTH adapters (exact memory/PG
+ *  parity); the PG adapter additionally proves the storage-column org. */
+export const CANONICAL_ISO_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+export function isCanonicalIsoZ(v: unknown): v is string {
+  if (typeof v !== 'string' || !CANONICAL_ISO_Z.test(v)) return false;
+  const ms = Date.parse(v);
+  if (Number.isNaN(ms)) return false; // finite parse
+  return new Date(ms).toISOString() === v; // exact round-trip: no impossible dates
+}
+
+/** Full canonical session check. storageOrgId is the authoritative storage
+ *  org column; the memory adapter's only representation is the record
+ *  itself, so it passes u.orgId. Mismatch between representations is
+ *  non-canonical. */
+export function isCanonicalSandboxSession(u: UserRecord, sandboxOrg: ID, storageOrgId: ID = u.orgId): boolean {
+  if (storageOrgId !== sandboxOrg || u.orgId !== sandboxOrg) return false;
+  if (typeof u.impersonationOf !== 'string' || u.impersonationOf.trim().length === 0) return false;
+  if (!isCanonicalIsoZ(u.createdAt) || !isCanonicalIsoZ(u.expiresAt)) return false;
+  if ((u.expiresAt as string) <= (u.createdAt as string)) return false;
+  if (u.sessionState === 'active') {
+    return u.sessionEndedAt === undefined && u.sessionEndBy === undefined;
+  }
+  if (u.sessionState === 'stopped' || u.sessionState === 'expired' || u.sessionState === 'revoked') {
+    return isCanonicalIsoZ(u.sessionEndedAt) && typeof u.sessionEndBy === 'string' && u.sessionEndBy.trim().length > 0;
+  }
+  return false;
+}
+
+/** Shared session pipeline (QA hardening v2): BOTH adapters run the SAME
+ *  filter + state-filter + sort + cursor + page logic over canonical
+ *  candidates, so list results are identical across memory and Postgres by
+ *  construction. The PG adapter's SQL is only a superset prefilter. */
+export function paginateSessions(
+  rows: { record: UserRecord; storageOrgId: ID }[],
+  sandboxOrg: ID,
+  opts: { state?: 'active' | 'stopped' | 'expired' | 'revoked'; limit: number; cursor?: string },
+): ImpersonationSessionPage {
+  let rows2 = rows.filter(r => isCanonicalSandboxSession(r.record, sandboxOrg, r.storageOrgId)).map(r => r.record);
+  if (opts.state) rows2 = rows2.filter(u => (u.sessionState ?? 'active') === opts.state);
+  rows2.sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? '') || a.userId.localeCompare(b.userId));
+  if (opts.cursor !== undefined) {
+    const sep = opts.cursor.lastIndexOf('|');
+    const cCreated = opts.cursor.slice(0, sep);
+    const cId = opts.cursor.slice(sep + 1);
+    rows2 = rows2.filter(u => (u.createdAt ?? '') > cCreated || ((u.createdAt ?? '') === cCreated && u.userId > cId));
+  }
+  const page = rows2.slice(0, opts.limit + 1);
+  const sessions = page.slice(0, opts.limit);
+  const out: ImpersonationSessionPage = { sessions };
+  if (page.length > opts.limit && sessions.length > 0) {
+    const last = sessions[sessions.length - 1]!;
+    out.nextCursor = `${last.createdAt ?? ''}|${last.userId}`;
+  }
+  return out;
+}
+
+/** Strict cursor shape for session listing (QA hardening 2026-09-18):
+ *  `<createdAt canonical ISO-Z>|<userId>` - exactly one separator, canonical
+ *  timestamp (finite parse + exact round-trip), non-empty safe-charset id,
+ *  bounded length. */
+export function isValidSessionCursor(cursor: unknown): cursor is string {
+  if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > 256) return false;
+  const parts = cursor.split('|');
+  if (parts.length !== 2) return false;
+  if (!isCanonicalIsoZ(parts[0])) return false;
+  return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(parts[1]!);
+}
+
+/** Lifecycle states a sandbox impersonation session can END in. */
+export type ImpersonationEndState = 'stopped' | 'expired' | 'revoked';
+export interface ImpersonationSessionPage {
+  sessions: UserRecord[];
+  nextCursor?: string;
 }
 
 export interface ChannelRecord {
@@ -37,10 +147,33 @@ export interface GraphRepository {
   // users & channels
   createUser(u: UserRecord): Promise<UserRecord>;
   getUser(userId: ID): Promise<UserRecord | undefined>;
+  /** QA hardening v2 (2026-09-18): the record PLUS its authoritative storage
+   *  org column, so canonical checks can prove both representations. The
+   *  memory adapter's only representation is the record itself. */
+  getUserWithStorageOrg(userId: ID): Promise<{ record: UserRecord; storageOrgId: ID } | undefined>;
   findUserByEmail(email: string): Promise<UserRecord | undefined>;
   findUserByPhone(phone: string): Promise<UserRecord | undefined>;
   updateUser(userId: ID, patch: Partial<UserRecord>): Promise<UserRecord | undefined>;
   listUsers(orgId: ID): Promise<UserRecord[]>;
+  /** QA lifecycle gate (2026-09-17): ATOMIC impersonation-session transition
+   *  active -> stopped|expired|revoked plus its immutable audit row, in one
+   *  adapter-level atomic unit (PG: row lock in a transaction; memory:
+   *  single-threaded check+set+append). Returns 'not-found' when the id is
+   *  missing or not a sandbox identity, 'not-active' when the session is not
+   *  in the expected state (fail loud - the caller maps this to 404/409),
+   *  'transitioned' on success. No deletion, ever. */
+  transitionImpersonationSession(
+    userId: ID, expected: 'active', next: ImpersonationEndState,
+    at: string, auditEntry: AuditLogEntry, endBy: string,
+  ): Promise<'transitioned' | 'not-active' | 'not-found'>;
+  /** Tenant-safe paginated listing of sandbox impersonation sessions: only
+   *  sandbox identities (impersonationOf set), keyset-paginated by
+   *  (createdAt, userId), optionally filtered by lifecycle state. */
+  listImpersonationSessions(opts: {
+    state?: 'active' | 'stopped' | 'expired' | 'revoked';
+    limit: number;
+    cursor?: string;
+  }): Promise<ImpersonationSessionPage>;
   createChannel(c: ChannelRecord): Promise<ChannelRecord>;
   getChannel(id: ID): Promise<ChannelRecord | undefined>;
   findChannelByAddress(address: string): Promise<ChannelRecord | undefined>;

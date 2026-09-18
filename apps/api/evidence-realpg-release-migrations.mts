@@ -63,7 +63,7 @@ if (phase === 'phase1') {
   // 1) Full explicit run on real Postgres; boot gate green.
   const db = mk('contake_evidence');
   const r1 = await runMigrations(db, { deployment: 'staging', appliedBy: 'evidence' });
-  check('full-run applied 0001', r1.appliedNow.join(',') === '0001', r1.appliedNow);
+  check('full-run applied 0001-0003', r1.appliedNow.join(',') === '0001,0002,0003', r1.appliedNow);
   check('stored digest matches registry artifact', true, stepDigest(MIGRATIONS[0]!).slice(0, 16));
   await assertSchemaCurrent(db);
   check('boot gate passes after run', true);
@@ -134,23 +134,23 @@ if (phase === 'phase1') {
     await runMigrations(db2, {
       deployment: 'staging',
       migrations: [...MIGRATIONS, {
-        version: '0002', name: 'guarded', description: 'x',
+        version: '0004', name: 'guarded', description: 'x',
         xactLockKey: 4242, lockTables: ['users'],
         assertions: [{ kind: 'table-empty', table: 'users' }],
         template: 'ddl.create-index',
-        params: { ...SA_PARAMS, index: 'users_phone_unique' },
+        params: { ...SA_PARAMS, index: 'users_phone_unique_guarded' },
       }],
     });
   } catch (e) { guardRefused = /ASSERTION refusal/.test(String(e)); }
   check('guard hard-fails on REAL postgres', guardRefused);
-  const gi = await db2.query(`SELECT to_regclass('users_phone_unique') AS r`);
+  const gi = await db2.query(`SELECT to_regclass('users_phone_unique_guarded') AS r`);
   check('guarded artifact rolled back', gi.rows[0]?.['r'] === null);
 
   // 3d) Pre-mutation instance pin: wrong pin refuses with ZERO writes.
   let pinRefused = false;
   try { await runMigrations(db2, { deployment: 'staging', expectInstanceId: 'wrong-pin' }); } catch (e) { pinRefused = /INSTANCE BINDING refusal/.test(String(e)); }
   check('wrong instance pin refused (pre-mutation)', pinRefused);
-  const pv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations WHERE version <> '0001'`);
+  const pv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations WHERE version NOT IN ('0001', '0002', '0003')`);
   check('zero writes from a refused pin', Number(pv.rows[0]?.['n']) === 0);
 
   // 3e0) Fresh DB + supplied pin: refused BEFORE any write (TOFU needs an
@@ -216,7 +216,7 @@ if (phase === 'phase1') {
   await assertSchemaCurrent(db);
   check('boot gate passes after REAL restart', true);
   const v = await db.query(`SELECT version, name, sha256 FROM schema_migrations`);
-  check('migration history durable', v.rows.length === 1 && v.rows[0]?.['version'] === '0001', v.rows);
+  check('migration history durable', v.rows.length === 3 && v.rows.map(x => String(x['version'])).join(',') === '0001,0002,0003', v.rows.map(x => x['version']));
   const u = await db.query(`SELECT count(*)::int AS n FROM users`);
   check('seeded rows durable across restart', Number(u.rows[0]?.['n']) === 5, u.rows[0]?.['n']);
   const r = await runStagingSeed(db, { marker: '1', credentials: CREDS });
@@ -252,7 +252,7 @@ if (phase === 'phase1') {
   mig.on('error', () => { /* force-dropped idle client */ });
   // Migrator runs the FULL release job as a non-superuser least-priv role.
   const rr = await runMigrations(mig, { deployment: 'staging', appliedBy: 'role-evidence' });
-  check('least-priv migrator role applies 0001', rr.appliedNow.length === 1);
+  check('least-priv migrator role applies 0001-0003', rr.appliedNow.length === 3);
   // Privilege boundary (honest model): schema-level CREATE is one privilege,
   // so a role that can create tables in public can create functions THERE -
   // in-schema code objects are enforced by the catalog diff (proven below).
@@ -453,7 +453,7 @@ if (phase === 'phase1') {
   const mig = new Pool({ host, port, user: 'conf_migrator', database: 'contake_conf' });
   mig.on('error', () => { /* force-dropped idle client */ });
   const rr = await runMigrations(mig, { deployment: 'staging', appliedBy: 'conf-evidence' });
-  check('conf: migrator applies 0001', rr.appliedNow.length === 1);
+  check('conf: migrator applies 0001-0003', rr.appliedNow.length === 3);
 
   // (1) One tx per governed operation / non-transactional classes refused at the gate.
   // R3: non-transactional / code classes CANNOT EXIST BY CONSTRUCTION - no

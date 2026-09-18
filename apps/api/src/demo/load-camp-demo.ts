@@ -49,5 +49,5 @@ if (existing.some(e => e.id === CAMP_DEMO_EVENT_ID)) {
 }
 const snap = await repo.snapshot(CAMP_DEMO_EVENT_ID);
 console.log(`camp-demo: event '${snap?.event.name}' status=${snap?.event.status} date=${snap?.event.date}; late-bus task ${CAMP_DEMO_LATE_BUS_TASK_ID} = '${snap?.tasks.find(t => t.id === CAMP_DEMO_LATE_BUS_TASK_ID)?.name}'`);
-console.log('camp-demo: logins — admin dana@oranim-camp.local / camp-admin-1; OTP devCode returned only with CONTAKE_DEV_OTP=true (fail-closed hotfix)');
+console.log('camp-demo: logins — admin dana@oranim-camp.local / camp-admin-1; OTP devCode returned only when CONTAKE_DEV_OTP=true under explicit test mode (security 2026-09-18)');
 await close();

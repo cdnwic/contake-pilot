@@ -1,13 +1,6 @@
 import { defineConfig } from 'vitest/config';
 export default defineConfig({
-  test: {
-    environment: 'node', include: ['tests/**/*.test.ts', 'tests/**/*.spec.ts'], testTimeout: 30000,
-    // Fail-closed hotfix (2026-09-17): the API exposes OTP devCode ONLY for
-    // CONTAKE_DEV_OTP === 'true'. Tests that log in via OTP opt in EXPLICITLY
-    // here (harness-level, never in shipped code); production-shaped runs
-    // leave it unset and stay closed.
-    env: { CONTAKE_DEV_OTP: 'true' },
-  },
+  test: { environment: 'node', include: ['tests/**/*.test.ts', 'tests/**/*.spec.ts'], testTimeout: 30000, setupFiles: ['tests/setup.ts'] },
   resolve: {
     alias: {
       '@contake/core': new URL('../../packages/core/src/index.ts', import.meta.url).pathname,

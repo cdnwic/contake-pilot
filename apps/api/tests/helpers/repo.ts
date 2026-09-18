@@ -27,6 +27,7 @@ import { PGlite } from '@electric-sql/pglite';
 import type { GraphRepository } from '../../src/repo/graph-repository.js';
 import { MemoryGraphRepository } from '../../src/repo/memory.js';
 import { PostgresGraphRepository, pgliteConnectable, createPgOtpState, type Connectable } from '../../src/repo/postgres.js';
+import { runMigrations } from '../../src/migrations/runner.js';
 import { memoryOtpState, type OtpStateStore } from '../../src/auth.js';
 import { probe } from './g4-diag.js';
 import { applySeed, seedDemo } from '../../src/seed.js';
@@ -118,7 +119,37 @@ export function getFileInstanceInfo(): { instanceId: string; fileId: string; res
   return filePg && { instanceId: filePg.instanceId, fileId: filePg.fileId, resets: filePg.resets, maxRssMB: filePg.maxRssMB };
 }
 
+/** QA stop-ship (2026-09-17): REPO_IMPL=realpg runs against REAL PostgreSQL
+ *  via DATABASE_URL (node-pg Pool). Per-test isolation mirrors the PGlite
+ *  lane: DROP/CREATE SCHEMA public, then the production bootstrap re-runs.
+ *  PGlite is single-connection; this lane is the multi-connection proof. */
+
+/** QA harness: the users_phone_unique index reaches test databases ONLY via
+ *  the reviewed forward-migration path (shared release-migration runner,
+ *  steps 0001-0003) - never via bootstrap, never via caller SQL. */
+async function createUsersPhoneIndex(conn: Connectable): Promise<void> {
+  await runMigrations(conn, { deployment: 'test-harness' });
+}
+
+async function makeRealPgRepo(): Promise<GraphRepository> {
+  const { Pool } = await import('pg');
+  const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
+  await pool.query('DROP SCHEMA public CASCADE');
+  await pool.query('CREATE SCHEMA public');
+  const conn = pool as unknown as Connectable;
+  const repo = await PostgresGraphRepository.create(conn);
+  await applySeed(repo, seedDemo());
+  // QA 2026-09-18 (tool updated 2026-09-19): bootstrap no longer creates
+  // users_phone_unique (preservation-first migration); test lanes apply the
+  // reviewed forward migrations (0001 adopt + 0002 normalize + 0003 index)
+  // through the shared release-migration runner, exactly as an operator
+  // would after a clean preflight.
+  await createUsersPhoneIndex(conn);
+  return repo;
+}
+
 export async function makeTestRepo(): Promise<GraphRepository> {
+  if (REPO_IMPL === 'realpg') return makeRealPgRepo();
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
     await resetInstance(fp);
@@ -126,6 +157,12 @@ export async function makeTestRepo(): Promise<GraphRepository> {
     fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, seedDemo());
+  // QA 2026-09-18 (tool updated 2026-09-19): bootstrap no longer creates
+  // users_phone_unique (preservation-first migration); test lanes apply the
+  // reviewed forward migrations (0001 adopt + 0002 normalize + 0003 index)
+  // through the shared release-migration runner, exactly as an operator
+  // would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     return repo;
   }
   return MemoryGraphRepository.seeded(seedDemo());
@@ -133,6 +170,22 @@ export async function makeTestRepo(): Promise<GraphRepository> {
 
 /** Same factory with an explicit seed (profile-parity builds custom graphs). */
 export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository> {
+  if (REPO_IMPL === 'realpg') {
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
+    await pool.query('DROP SCHEMA public CASCADE');
+    await pool.query('CREATE SCHEMA public');
+    const conn = pool as unknown as Connectable;
+    const repo = await PostgresGraphRepository.create(conn);
+    await applySeed(repo, data);
+  // QA 2026-09-18 (tool updated 2026-09-19): bootstrap no longer creates
+  // users_phone_unique (preservation-first migration); test lanes apply the
+  // reviewed forward migrations (0001 adopt + 0002 normalize + 0003 index)
+  // through the shared release-migration runner, exactly as an operator
+  // would after a clean preflight.
+  await createUsersPhoneIndex(conn);
+    return repo;
+  }
   if (REPO_IMPL === 'postgres') {
     const fp = await fileInstance();
     await resetInstance(fp);
@@ -140,6 +193,12 @@ export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository>
     fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, data);
+  // QA 2026-09-18 (tool updated 2026-09-19): bootstrap no longer creates
+  // users_phone_unique (preservation-first migration); test lanes apply the
+  // reviewed forward migrations (0001 adopt + 0002 normalize + 0003 index)
+  // through the shared release-migration runner, exactly as an operator
+  // would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     return repo;
   }
   return MemoryGraphRepository.seeded(data);
@@ -155,6 +214,12 @@ export async function makeTestBackend(): Promise<{ repo: GraphRepository; otpSto
     fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, seedDemo());
+  // QA 2026-09-18 (tool updated 2026-09-19): bootstrap no longer creates
+  // users_phone_unique (preservation-first migration); test lanes apply the
+  // reviewed forward migrations (0001 adopt + 0002 normalize + 0003 index)
+  // through the shared release-migration runner, exactly as an operator
+  // would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     const otpStore = await createPgOtpState(conn);
     return { repo, otpStore };
   }
@@ -211,6 +276,12 @@ export async function makeTestBackendFrom(data: SeedData): Promise<TestBackend> 
     fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, data);
+  // QA 2026-09-18 (tool updated 2026-09-19): bootstrap no longer creates
+  // users_phone_unique (preservation-first migration); test lanes apply the
+  // reviewed forward migrations (0001 adopt + 0002 normalize + 0003 index)
+  // through the shared release-migration runner, exactly as an operator
+  // would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     const otpStore = await createPgOtpState(conn);
     return { repo, otpStore, setAuditHook: h => { hook = h; } };
   }

@@ -110,10 +110,13 @@ describe('resolveAuthSecret (fail-closed)', () => {
   it('devOtpEnabled is closed in a production boot even for exact true', () => {
     expect(devOtpEnabled({ CONTAKE_DEV_OTP: 'true', NODE_ENV: 'production' })).toBe(false);
   });
-  it('memory/dev falls back to the explicit NON-DEPLOYABLE local constant (never env-adjacent)', () => {
-    expect(resolveAuthSecret({})).toBe(LOCAL_DEV_AUTH_SECRET);
+  it('memory/dev falls back to the explicit NON-DEPLOYABLE local constant ONLY under explicit test mode (SA hardening)', () => {
+    expect(resolveAuthSecret({ CONTAKE_TEST_MODE: 'true' })).toBe(LOCAL_DEV_AUTH_SECRET);
+    expect(resolveAuthSecret({ NODE_ENV: 'test' })).toBe(LOCAL_DEV_AUTH_SECRET);
     expect(LOCAL_DEV_AUTH_SECRET).toContain('NOT-DEPLOYABLE');
-    expect(new AuthService({} as never).issueToken).toBeDefined(); // default ctor stays local-dev
+    // Outside explicit test mode a secret-less boot fails CLOSED (no silent default):
+    expect(() => resolveAuthSecret({})).toThrow(/fail CLOSED/);
+    expect(new AuthService({} as never).issueToken).toBeDefined(); // default ctor resolves under vitest NODE_ENV=test
   });
 });
 
@@ -136,11 +139,14 @@ describe('documented secret generators (doc/parser alignment, QA 2026-09-18)', (
   });
 });
 
-describe('devOtpEnabled (exact opt-in)', () => {
-  it('only the literal string true opens devCode', () => {
-    expect(devOtpEnabled({ CONTAKE_DEV_OTP: 'true' })).toBe(true);
+describe('devOtpEnabled (exact opt-in, explicit test mode only)', () => {
+  it("only the literal string true opens devCode, and ONLY under explicit test mode (SA hardening)", () => {
+    expect(devOtpEnabled({ CONTAKE_DEV_OTP: 'true', CONTAKE_TEST_MODE: 'true' })).toBe(true);
+    expect(devOtpEnabled({ CONTAKE_DEV_OTP: 'true', NODE_ENV: 'test' })).toBe(true);
+    // Opt-in WITHOUT explicit test mode stays closed:
+    expect(devOtpEnabled({ CONTAKE_DEV_OTP: 'true' })).toBe(false);
     for (const v of [undefined, '', 'false', '1', 'yes', 'TRUE', 'True', ' true']) {
-      expect(devOtpEnabled({ CONTAKE_DEV_OTP: v })).toBe(false);
+      expect(devOtpEnabled({ CONTAKE_DEV_OTP: v, CONTAKE_TEST_MODE: 'true' })).toBe(false);
     }
   });
 });
