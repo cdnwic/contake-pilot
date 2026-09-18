@@ -67,7 +67,7 @@ describe('auth secret resolution (fail closed)', () => {
   it('falls back to the dev secret ONLY under explicit test mode', () => {
     clearModes();
     delete process.env['CONTAKE_AUTH_SECRET'];
-    expect(() => resolveAuthSecret(undefined)).toThrow(/fail CLOSED/i);
+    expect(() => resolveAuthSecret(undefined)).toThrow(/fail.?closed/i);
     process.env['NODE_ENV'] = 'test';
     expect(resolveAuthSecret(undefined)).toBe(DEV_ONLY_AUTH_SECRET);
   });

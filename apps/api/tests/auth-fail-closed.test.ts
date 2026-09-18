@@ -113,6 +113,13 @@ describe('resolveAuthSecret (fail-closed)', () => {
   it('memory/dev falls back to the explicit NON-DEPLOYABLE local constant ONLY under explicit test mode (SA hardening)', () => {
     expect(resolveAuthSecret({ CONTAKE_TEST_MODE: 'true' })).toBe(LOCAL_DEV_AUTH_SECRET);
     expect(resolveAuthSecret({ NODE_ENV: 'test' })).toBe(LOCAL_DEV_AUTH_SECRET);
+    // Lineage semantics (d224418, pinned 2026-09-19): explicit test mode is
+    // authoritative - a harness DATABASE_URL (throwaway PG) must NOT defeat
+    // the fallback; the deployed entry is blocked by assertDeployedBoot.
+    expect(resolveAuthSecret({ CONTAKE_TEST_MODE: 'true', DATABASE_URL: 'postgres://x' })).toBe(LOCAL_DEV_AUTH_SECRET);
+    expect(resolveAuthSecret({ NODE_ENV: 'test', DATABASE_URL: 'postgres://x' })).toBe(LOCAL_DEV_AUTH_SECRET);
+    // ...while DATABASE_URL WITHOUT explicit test mode stays fail-closed:
+    expect(() => resolveAuthSecret({ DATABASE_URL: 'postgres://x' })).toThrow(/production-shaped/);
     expect(LOCAL_DEV_AUTH_SECRET).toContain('NOT-DEPLOYABLE');
     // Outside explicit test mode a secret-less boot fails CLOSED (no silent default):
     expect(() => resolveAuthSecret({})).toThrow(/fail CLOSED/);

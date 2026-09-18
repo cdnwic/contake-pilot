@@ -96,15 +96,19 @@ export function resolveAuthSecret(env: NodeJS.ProcessEnv = process.env): string 
     }
     return s;
   }
-  if (env['DATABASE_URL'] || isProductionBoot(env)) {
-    throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is missing or empty in a production-shaped boot (DATABASE_URL and/or NODE_ENV=production) - refusing to boot (fail-closed)');
-  }
-  // SA hardening (2026-09-18, carried onto main): the dev fallback exists
-  // ONLY under explicit test mode. Any other boot shape without a managed
-  // secret fails CLOSED - no silent local default.
+  // SA hardening (2026-09-18, carried onto main; ordering fixed 2026-09-19):
+  // explicit test mode is AUTHORITATIVE - the dev fallback applies even when
+  // a test harness points DATABASE_URL at a throwaway postgres (d224418
+  // resolver semantics). A deployed entry can never reach this branch:
+  // assertDeployedBoot refuses explicit test mode before any listener.
   if (isExplicitTestMode(env)) {
     return LOCAL_DEV_AUTH_SECRET;
   }
+  if (env['DATABASE_URL'] || isProductionBoot(env)) {
+    throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is missing or empty in a production-shaped boot (DATABASE_URL and/or NODE_ENV=production) - refusing to boot (fail-closed)');
+  }
+  // Any other boot shape without a managed secret fails CLOSED - no silent
+  // local default.
   throw new AuthSecretConfigError('CONTAKE_AUTH_SECRET is not set - refusing to start authentication without an explicitly managed secret (fail CLOSED; the dev fallback exists only under explicit test mode)');
 }
 
