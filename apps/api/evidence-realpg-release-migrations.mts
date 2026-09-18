@@ -16,8 +16,9 @@
  *  privilege lockdown.
  *
  *  Usage: tsx evidence-realpg-release-migrations.mts <phase1|phase2|phase3|phase4|phase5> <socketDirOrHost> <port>
- *  phase5 (SA1 attended-TOFU): requires OPERATOR_ACK=ack:<preflight listDigest>;
- *  run once WITHOUT it to obtain the digest (gate refuses, digest printed).
+ *  phase5 (SA2 attended-TOFU): drives the REAL migration CLI
+ *  (scripts/migrate.mts -> runMigrations) as a child process; the runner
+ *  enforces the operator ack under lock, in-transaction.
  */
 import { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
@@ -31,8 +32,14 @@ const R = await import(RUNNER_PATH) as typeof import('./src/migrations/runner.js
 const S = await import(SEED_PATH) as typeof import('./src/migrations/staging-seed.js');
 const {
   MIGRATIONS, REGISTRY_DIGEST, assertDirectDatabaseUrl, assertSchemaCurrent, assertSingleStatementForms, assertZeroCatalogDelta, catalogSnapshot,
-  restoreSequenceValues, runMigrations, sequenceValues, stepDigest,
+  computeUsersPhonePreflight, operatorAckFor, restoreSequenceValues, runMigrations, sequenceValues, stepDigest,
 } = R;
+/** SA2: evidence lanes mint the attended-TOFU ack from the runner's canonical
+ *  preflight against the CURRENT state (the runner recomputes in-transaction). */
+const ackedRun = async (db: Parameters<typeof runMigrations>[0], opts: Parameters<typeof runMigrations>[1]) => {
+  const pf = await computeUsersPhonePreflight(db, { deployment: opts.deployment });
+  return runMigrations(db, { operatorAck: operatorAckFor(pf), ...opts });
+};
 const { DATA_REGISTRY_DIGEST, runStagingSeed } = S;
 const runnerModule = R as unknown as Record<string, unknown>;
 console.error(`OBSERVED[module under evidence]: runner=${RUNNER_PATH} seed=${SEED_PATH}`);
@@ -64,7 +71,7 @@ if (phase === 'phase1') {
   await admin.query(`CREATE DATABASE contake_seed`);
   // 1) Full explicit run on real Postgres; boot gate green.
   const db = mk('contake_evidence');
-  const r1 = await runMigrations(db, { deployment: 'staging', appliedBy: 'evidence' });
+  const r1 = await ackedRun(db, { deployment: 'staging', appliedBy: 'evidence' });
   check('full-run applied 0001-0003', r1.appliedNow.join(',') === '0001,0002,0003', r1.appliedNow);
   check('stored digest matches registry artifact', true, stepDigest(MIGRATIONS[0]!).slice(0, 16));
   await assertSchemaCurrent(db);
@@ -77,8 +84,8 @@ if (phase === 'phase1') {
   const b = mk('contake_evidence');
   await a.query(`DELETE FROM schema_migrations`); // reset to pending on the same schema
   const [ra, rb] = await Promise.allSettled([
-    runMigrations(a, { deployment: 'staging', appliedBy: 'racer-a' }),
-    runMigrations(b, { deployment: 'staging', appliedBy: 'racer-b' }),
+    ackedRun(a, { deployment: 'staging', appliedBy: 'racer-a' }),
+    ackedRun(b, { deployment: 'staging', appliedBy: 'racer-b' }),
   ]);
   check('both racers settled without error', ra.status === 'fulfilled' && rb.status === 'fulfilled', [ra.status, rb.status]);
   const appliedNow = [ra, rb].map(r => (r.status === 'fulfilled' ? r.value.appliedNow : []));
@@ -104,7 +111,7 @@ if (phase === 'phase1') {
     params: { index: 'partial_leak_idx', table: 'no_such_table', unique: 'plain', expression: 'EXPR_NONE', predicate: 'PRED_NONE', ifNotExists: 'strict' },
   };
   let threw = false;
-  try { await runMigrations(db2, { deployment: 'staging', migrations: [failing] }); } catch { threw = true; }
+  try { await ackedRun(db2, { deployment: 'staging', migrations: [failing] }); } catch { threw = true; }
   check('failing template execution threw', threw);
   const leak = await db2.query(`SELECT to_regclass('partial_leak_idx') AS r`);
   check('step effect rolled back on REAL postgres', leak.rows[0]?.['r'] === null, leak.rows[0]);
@@ -121,7 +128,7 @@ if (phase === 'phase1') {
     ['free-text expression in params', saStep({ expression: 'pg_catalog.pg_advisory_unlock(841000001)' }, { version: '0001', name: 'bad' })],
   ] as [string, MigrationStep][]) {
     let refused = false;
-    try { await runMigrations(db2, { deployment: 'staging', migrations: [bad] }); }
+    try { await ackedRun(db2, { deployment: 'staging', migrations: [bad] }); }
     catch (e) { refused = /TEMPLATE refusal/.test(String(e)); }
     check(`${label} rejected at registration`, refused);
   }
@@ -129,7 +136,7 @@ if (phase === 'phase1') {
   check('no statement executed from a rejected step', el.rows[0]?.['r'] === null);
 
   // 3c) Guard primitive hard-fail rolls back on REAL postgres.
-  await runMigrations(db2, { deployment: 'staging' });
+  await ackedRun(db2, { deployment: 'staging' });
   await db2.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u1', 'o1', '+972555111111', '{}')`);
   let guardRefused = false;
   try {
@@ -150,7 +157,7 @@ if (phase === 'phase1') {
 
   // 3d) Pre-mutation instance pin: wrong pin refuses with ZERO writes.
   let pinRefused = false;
-  try { await runMigrations(db2, { deployment: 'staging', expectInstanceId: 'wrong-pin' }); } catch (e) { pinRefused = /INSTANCE BINDING refusal/.test(String(e)); }
+  try { await ackedRun(db2, { deployment: 'staging', expectInstanceId: 'wrong-pin' }); } catch (e) { pinRefused = /INSTANCE BINDING refusal/.test(String(e)); }
   check('wrong instance pin refused (pre-mutation)', pinRefused);
   const pv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations WHERE version NOT IN ('0001', '0002', '0003')`);
   check('zero writes from a refused pin', Number(pv.rows[0]?.['n']) === 0);
@@ -161,7 +168,7 @@ if (phase === 'phase1') {
   await admin.query(`CREATE DATABASE contake_fresh`);
   const fr = mk('contake_fresh');
   let freshPinRefused = false;
-  try { await runMigrations(fr, { deployment: 'staging', expectInstanceId: '0123456789abcdef' }); } catch (e) { freshPinRefused = /INSTANCE BINDING refusal/.test(String(e)); }
+  try { await ackedRun(fr, { deployment: 'staging', expectInstanceId: '0123456789abcdef' }); } catch (e) { freshPinRefused = /INSTANCE BINDING refusal/.test(String(e)); }
   check('fresh DB + supplied pin refused pre-write (TOFU gate)', freshPinRefused);
   const frw = await fr.query(`SELECT to_regclass('schema_migrations') AS r`);
   check('zero writes on fresh-DB pin refusal', frw.rows[0]?.['r'] === null);
@@ -178,7 +185,7 @@ if (phase === 'phase1') {
 
   // 4) Staging seed on real Postgres: transaction, exact rerun, drift, rollback.
   const sd = mk('contake_seed');
-  await runMigrations(sd, { deployment: 'staging', appliedBy: 'evidence' });
+  await ackedRun(sd, { deployment: 'staging', appliedBy: 'evidence' });
   const s1 = await runStagingSeed(sd, { marker: '1', credentials: CREDS, forbiddenIdentifiers: ['+972587700852'] });
   check('seed applied on real postgres', s1.applied && !s1.alreadyApplied, s1.inventory.counts);
   const s2 = await runStagingSeed(sd, { marker: '1', credentials: CREDS });
@@ -190,7 +197,7 @@ if (phase === 'phase1') {
   await sd.end(); await admin.query(`DROP DATABASE contake_seed WITH (FORCE)`);
   await admin.query(`CREATE DATABASE contake_seed`);
   const sd2 = mk('contake_seed');
-  await runMigrations(sd2, { deployment: 'staging', appliedBy: 'evidence' });
+  await ackedRun(sd2, { deployment: 'staging', appliedBy: 'evidence' });
   let rollback = false;
   try { await runStagingSeed(sd2, { marker: '1', credentials: CREDS, forbiddenIdentifiers: ['יום סינתטי'] }); } catch (e) { rollback = /POST-WRITE absence proof FAILED/.test(String(e)); }
   check('forced post-write failure threw', rollback);
@@ -208,7 +215,7 @@ if (phase === 'phase1') {
   await sd2.end(); await admin.query(`DROP DATABASE contake_seed WITH (FORCE)`);
   await admin.query(`CREATE DATABASE contake_seed`);
   const sd3 = mk('contake_seed');
-  await runMigrations(sd3, { deployment: 'staging', appliedBy: 'evidence' });
+  await ackedRun(sd3, { deployment: 'staging', appliedBy: 'evidence' });
   await runStagingSeed(sd3, { marker: '1', credentials: CREDS });
   await sd3.end();
   out['readyForRestart'] = true;
@@ -253,7 +260,7 @@ if (phase === 'phase1') {
   const mig = new Pool({ host, port, user: 'contake_migrator', database: 'contake_role' });
   mig.on('error', () => { /* force-dropped idle client */ });
   // Migrator runs the FULL release job as a non-superuser least-priv role.
-  const rr = await runMigrations(mig, { deployment: 'staging', appliedBy: 'role-evidence' });
+  const rr = await ackedRun(mig, { deployment: 'staging', appliedBy: 'role-evidence' });
   check('least-priv migrator role applies 0001-0003', rr.appliedNow.length === 3);
   // Privilege boundary (honest model): schema-level CREATE is one privilege,
   // so a role that can create tables in public can create functions THERE -
@@ -315,7 +322,7 @@ if (phase === 'phase1') {
   ];
   for (const [label, bad, re] of registryAttacks) {
     let refused = false; let observed = '';
-    try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, bad] }); } catch (e) { refused = true; observed = String(e); }
+    try { await ackedRun(mig, { deployment: 'staging', migrations: [...MIGRATIONS, bad] }); } catch (e) { refused = true; observed = String(e); }
     console.error(`OBSERVED[registry attack ${label}]: ${observed.slice(0, 200)}`);
     check(`attacker regression refused at registration: ${label}`, refused && re.test(observed), observed.slice(0, 160));
   }
@@ -351,7 +358,7 @@ if (phase === 'phase1') {
   check('R4 anchor B: DB-anchored digest pinned at first governed run (OBSERVED)', ab.rows[0]?.['d'] === REGISTRY_DIGEST, ab.rows[0]?.['d']);
   await mig.query(`UPDATE public.contake_db_identity SET registry_digest = 'tampered' WHERE id = 1`);
   let abRun = '';
-  try { await runMigrations(mig, { deployment: 'staging' }); } catch (e) { abRun = String(e); }
+  try { await ackedRun(mig, { deployment: 'staging' }); } catch (e) { abRun = String(e); }
   console.error(`OBSERVED[anchor B tamper - run]: ${abRun.slice(0, 200)}`);
   check('R4 anchor B: run refuses anchored drift on REAL PG (OBSERVED)', /ANCHOR refusal/.test(abRun), abRun.slice(0, 160));
   let abBoot = '';
@@ -363,21 +370,21 @@ if (phase === 'phase1') {
   check('R4 anchor B: restore heals the boot gate', true);
   // R5 section 2: a WRONG registry-digest operator pin refuses BEFORE any write.
   let pinRefusal = '';
-  try { await runMigrations(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: 'deadbeef'.repeat(8) }); } catch (e) { pinRefusal = String(e); }
+  try { await ackedRun(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: 'deadbeef'.repeat(8) }); } catch (e) { pinRefusal = String(e); }
   console.error(`OBSERVED[wrong registry pin]: ${pinRefusal.slice(0, 200)}`);
   check('R5: wrong expect-registry-digest pin refuses pre-write (OBSERVED)', /REGISTRY PIN refusal/.test(pinRefusal), pinRefusal.slice(0, 160));
   check('R5: correct dual pin passes the preconditions', true,
-    await (async () => { const p = await runMigrations(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: REGISTRY_DIGEST }); return p.identity.instanceId; })());
+    await (async () => { const p = await ackedRun(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: REGISTRY_DIGEST }); return p.identity.instanceId; })());
   // R5 section 3 on REAL PG: legacy NULL adoption writes NOTHING without BOTH
   // pins; only the dual-pinned run adopts.
   await mig.query(`UPDATE public.contake_db_identity SET registry_digest = NULL WHERE id = 1`);
   let unpinned = '';
-  try { await runMigrations(mig, { deployment: 'staging' }); } catch (e) { unpinned = String(e); }
+  try { await ackedRun(mig, { deployment: 'staging' }); } catch (e) { unpinned = String(e); }
   console.error(`OBSERVED[unpinned NULL adoption refusal]: ${unpinned.slice(0, 220)}`);
   check('R5: unpinned NULL-anchor adoption refuses and writes NOTHING (OBSERVED)', /LEGACY ADOPTION refusal/.test(unpinned), unpinned.slice(0, 180));
   const stillNull = await mig.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
   check('R5: anchor still NULL after the refused adoption (nothing written)', stillNull.rows[0]?.['d'] === null, stillNull.rows[0]);
-  await runMigrations(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: REGISTRY_DIGEST });
+  await ackedRun(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: REGISTRY_DIGEST });
   const adopted = await mig.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
   check('R5: dual-pinned run adopts the NULL anchor', adopted.rows[0]?.['d'] === REGISTRY_DIGEST, adopted.rows[0]?.['d']);
   // R5 section 5 (carried): default-ACL boot tamper on REAL PG - granting the
@@ -454,7 +461,7 @@ if (phase === 'phase1') {
   await adminC.query(`GRANT CREATE, USAGE ON SCHEMA public TO conf_migrator`);
   const mig = new Pool({ host, port, user: 'conf_migrator', database: 'contake_conf' });
   mig.on('error', () => { /* force-dropped idle client */ });
-  const rr = await runMigrations(mig, { deployment: 'staging', appliedBy: 'conf-evidence' });
+  const rr = await ackedRun(mig, { deployment: 'staging', appliedBy: 'conf-evidence' });
   check('conf: migrator applies 0001-0003', rr.appliedNow.length === 3);
 
   // (1) One tx per governed operation / non-transactional classes refused at the gate.
@@ -476,11 +483,11 @@ if (phase === 'phase1') {
     Number(codeObjs.rows[0]?.['f']) === 0 && Number(codeObjs.rows[0]?.['t']) === 0 && Number(codeObjs.rows[0]?.['p']) === 0, codeObjs.rows[0]);
   for (const label of ['create-index-concurrently', 'vacuum', 'alter-system', 'create-database', 'call', 'do', 'security-definer-function']) {
     let refused = false; let ntxObs = '';
-    try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, { version: '0004', name: 'x', description: 'x', template: `ddl.${label}`, params: {} }] }); } catch (e) { refused = true; ntxObs = String(e); }
+    try { await ackedRun(mig, { deployment: 'staging', migrations: [...MIGRATIONS, { version: '0004', name: 'x', description: 'x', template: `ddl.${label}`, params: {} }] }); } catch (e) { refused = true; ntxObs = String(e); }
     check(`conf: no template exists for non-tx class: ${label}`, refused && /unknown template name/.test(ntxObs), ntxObs.slice(0, 120));
   }
   let concRefused = false; let concObs = '';
-  try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, saStep({ unique: 'concurrently' }, { version: '0004' })] }); } catch (e) { concRefused = true; concObs = String(e); }
+  try { await ackedRun(mig, { deployment: 'staging', migrations: [...MIGRATIONS, saStep({ unique: 'concurrently' }, { version: '0004' })] }); } catch (e) { concRefused = true; concObs = String(e); }
   check('conf: enum escape toward CONCURRENTLY refused by the closed enum', concRefused && /TEMPLATE refusal - enum/.test(concObs), concObs.slice(0, 120));
 
   // (2)+(3)+(5) NAMED ATTACK: SECURITY DEFINER trigger function planted under
@@ -522,7 +529,7 @@ if (phase === 'phase1') {
   try { await adminC.query(`CREATE EXTENSION dblink`); } catch { dblinkInstalled = false; }
   if (dblinkInstalled) {
     let gateObserved = '';
-    try { await runMigrations(mig, { deployment: 'staging', appliedBy: 'conf-evidence' }); } catch (e) { gateObserved = String(e); }
+    try { await ackedRun(mig, { deployment: 'staging', appliedBy: 'conf-evidence' }); } catch (e) { gateObserved = String(e); }
     console.error(`OBSERVED[dblink baseline refusal]: ${gateObserved.slice(0, 220)}`);
     check('conf: bootstrap gate refuses a database whose extension set drifted from the pinned baseline (dblink)', /EXTENSION BASELINE refusal/.test(gateObserved), gateObserved.slice(0, 200));
     await adminC.query(`DROP EXTENSION dblink`);
@@ -611,10 +618,22 @@ if (phase === 'phase1') {
   await admin.query(`DROP DATABASE contake_conf WITH (FORCE)`);
   await admin.query(`DROP ROLE conf_runtime`); await admin.query(`DROP ROLE conf_migrator`);
 } else if (phase === 'phase5') {
-  // SA1 ruling (2026-09-19): attended-TOFU operator gate. The read-only
-  // preflight runs FIRST; its inconsistency list is recorded; the migration
-  // executes ONLY after explicit operator acknowledgment of the list digest.
-  const { execFileSync } = await import('node:child_process');
+  // SA2 ruling (2026-09-19): the attended-TOFU operator gate is enforced by
+  // the REAL product path - the migration CLI (scripts/migrate.mts) ->
+  // runMigrations itself, recomputed under the step locks in the step
+  // transaction (no TOCTOU). No harness gate, no env ack. The evidence drives
+  // the real CLI as a child process against disposable databases.
+  const { spawnSync } = await import('node:child_process');
+  const cli = (args: string[]) => {
+    const r = spawnSync('npx', ['tsx', 'scripts/migrate.mts', ...args], { encoding: 'utf8', timeout: 300000 });
+    return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  };
+  const preflight = (url: string) => {
+    const r = spawnSync('npx', ['tsx', 'scripts/users-phone-preflight.mts', '--database-url', url, '--deployment', 'staging'], { encoding: 'utf8', timeout: 300000 });
+    if (r.status !== 0) throw new Error(`preflight failed: ${r.stderr}`);
+    return JSON.parse(r.stdout) as { listDigest: string; requiredAck: string; target: string; crossRepresentationInconsistencies: unknown[]; blankPhoneUsers: unknown[]; collisionGroups: unknown[]; operatorDecisionRequired: boolean };
+  };
+
   await admin.query(`DROP DATABASE IF EXISTS contake_tofu WITH (FORCE)`);
   await admin.query(`CREATE DATABASE contake_tofu`);
   const tofu = mk('contake_tofu');
@@ -629,42 +648,56 @@ if (phase === 'phase1') {
   const url = `postgres://postgres@${host}:${port}/contake_tofu`;
   const before = await tofu.query(`SELECT count(*)::int AS n FROM users`);
 
-  // 1) preflight FIRST, read-only (session forced default_transaction_read_only).
-  const preflightJson = execFileSync('npx', ['tsx', 'scripts/users-phone-preflight.mts', '--database-url', url], { encoding: 'utf8' });
-  const preflight = JSON.parse(preflightJson) as { listDigest: string; crossRepresentationInconsistencies: unknown[]; blankPhoneUsers: unknown[]; collisionGroups: unknown[]; operatorDecisionRequired: boolean };
-  out['preflight'] = preflight;
-  console.error(`OBSERVED[preflight listDigest]: ${preflight.listDigest}`);
-  console.error(`OBSERVED[preflight inconsistencies]: ${JSON.stringify(preflight.crossRepresentationInconsistencies)}`);
-  check('preflight ran FIRST and recorded the inconsistency list', preflight.crossRepresentationInconsistencies.length === 1
-    && JSON.stringify(preflight.crossRepresentationInconsistencies).includes('u-inconsistent'), preflight.crossRepresentationInconsistencies);
-  check('preflight recorded both blank phones', preflight.blankPhoneUsers.length === 2, preflight.blankPhoneUsers);
-  check('preflight flagged operator decision', preflight.operatorDecisionRequired === true);
+  // 1) canonical preflight FIRST, read-only (runner-owned implementation).
+  const pf = preflight(url);
+  out['preflight'] = pf;
+  console.error(`OBSERVED[preflight listDigest]: ${pf.listDigest}`);
+  check('preflight ran FIRST and recorded the inconsistency list', pf.crossRepresentationInconsistencies.length === 1
+    && JSON.stringify(pf.crossRepresentationInconsistencies).includes('u-inconsistent'), pf.crossRepresentationInconsistencies);
+  check('preflight recorded both blank phones', pf.blankPhoneUsers.length === 2, pf.blankPhoneUsers);
+  check('preflight flagged operator decision', pf.operatorDecisionRequired === true);
   const after = await tofu.query(`SELECT count(*)::int AS n FROM users`);
   check('preflight was read-only (row data untouched)', Number(before.rows[0]?.['n']) === Number(after.rows[0]?.['n']));
 
-  // 2) the gate: NO execution without an exact acknowledgment of THIS list.
-  const requiredAck = `ack:${preflight.listDigest}`;
-  console.error(`OBSERVED[required ack]: ${requiredAck}`);
-  const supplied = process.env['OPERATOR_ACK'] ?? '';
-  if (supplied !== requiredAck) {
-    // The refusal IS the evidence for a no-ack run: the migration does not
-    // execute; the exact required acknowledgment is printed for the operator.
-    console.error(`CHECK PASS attended-TOFU gate refuses without the exact operator acknowledgment (supplied=${supplied === '' ? '(none)' : 'mismatch'})`);
-    console.error(`GATE: to execute, the operator reviews the list above and re-runs with OPERATOR_ACK=${requiredAck}`);
-    (out.checks as unknown[]).push({ name: 'attended-TOFU gate refuses without the exact operator acknowledgment', ok: true, detail: `REFUSED as designed; required ${requiredAck}` });
-    out['gateOutcome'] = 'REFUSED-no-ack';
-    console.log(JSON.stringify(out, null, 2));
-    await tofu.end();
-    await admin.query(`DROP DATABASE contake_tofu WITH (FORCE)`);
-    await admin.end();
-    process.exit(0);
-  }
-  out['operatorAcknowledgment'] = { ack: supplied, listDigest: preflight.listDigest, ordering: 'preflight-before-migration' };
-  check('explicit operator acknowledgment recorded before execution', supplied === requiredAck);
+  // 2) ATTACK SET through the REAL CLI (all must fail closed, nothing applied).
+  const applied = async () => (await tofu.query(`SELECT version FROM public.schema_migrations ORDER BY seq`)).rows.map(x => String(x['version']));
 
-  // 3) execution AFTER acknowledgment: SA1 semantics on REAL PG.
-  const r = await runMigrations(tofu, { deployment: 'staging' }); // full registry; 0001 already recorded
-  check('tofu: 0002+0003 applied after acknowledgment', r.appliedNow.join(',') === '0002,0003', r.appliedNow);
+  const noAck = cli(['--database-url', url, '--deployment', 'staging']);
+  console.error(`OBSERVED[cli no-ack]: status=${noAck.status} ${noAck.stderr.split('\n').find(l => l.includes('GATE')) ?? ''}`);
+  check('REAL CLI refuses an absent ack (exit 75, nothing executed)', noAck.status === 75 && noAck.stderr.includes('GATE: no ack supplied'), { status: noAck.status, stderr: noAck.stderr.slice(0, 200) });
+  check('no-ack run applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+
+  const wrongAck = cli(['--database-url', url, '--deployment', 'staging', '--ack', `ack:${'deadbeef'.repeat(8)}`]);
+  console.error(`OBSERVED[cli wrong-ack]: status=${wrongAck.status}`);
+  check('REAL CLI refuses a wrong ack (runner gate, fail closed)', wrongAck.status !== 0 && wrongAck.stderr.includes('OPERATOR GATE refusal'), { status: wrongAck.status });
+  check('wrong-ack run applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+
+  const staleAck = pf.requiredAck;
+  await ins('u-late', '+972555000999');
+  const stale = cli(['--database-url', url, '--deployment', 'staging', '--ack', staleAck]);
+  console.error(`OBSERVED[cli stale-ack]: status=${stale.status}`);
+  check('REAL CLI refuses a STALE ack (state changed after it was minted; runner recomputes under lock)', stale.status !== 0 && stale.stderr.includes('OPERATOR GATE refusal'), { status: stale.status });
+  await tofu.query(`DELETE FROM users WHERE user_id = 'u-late'`);
+
+  await admin.query(`DROP DATABASE IF EXISTS contake_tofu2 WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_tofu2`);
+  const tofu2 = mk('contake_tofu2');
+  await runMigrations(tofu2, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  await tofu2.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-other', 'org-1', 'o@x', '+972555000777', '{}')`);
+  const url2 = `postgres://postgres@${host}:${port}/contake_tofu2`;
+  const pf2 = preflight(url2);
+  const replayed = cli(['--database-url', url, '--deployment', 'staging', '--ack', pf2.requiredAck]);
+  console.error(`OBSERVED[cli replayed-ack]: status=${replayed.status}`);
+  check('REAL CLI refuses a REPLAYED ack (minted against another target)', replayed.status !== 0 && replayed.stderr.includes('OPERATOR GATE refusal'), { status: replayed.status });
+
+  const fabricated = cli(['--database-url', url, '--deployment', 'staging', '--ack', `ack:${'0'.repeat(64)}`]);
+  check('REAL CLI refuses a fabricated ack (no preflight ever produced it)', fabricated.status !== 0 && fabricated.stderr.includes('OPERATOR GATE refusal'), { status: fabricated.status });
+  check('all refusals applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+
+  // 3) GREEN PATH: operator reviews the preflight, supplies THIS target+state ack.
+  const green = cli(['--database-url', url, '--deployment', 'staging', '--ack', pf.requiredAck]);
+  console.error(`OBSERVED[cli green]: status=${green.status} ${green.stdout.split('\n').find(l => l.includes('applied')) ?? ''}`);
+  check('REAL CLI applies 0002+0003 with the exact operator ack', green.status === 0 && green.stdout.includes('"0002"') && green.stdout.includes('"0003"'), { status: green.status, stdout: green.stdout.slice(0, 300) });
   const rows = await tofu.query(`SELECT user_id, phone, data->>'phone' AS jp FROM users ORDER BY user_id`);
   const byId = Object.fromEntries(rows.rows.map(x => [String(x['user_id']), x]));
   check('tofu: two blank phones normalize to NULL (absence, not identity)',
@@ -677,17 +710,21 @@ if (phase === 'phase1') {
   const noMatch = await tofu.query(`SELECT count(*)::int AS n FROM users WHERE phone = ''`);
   check('tofu: login-by-phone can never match a NULL phone', Number(noMatch.rows[0]?.['n']) === 0);
 
-  // 4) a REAL cross-tenant phone collision still blocks loudly.
-  await admin.query(`DROP DATABASE IF EXISTS contake_tofu2 WITH (FORCE)`);
-  await admin.query(`CREATE DATABASE contake_tofu2`);
-  const tofu2 = mk('contake_tofu2');
-  await runMigrations(tofu2, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
-  await tofu2.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u-a', 'org-1', '+972555000444', '{}')`);
-  await tofu2.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u-b', 'org-2', '  +972555000444 ', '{}')`);
-  let blocked = false;
-  try { await runMigrations(tofu2, { deployment: 'staging' }); }
-  catch (e) { blocked = /ASSERTION refusal - guard 'no-duplicates' in '0002'/.test(String(e)); }
-  check('tofu: a real cross-tenant phone collision still BLOCKS loudly', blocked);
+  // 4) the acknowledged report + digest PERSISTED as migration evidence.
+  const ev = await tofu.query(`SELECT version, list_digest, target FROM public.schema_migration_evidence ORDER BY version`);
+  check('acknowledged report/digest persisted with the migration evidence (0002 + 0003)',
+    JSON.stringify(ev.rows.map(x => String(x['version']))) === '["0002","0003"]'
+    && ev.rows.every(x => String(x['list_digest']) === pf.listDigest)
+    && ev.rows.every(x => String(x['target']) === 'contake_tofu'), ev.rows);
+
+  // 5) a REAL cross-tenant phone collision still blocks loudly WITH a valid ack
+  //    (the ack is a precondition, never an override).
+  await tofu2.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-a', 'org-1', 'a@x', '+972555000444', '{}')`);
+  await tofu2.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-b', 'org-2', 'b@x', '  +972555000444 ', '{}')`);
+  const pf2b = preflight(url2);
+  const blockedRun = cli(['--database-url', url2, '--deployment', 'staging', '--ack', pf2b.requiredAck]);
+  check('REAL CLI: a real cross-tenant collision still BLOCKS loudly even with a valid ack',
+    blockedRun.status !== 0 && /ASSERTION refusal - guard 'no-duplicates' in '0002'/.test(blockedRun.stderr), { status: blockedRun.status });
   const t2 = await tofu2.query(`SELECT to_regclass('users_phone_unique') AS r`);
   check('tofu: blocked run built nothing', t2.rows[0]?.['r'] === null);
   await tofu2.end(); await tofu.end();

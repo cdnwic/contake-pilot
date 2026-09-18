@@ -22,7 +22,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { pgliteConnectable, type Connectable } from '../src/repo/postgres.js';
 import {
   EXPECTED_SCHEMA_VERSIONS, MIGRATIONS, assertSchemaCurrent, runMigrations,
-} from '../src/migrations/runner.js';
+  computeUsersPhonePreflight, operatorAckFor, runMigrations } from '../src/migrations/runner.js';
 
 const pgOnly = process.env['REPO_IMPL'] === 'memory' ? describe.skip : describe;
 
@@ -172,5 +172,99 @@ pgOnly('declarative users-phone migration (0002 normalize + 0003 index)', () => 
     expect(r2.appliedNow).toEqual([]);
     expect((await conn.query(`SELECT to_regclass('public.users_phone_unique') AS r`)).rows[0]!['r']).not.toBeNull();
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
+  });
+});
+
+// --- SA2 real-entrypoint operator gate (mine) ---
+describe('SA2 operator gate (runner-enforced, recomputed under lock)', () => {
+  const STAGING = 'staging';
+  const seedClean = async (db: PGlite) => {
+    await db.query(`CREATE TABLE public.users(user_id text PRIMARY KEY, org_id text NOT NULL DEFAULT 'o1', phone text, data jsonb)`);
+    await db.query(`INSERT INTO public.users(user_id, phone, data) VALUES
+      ('u1', '+15550100001', '{"phone":"+15550100001"}'),
+      ('u2', NULL, '{}')`);
+  };
+  it('absent ack refuses on staging-shaped deployments; nothing past 0001 applies', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      await expect(runMigrations(db, { deployment: STAGING })).rejects.toThrow('OPERATOR GATE refusal');
+      const r = await db.query(`SELECT version FROM public.schema_migrations ORDER BY seq`);
+      expect(r.rows.map(x => x['version'])).toEqual(['0001']);
+    } finally { await raw.close(); }
+  });
+  it('wrong ack refuses', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: 'ack:deadbeef' })).rejects.toThrow('OPERATOR GATE refusal');
+    } finally { await raw.close(); }
+  });
+  it('correct ack applies 0002/0003 and persists the acknowledged report + digest as migration evidence', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      // attended first run: preflight on the fresh DB (empty list), ack minted.
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) });
+      expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
+      const ev = await db.query(`SELECT version, kind, list_digest, target FROM public.schema_migration_evidence ORDER BY version`);
+      expect(ev.rows.map(x => x['version'])).toEqual(['0002', '0003']);
+      expect(ev.rows[0]!['list_digest']).toMatch(/^[0-9a-f]{64}$/);
+    } finally { await raw.close(); }
+  });
+  it('stale ack refuses: state changed after the ack was minted', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      const ack = operatorAckFor(pf);
+      // operator walks away; state changes (a colliding pair appears)
+      await seedClean(db);
+      await db.query(`INSERT INTO public.users(user_id, phone, data) VALUES ('u3', ' +15550100001 ', '{}')`);
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: ack })).rejects.toThrow('OPERATOR GATE refusal');
+      const r = await db.query(`SELECT version FROM public.schema_migrations ORDER BY seq`);
+      expect(r.rows.map(x => x['version'])).toEqual(['0001']);
+    } finally { await raw.close(); }
+  });
+  it('replayed ack refuses: ack minted for another deployment matches nothing here', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      const pfOther = await computeUsersPhonePreflight(db, { deployment: 'production' });
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pfOther) })).rejects.toThrow('OPERATOR GATE refusal');
+    } finally { await raw.close(); }
+  });
+  it('attended TOFU on an EXISTING database: real inconsistency list acknowledged, gate passes, evidence carries the list', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      await seedClean(db);
+      // cross-representation inconsistency (does NOT block; operator boundary),
+      // no real-phone collision.
+      await db.query(`INSERT INTO public.users(user_id, phone, data) VALUES ('u3', ' +15550100009 ', '{"phone":"+15550100008"}')`);
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      expect(pf.collisionGroups.length).toBe(0);
+      expect(pf.crossRepresentationInconsistencies.length).toBe(1);
+      const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) });
+      expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
+      const ev = await db.query(`SELECT report FROM public.schema_migration_evidence WHERE version = '0002'`);
+      const report = ev.rows[0]!['report'] as { report: { crossRepresentationInconsistencies: unknown[] } };
+      expect(report.report.crossRepresentationInconsistencies.length).toBe(1);
+    } finally { await raw.close(); }
+  });
+  it('a VALID ack does NOT override the collision guard: ack is a precondition, not a bypass', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      await seedClean(db);
+      await db.query(`INSERT INTO public.users(user_id, phone, data) VALUES ('u3', ' +15550100001 ', '{}')`);
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      expect(pf.collisionGroups.length).toBe(1);
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) }))
+        .rejects.toThrow(/ASSERTION refusal - guard 'no-duplicates'/);
+      const r = await db.query(`SELECT version FROM public.schema_migrations ORDER BY seq`);
+      expect(r.rows.map(x => x['version'])).toEqual(['0001']);
+    } finally { await raw.close(); }
+  });
+  it("test deployments stay gate-exempt (hermetic synthetic lanes)", async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      const r = await runMigrations(db, { deployment: 'test' });
+      expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
+    } finally { await raw.close(); }
   });
 });

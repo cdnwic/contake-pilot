@@ -1,45 +1,38 @@
 #!/usr/bin/env node
-/** READ-ONLY users-phone preflight (SA1 ruling 2026-09-19, attended-TOFU
- *  companion to migrations 0002/0003). Runs FIRST at attended TOFU; its
- *  inconsistency list is recorded in the run evidence and the operator must
- *  explicitly acknowledge listDigest before the migration executes.
- *  - NEVER mutates: the session is forced default_transaction_read_only=on
- *    and only SELECTs are issued; no winner is picked, nothing is deleted.
- *  - Resolved-DB-only: REQUIRES an explicit --database-url (no ambient env).
- *  Usage: npx tsx scripts/users-phone-preflight.mts --database-url postgres://...
+/** READ-ONLY users-phone preflight (SA1+SA2, attended-TOFU companion). Runs
+ *  FIRST at attended TOFU; its inconsistency listDigest is what the operator
+ *  acknowledges. Uses the runner's CANONICAL preflight implementation - a
+ *  wrapper can never substitute a different list.
+ *  - NEVER mutates: session forced default_transaction_read_only=on, SELECTs
+ *    only; no winner picked, nothing deleted.
+ *  - Resolved-DB-only: REQUIRES explicit --database-url and --deployment.
+ *  Usage: npx tsx scripts/users-phone-preflight.mts --database-url postgres://... --deployment staging
  *  Exit 0 always; operatorDecisionRequired flags what needs human judgment. */
 import { Pool } from 'pg';
-import { createHash } from 'node:crypto';
+import { computeUsersPhonePreflight, operatorAckFor } from '../src/migrations/runner.js';
 
-const url = process.argv.find((a, i) => i > 0 && process.argv[i - 1] === '--database-url');
+const arg = (name: string) => process.argv.find((a, i) => i > 0 && process.argv[i - 1] === name);
+const url = arg('--database-url');
+const deployment = arg('--deployment') ?? 'staging';
 if (!url) {
   console.error('FATAL: explicit --database-url is required (resolved-DB-only; no default, no ambient env).');
   process.exit(64);
 }
 const pool = new Pool({ connectionString: url, options: '-c default_transaction_read_only=on' });
-const NORM = `NULLIF(pg_catalog.btrim(phone), '')`;
-const JNORM = `NULLIF(pg_catalog.btrim(data->>'phone'), '')`;
 try {
-  const collisions = await pool.query(
-    `SELECT ${NORM} AS norm_phone, jsonb_agg(jsonb_build_object('userId', user_id, 'orgId', org_id) ORDER BY user_id) AS users
-     FROM users WHERE ${NORM} IS NOT NULL GROUP BY ${NORM} HAVING count(*) > 1 ORDER BY 1`);
-  const inconsistencies = await pool.query(
-    `SELECT user_id AS "userId", org_id AS "orgId", ${NORM} AS "columnPhone", ${JNORM} AS "jsonPhone"
-     FROM users WHERE ${NORM} IS NOT NULL AND ${JNORM} IS NOT NULL AND ${NORM} <> ${JNORM} ORDER BY user_id`);
-  const blanks = await pool.query(
-    `SELECT user_id AS "userId", org_id AS "orgId" FROM users
-     WHERE phone IS NOT NULL AND ${NORM} IS NULL ORDER BY user_id`);
+  const pf = await computeUsersPhonePreflight(pool, { deployment });
   const report = {
     tool: 'users-phone-preflight', readOnly: true, generatedAt: new Date().toISOString(),
-    collisionGroups: collisions.rows,
-    crossRepresentationInconsistencies: inconsistencies.rows,
-    blankPhoneUsers: blanks.rows,
-    operatorDecisionRequired: collisions.rows.length > 0 || inconsistencies.rows.length > 0,
-    notes: 'blank phones normalize to NULL at 0002 (absence, not identity); real-phone collisions BLOCK 0002 loudly; cross-representation inconsistencies are operator judgment - non-blocking in code, never unexamined in operation.',
+    target: pf.target, deployment: pf.deployment,
+    collisionGroups: pf.collisionGroups,
+    crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies,
+    blankPhoneUsers: pf.blankPhoneUsers,
+    operatorDecisionRequired: pf.collisionGroups.length > 0 || pf.crossRepresentationInconsistencies.length > 0,
+    listDigest: pf.listDigest,
+    requiredAck: operatorAckFor(pf),
+    notes: 'blank phones normalize to NULL at 0002 (absence, not identity); real-phone collisions BLOCK loudly; cross-representation inconsistencies are operator judgment. The ack binds THIS target + CURRENT state; the runner recomputes under lock and refuses absent/wrong/stale/replayed acks.',
   };
-  const canonical = JSON.stringify({ c: report.collisionGroups, i: report.crossRepresentationInconsistencies, b: report.blankPhoneUsers });
-  const listDigest = createHash('sha256').update(canonical).digest('hex');
-  console.log(JSON.stringify({ ...report, listDigest }, null, 2));
-  console.error(`PREFLIGHT: ${collisions.rows.length} collision group(s), ${inconsistencies.rows.length} cross-representation inconsistency(ies), ${blanks.rows.length} blank phone(s). listDigest=${listDigest}`);
-  console.error(`PREFLIGHT: acknowledge with OPERATOR_ACK=ack:${listDigest} before executing the migration.`);
+  console.log(JSON.stringify(report, null, 2));
+  console.error(`PREFLIGHT: ${pf.collisionGroups.length} collision group(s), ${pf.crossRepresentationInconsistencies.length} cross-representation inconsistency(ies), ${pf.blankPhoneUsers.length} blank phone(s). listDigest=${pf.listDigest}`);
+  console.error(`PREFLIGHT: execute with --ack ${operatorAckFor(pf)} (binds target ${pf.target}, current state only).`);
 } finally { await pool.end(); }

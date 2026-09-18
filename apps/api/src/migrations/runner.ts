@@ -91,6 +91,10 @@ export interface MigrationStep {
   readonly assertions?: readonly MigrationAssertion[];
   /** Runner-executed `LOCK TABLE <t> IN SHARE ROW EXCLUSIVE MODE` before the step. */
   readonly lockTables?: readonly string[];
+  /** SA2: steps that mutate credential-identity row data require the
+   *  attended-TOFU operator ack, enforced by the RUNNER (recomputed under the
+   *  step's locks, same transaction - no TOCTOU gap) on non-test deployments. */
+  readonly requiresOperatorAck?: boolean;
   /** Runner-executed pg_advisory_xact_lock(key) first (step-scoped). */
   readonly xactLockKey?: number;
 }
@@ -492,13 +496,61 @@ deepFreeze(TEMPLATES);
  *  source/tsx, tsc dist, vitest and the real-PG run all compute the SAME
  *  value. Anchor A records this value from reviewed source; anchor B records
  *  it in the migration identity at the first pinned governed run. */
-export const REGISTRY_DIGEST: string = createHash('sha256')
-  .update(`contake-registry/v2\n${canonicalJson({
-    templates: TEMPLATES,
-    namedExpressions: NAMED_EXPRESSIONS,
-    namedPredicates: NAMED_PREDICATES,
-  })}`)
-  .digest('hex');
+/** SA2 preimage discipline (ruling 2026-09-19): the digest preimage is an
+ *  EXPLICIT, canonical, independently enumerable manifest - one entry per
+ *  artifact with executable semantics (runner-owned closed templates, named
+ *  expressions, named predicates, named normalizations, frozen baselines, and
+ *  any future named structure). Each entry carries a role tag, identifier and
+ *  CONTENT HASH; nothing with semantic effect may exist outside the manifest.
+ *  The manifest exposes HASHES ONLY - no render content leaves the module
+ *  (R4 confinement preserved); reviewers recompute content hashes from
+ *  reviewed source, then the manifest digest. */
+export interface BlueprintManifestEntry {
+  readonly role: 'template' | 'named-expression' | 'named-predicate' | 'named-normalization' | 'frozen-baseline';
+  readonly id: string;
+  readonly contentHash: string;
+}
+const manifestMemberHash = (role: string, id: string, content: unknown): string =>
+  createHash('sha256').update(`contake-manifest-member/v1\n${role}\n${id}\n${canonicalJson(content)}`).digest('hex');
+
+const buildBlueprintManifest = (): readonly BlueprintManifestEntry[] => {
+  const entries: BlueprintManifestEntry[] = [];
+  entries.push({ role: 'frozen-baseline', id: '0001-baseline', contentHash: manifestMemberHash('frozen-baseline', '0001-baseline', BASELINE_0001_STATEMENTS) });
+  for (const t of TEMPLATES) {
+    // description is operator display metadata (not executable) - excluded,
+    // consistent with step-digest doctrine.
+    entries.push({ role: 'template', id: t.name, contentHash: manifestMemberHash('template', t.name, { params: t.params, shapes: t.shapes, writesCatalogs: t.writesCatalogs }) });
+  }
+  for (const [family, map, role] of [
+    ['expressions', NAMED_EXPRESSIONS, 'named-expression'],
+    ['predicates', NAMED_PREDICATES, 'named-predicate'],
+    ['normalizations', NAMED_NORMALIZATIONS, 'named-normalization'],
+  ] as const) {
+    for (const k of Object.keys(map).sort()) {
+      entries.push({ role, id: `${family}.${k}`, contentHash: manifestMemberHash(role, `${family}.${k}`, map[k]) });
+    }
+  }
+  return entries;
+};
+
+/** Anchor A surface (SA2): the canonical manifest - detached, frozen, HASHES
+ *  ONLY. Every member is inside the effective preimage BY CONSTRUCTION;
+ *  per-member tamper moves the digest (constructive regression in the suite). */
+export const BLUEPRINT_MANIFEST: readonly BlueprintManifestEntry[] = deepFreeze([...buildBlueprintManifest()]);
+
+/** PURE member-hash computation over caller-supplied data (SA2
+ *  constructive-verification seam; same recipe the manifest uses). */
+export function manifestMemberHashForReview(role: string, id: string, content: unknown): string {
+  return manifestMemberHash(role, id, content);
+}
+
+/** PURE canonical digest over caller-supplied manifest entries (SA2
+ *  constructive-verification seam; computes over data only). */
+export function digestManifestForReview(entries: readonly BlueprintManifestEntry[]): string {
+  return createHash('sha256').update(`contake-registry/v3\n${canonicalJson(entries)}`).digest('hex');
+}
+
+export const REGISTRY_DIGEST: string = digestManifestForReview(BLUEPRINT_MANIFEST);
 
 /** R4 section 4: single-statement construction guarantee. Exported ONLY as a
  *  pure assertion over caller-supplied forms (no registry content leaves the
@@ -778,6 +830,7 @@ export const MIGRATIONS: readonly MigrationStep[] = [
     params: { table: 'users', column: 'phone', jsonColumn: 'data', jsonKey: 'phone', columnNorm: 'NORM_COL_BTRIM_NULLIF_EMPTY', jsonNorm: 'NORM_JSON_BTRIM_NULLIF_EMPTY' },
     xactLockKey: 7263849598301, // 'users-phone-migration'
     lockTables: ['users'],
+    requiresOperatorAck: true,
     assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim-nullif-empty', skipNulls: true }],
   },
   {
@@ -788,6 +841,7 @@ export const MIGRATIONS: readonly MigrationStep[] = [
     params: { index: 'users_phone_unique', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
     xactLockKey: 7263849598301, // 'users-phone-migration'
     lockTables: ['users'],
+    requiresOperatorAck: true,
     // SA1 ruling: guard re-fires AFTER normalization with blank-as-absence.
     assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim-nullif-empty', skipNulls: true }],
   },
@@ -822,6 +876,18 @@ ALTER TABLE public.contake_db_identity ADD COLUMN IF NOT EXISTS registry_digest 
 
 export interface DbIdentity { deploymentLabel: string; instanceId: string }
 export interface MigrationRunResult { identity: DbIdentity; stampedNow: boolean; appliedNow: string[]; versions: string[] }
+const RUNNER_EVIDENCE_DDL = `
+CREATE TABLE IF NOT EXISTS public.schema_migration_evidence(
+  seq bigserial PRIMARY KEY,
+  version text NOT NULL,
+  kind text NOT NULL,
+  report jsonb NOT NULL,
+  list_digest text NOT NULL,
+  target text NOT NULL,
+  recorded_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(version, kind)
+)`;
+
 export interface AppliedMigrationRow { version: string; name: string; sha256: string }
 
 const DEPLOYMENT_LABEL = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -921,16 +987,70 @@ export function validateRegistry(migrations: readonly MigrationStep[]): void {
     for (const t of m.lockTables ?? []) {
       if (typeof t !== 'string' || !IDENT_STRICT.test(t)) throw new Error(`release-migrations: invalid lockTables identifier ${JSON.stringify(t)}`);
     }
+    if (m.requiresOperatorAck !== undefined && typeof m.requiresOperatorAck !== 'boolean') {
+      throw new Error('release-migrations: requiresOperatorAck must be an exact boolean');
+    }
     if (m.xactLockKey !== undefined && (!Number.isSafeInteger(m.xactLockKey) || m.xactLockKey < 0)) {
       throw new Error('release-migrations: xactLockKey must be a non-negative safe integer');
     }
   }
 }
 
+/** SA2 canonical operator preflight (runner-owned, the ONE implementation -
+ *  the read-only companion script AND the in-transaction gate both use this,
+ *  so a wrapper can never substitute a different list). READ-ONLY queries.
+ *  The listDigest binds the canonical inconsistency lists PLUS target identity
+ *  (current_database() + deployment) - an ack minted against another target
+ *  or an earlier state matches nothing. */
+export interface OperatorPreflightReport {
+  readonly target: string;
+  readonly deployment: string;
+  readonly collisionGroups: readonly unknown[];
+  readonly crossRepresentationInconsistencies: readonly unknown[];
+  readonly blankPhoneUsers: readonly unknown[];
+}
+export async function computeUsersPhonePreflight(
+  conn: Queryable,
+  opts: { deployment: string },
+): Promise<OperatorPreflightReport & { listDigest: string }> {
+  const NORM = `NULLIF(pg_catalog.btrim(phone), '')`;
+  const JNORM = `NULLIF(pg_catalog.btrim(data->>'phone'), '')`;
+  const t = await conn.query(`SELECT pg_catalog.current_database() AS d`);
+  const target = String(t.rows[0]?.['d']);
+  // Fresh databases (pre-0001) have no users table yet: the attended list is
+  // EMPTY, and the runner's in-transaction recompute (after 0001 creates the
+  // table, still empty) matches it. Existing databases list real state.
+  const reg = await conn.query(`SELECT pg_catalog.to_regclass('public.users') AS r`);
+  if (!reg.rows[0]?.['r']) {
+    const report: OperatorPreflightReport = { target, deployment: opts.deployment, collisionGroups: [], crossRepresentationInconsistencies: [], blankPhoneUsers: [] };
+    const listDigest = createHash('sha256').update(`contake-operator-preflight/v1\n${canonicalJson(report)}`).digest('hex');
+    return { ...report, listDigest };
+  }
+  const collisions = await conn.query(
+    `SELECT ${NORM} AS norm_phone, jsonb_agg(jsonb_build_object('userId', user_id, 'orgId', org_id) ORDER BY user_id) AS users
+     FROM "public"."users" WHERE ${NORM} IS NOT NULL GROUP BY ${NORM} HAVING pg_catalog.count(*) > 1 ORDER BY 1`);
+  const inconsistencies = await conn.query(
+    `SELECT user_id AS "userId", org_id AS "orgId", ${NORM} AS "columnPhone", ${JNORM} AS "jsonPhone"
+     FROM "public"."users" WHERE ${NORM} IS NOT NULL AND ${JNORM} IS NOT NULL AND ${NORM} <> ${JNORM} ORDER BY user_id`);
+  const blanks = await conn.query(
+    `SELECT user_id AS "userId", org_id AS "orgId" FROM "public"."users"
+     WHERE phone IS NOT NULL AND ${NORM} IS NULL ORDER BY user_id`);
+  const report: OperatorPreflightReport = {
+    target, deployment: opts.deployment,
+    collisionGroups: collisions.rows, crossRepresentationInconsistencies: inconsistencies.rows, blankPhoneUsers: blanks.rows,
+  };
+  const listDigest = createHash('sha256').update(`contake-operator-preflight/v1\n${canonicalJson(report)}`).digest('hex');
+  return { ...report, listDigest };
+}
+/** The exact ack string the operator must supply for THIS target+state. */
+export function operatorAckFor(preflight: { listDigest: string }): string {
+  return `ack:${preflight.listDigest}`;
+}
+
 /** Applies every pending migration in registry order. */
 export async function runMigrations(
   conn: Connectable,
-  opts: { deployment: string; appliedBy?: string; migrations?: readonly MigrationStep[]; expectInstanceId?: string; expectRegistryDigest?: string },
+  opts: { deployment: string; appliedBy?: string; migrations?: readonly MigrationStep[]; expectInstanceId?: string; expectRegistryDigest?: string; operatorAck?: string },
 ): Promise<MigrationRunResult> {
   const migrations = opts.migrations ?? MIGRATIONS;
   validateRegistry(migrations);
@@ -956,6 +1076,7 @@ export async function runMigrations(
       await client.query('BEGIN');
       try {
         for (const stmt of RUNNER_DDL.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
+        for (const stmt of RUNNER_EVIDENCE_DDL.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
         // Pre-mutation target binding is enforced inside the bootstrap tx as
         // well (the CLI also checks read-only before calling): any refusal
         // here still precedes every step write and rolls back.
@@ -1060,6 +1181,29 @@ export async function runMigrations(
           await client.query(`SELECT pg_catalog.set_config('search_path', '', true)`);
           if (m.xactLockKey !== undefined) await client.query(`SELECT pg_catalog.pg_advisory_xact_lock(${m.xactLockKey})`);
           for (const t of m.lockTables ?? []) await client.query(`LOCK TABLE "${CONTROLLED_SCHEMA}"."${t}" IN SHARE ROW EXCLUSIVE MODE`);
+          // SA2 real-entrypoint operator gate: the RUNNER recomputes the
+          // canonical preflight HERE - inside the step transaction, under the
+          // advisory xact lock and table locks (no TOCTOU gap) - and refuses
+          // absent/wrong/stale/replayed acks (fail closed, full rollback).
+          // Test deployments are hermetic synthetic lanes (gate-exempt); the
+          // gate is proven on staging-shaped lanes in the suite + evidence.
+          if (m.requiresOperatorAck === true && opts.deployment !== 'test' && opts.deployment !== 'test-harness') {
+            const pf = await computeUsersPhonePreflight(client, { deployment: opts.deployment });
+            const expected = operatorAckFor(pf);
+            if (opts.operatorAck !== expected) {
+              throw new Error(
+                `release-migrations: OPERATOR GATE refusal - step '${m.version}' mutates credential-identity row data and ` +
+                `requires the attended-TOFU ack for THIS target and CURRENT state (target ${pf.target}, deployment ${opts.deployment}, ` +
+                `listDigest ${pf.listDigest.slice(0, 16)}...). Supplied ack is absent/wrong/stale/replayed - refusing BEFORE any write (fail-closed, rolling back).`,
+              );
+            }
+            // Persist the acknowledged report + digest with the migration's
+            // evidence record (rolls back with the step on any failure).
+            await client.query(
+              `INSERT INTO public.schema_migration_evidence(version, kind, report, list_digest, target) VALUES($1, 'attended-tofu', $2::jsonb, $3, $4) ON CONFLICT (version, kind) DO NOTHING`,
+              [m.version, JSON.stringify({ ack: opts.operatorAck, report: { collisionGroups: pf.collisionGroups, crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies, blankPhoneUsers: pf.blankPhoneUsers } }), pf.listDigest, pf.target],
+            );
+          }
           for (const a of m.assertions ?? []) {
             const guard = await client.query(buildAssertionQuery(a));
             if (guard.rows.length > 0) {

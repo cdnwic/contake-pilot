@@ -225,7 +225,7 @@ export const DATA_REGISTRY_DIGEST: string = createHash('sha256')
 
 /** Explicit bookkeeping tables owned by the runner/seed (excluded from the
  *  zero-row business-table proof). */
-export const SEED_BOOKKEEPING_TABLES: readonly string[] = ['contake_db_identity', 'schema_migrations', 'staging_seed_state'];
+export const SEED_BOOKKEEPING_TABLES: readonly string[] = ['contake_db_identity', 'schema_migrations', 'schema_migration_evidence', 'staging_seed_state'];
 
 /** Business tables written by the seed, with their primary-key column, in
  *  canonical order (rerun-integrity scans use exactly this list). */

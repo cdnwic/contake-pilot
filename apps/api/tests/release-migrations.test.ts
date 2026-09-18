@@ -15,6 +15,14 @@ import {
   verifyTargetPreconditions, assertSingleStatementForms, REGISTRY_DIGEST, type MigrationStep,
 } from '../src/migrations/runner.js';
 import * as runnerModule from '../src/migrations/runner.js';
+import { computeUsersPhonePreflight, operatorAckFor, type Connectable } from '../src/migrations/runner.js';
+/** SA2: staging-shaped lanes mint the attended-TOFU ack from the runner's own
+ *  canonical preflight (empty list on fresh DBs; the runner recomputes
+ *  in-transaction). */
+const stagingRunMigrations = async (conn: Connectable, opts: Parameters<typeof runnerModule.runMigrations>[1]): Promise<runnerModule.MigrationRunResult> => {
+  const pf = await computeUsersPhonePreflight(conn, { deployment: opts.deployment });
+  return runnerModule.runMigrations(conn, { operatorAck: operatorAckFor(pf), ...opts });
+};
 
 async function freshDb() {
   const pg = new PGlite();
@@ -33,7 +41,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
   it('SA-shaped index applies via runMigrations; exact indexdef is catalog-observed (render is not exported)', async () => {
     const { pg, conn } = await freshDb();
     const sa = step('0004', 'sa', 'ddl.create-index', SA_PARAMS);
-    await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
+    await stagingRunMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
     const idx = await conn.query(`SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'users_phone_unique'`);
     const indexdef = String(idx.rows[0]?.['indexdef'] ?? '');
     console.log(`OBSERVED[sa indexdef]: ${indexdef}`);
@@ -41,7 +49,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     expect(indexdef).not.toContain(';'); // one statement, no separator
     // extra/missing params refuse at registration, driven through the runner
     // (as a NOT-yet-applied version so rendering is actually reached):
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa, step('0005', 'sa2', 'ddl.create-index', { ...SA_PARAMS, extra: 1 })] }))
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa, step('0005', 'sa2', 'ddl.create-index', { ...SA_PARAMS, extra: 1 })] }))
       .rejects.toThrow(/do not exactly match/);
     await pg.close();
   });
@@ -49,7 +57,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     const { pg, conn } = await freshDb();
     for (const bad of [`us"; DROP TABLE users;--`, `users' OR '1'='1`, 'public.users', 'attacker.users', 'Users', 'pg_catalog', 'pg_shadow', 'us ers', '']) {
       let observed = '';
-      try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, table: bad })] }); } catch (e) { observed = String(e); }
+      try { await stagingRunMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, table: bad })] }); } catch (e) { observed = String(e); }
       console.log(`OBSERVED[identifier-injection ${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
       expect(observed, bad).toMatch(/TEMPLATE refusal/);
     }
@@ -61,7 +69,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     const { pg, conn } = await freshDb();
     for (const [k, bad] of [['unique', 'UNIQUE'], ['unique', 'yes'], ['ifNotExists', 'sometimes'], ['ifNotExists', 'if-not-exists; DROP TABLE users']] as const) {
       let observed = '';
-      try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, [k]: bad })] }); } catch (e) { observed = String(e); }
+      try { await stagingRunMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, [k]: bad })] }); } catch (e) { observed = String(e); }
       console.log(`OBSERVED[enum escape ${k}=${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
       expect(observed, `${k}=${bad}`).toMatch(/TEMPLATE refusal - enum/);
     }
@@ -71,7 +79,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     const { pg, conn } = await freshDb();
     for (const bad of [1, NaN, Infinity, { a: 1 }, ['x'], null, undefined]) {
       let observed = '';
-      try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, index: bad })] }); } catch (e) { observed = String(e); }
+      try { await stagingRunMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, index: bad })] }); } catch (e) { observed = String(e); }
       console.log(`OBSERVED[type confusion ${JSON.stringify(bad) ?? String(bad)}]: ${observed.slice(0, 130)}`);
       expect(observed, String(bad)).toMatch(/TEMPLATE refusal/);
     }
@@ -81,7 +89,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     const { pg, conn } = await freshDb();
     for (const bad of ['btrim(phone)', 'attacker.lower(phone)', 'EXPR_NORM_PHONE; DROP TABLE users', 'expr_norm_phone', '']) {
       let observed = '';
-      try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, expression: bad })] }); } catch (e) { observed = String(e); }
+      try { await stagingRunMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, expression: bad })] }); } catch (e) { observed = String(e); }
       console.log(`OBSERVED[expression substitution ${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
       expect(observed, bad).toMatch(/TEMPLATE refusal/);
     }
@@ -106,7 +114,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
   it('unknown template name refused at registration', async () => {
     const { pg, conn } = await freshDb();
     let observed = '';
-    try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.drop-database', {})] }); } catch (e) { observed = String(e); }
+    try { await stagingRunMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.drop-database', {})] }); } catch (e) { observed = String(e); }
     console.log(`OBSERVED[unknown template]: ${observed.slice(0, 140)}`);
     expect(observed).toMatch(/unknown template name/);
     await pg.close();
@@ -125,7 +133,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
   it('code-object creation is impossible by construction and absent from the catalog after a full run', async () => {
     const { pg, conn } = await freshDb();
     const sa = step('0004', 'sa', 'ddl.create-index', SA_PARAMS);
-    await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
+    await stagingRunMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
     const counts = await conn.query(`SELECT
       (SELECT count(*)::int FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public') AS funcs,
       (SELECT count(*)::int FROM pg_trigger WHERE NOT tgisinternal) AS triggers,
@@ -179,7 +187,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
 
   it('CTL-DDL-CONFINEMENT: catalog diff catches every persisting code/privilege/ownership class; post-rollback catalog exactly equal', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     await conn.query(`CREATE SEQUENCE public.demo_seq`);
     const baseline = await catalogSnapshot(conn);
     const rogueBatches: [string, string[]][] = [
@@ -224,7 +232,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
 
   it('R2 attack matrix: pre-existing-object alteration, in-tx trigger firing, >2^53 sequence - each with OBSERVED ARTIFACT', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     // Pre-existing objects planted OUTSIDE any step (legitimate baseline state):
     await conn.query(`CREATE FUNCTION public.legit() RETURNS int LANGUAGE sql AS 'SELECT 1'`);
     await conn.query(`CREATE FUNCTION public.trg_fire() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''TRIGGER FIRED''; END'`);
@@ -299,7 +307,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
 
   it('sequence restore: exact text past 2^53, active restore, ERR-PROPAGATE on injected restore failure', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     await conn.query(`CREATE SEQUENCE public.restore_seq`);
     const before = await sequenceValues(conn);
     const BIG = '9007199254740993'; // 2^53 + 1 - JS Number would corrupt this
@@ -328,7 +336,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
 
   it('R2 defense-in-depth: migration-role functions carry NO default PUBLIC EXECUTE; boot gate asserts the hardening', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     await conn.query(`CREATE FUNCTION public.check_acl() RETURNS int LANGUAGE sql AS 'SELECT 1'`);
     const f = await conn.query(`SELECT proacl::text AS acl FROM pg_proc WHERE proname = 'check_acl'`);
     const acl = String(f.rows[0]?.['acl'] ?? '');
@@ -350,14 +358,14 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
 
   it('R4 anchor B: first run pins the DB-anchored REGISTRY_DIGEST; tamper refuses run AND boot (OBSERVED); NULL adopts once', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     const anchored = await conn.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
     console.log(`OBSERVED[anchor pinned at first run]: ${String(anchored.rows[0]?.['d'])}`);
     expect(anchored.rows[0]?.['d']).toBe(REGISTRY_DIGEST);
     // tamper the anchor: the run AND the boot gate refuse with the observed mismatch
     await conn.query(`UPDATE public.contake_db_identity SET registry_digest = 'tampered' WHERE id = 1`);
     let runRefusal = '';
-    try { await runMigrations(conn, { deployment: 'staging' }); } catch (e) { runRefusal = String(e); }
+    try { await stagingRunMigrations(conn, { deployment: 'staging' }); } catch (e) { runRefusal = String(e); }
     console.log(`OBSERVED[anchor tamper - run]: ${runRefusal.slice(0, 180)}`);
     expect(runRefusal).toMatch(/ANCHOR refusal/);
     expect(runRefusal).toMatch(/tampered/);
@@ -367,7 +375,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     expect(bootRefusal).toMatch(/ANCHOR refusal/);
     // restore heals both paths:
     await conn.query(`UPDATE public.contake_db_identity SET registry_digest = $1 WHERE id = 1`, [REGISTRY_DIGEST]);
-    await expect(runMigrations(conn, { deployment: 'staging' })).resolves.toBeDefined();
+    await expect(stagingRunMigrations(conn, { deployment: 'staging' })).resolves.toBeDefined();
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     // pre-R4 database (NULL anchor): boot refuses; unpinned adoption writes
     // NOTHING (R5 section 3); only a run carrying BOTH operator pins adopts.
@@ -377,19 +385,19 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     console.log(`OBSERVED[anchor NULL - boot]: ${adoptionRefusal.slice(0, 180)}`);
     expect(adoptionRefusal).toMatch(/no DB-anchored REGISTRY_DIGEST/);
     let unpinned = '';
-    try { await runMigrations(conn, { deployment: 'staging' }); } catch (e) { unpinned = String(e); }
+    try { await stagingRunMigrations(conn, { deployment: 'staging' }); } catch (e) { unpinned = String(e); }
     console.log(`OBSERVED[unpinned adoption refused]: ${unpinned.slice(0, 200)}`);
     expect(unpinned).toMatch(/LEGACY ADOPTION refusal/);
     const stillNull = await conn.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
     expect(stillNull.rows[0]?.['d']).toBeNull(); // nothing was written
     const iid = String((await conn.query(`SELECT instance_id AS i FROM public.contake_db_identity WHERE id = 1`)).rows[0]?.['i']);
     // wrong pins refuse too:
-    await expect(runMigrations(conn, { deployment: 'staging', expectInstanceId: 'wrong-instance', expectRegistryDigest: REGISTRY_DIGEST }))
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', expectInstanceId: 'wrong-instance', expectRegistryDigest: REGISTRY_DIGEST }))
       .rejects.toThrow(/INSTANCE BINDING refusal/);
-    await expect(runMigrations(conn, { deployment: 'staging', expectInstanceId: iid, expectRegistryDigest: 'deadbeef' }))
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', expectInstanceId: iid, expectRegistryDigest: 'deadbeef' }))
       .rejects.toThrow(/REGISTRY PIN refusal/);
     // both correct pins adopt:
-    await expect(runMigrations(conn, { deployment: 'staging', expectInstanceId: iid, expectRegistryDigest: REGISTRY_DIGEST })).resolves.toBeDefined();
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', expectInstanceId: iid, expectRegistryDigest: REGISTRY_DIGEST })).resolves.toBeDefined();
     const adopted = await conn.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
     console.log(`OBSERVED[anchor adopted with both pins]: ${String(adopted.rows[0]?.['d'])}`);
     expect(adopted.rows[0]?.['d']).toBe(REGISTRY_DIGEST);
@@ -413,7 +421,7 @@ describe('release-migration runner', () => {
 
   it('initializes explicitly; boot gate passes; re-run is a no-op', async () => {
     const { pg, conn } = await freshDb();
-    const r1 = await runMigrations(conn, { deployment: 'staging' });
+    const r1 = await stagingRunMigrations(conn, { deployment: 'staging' });
     expect(r1.appliedNow).toEqual([...EXPECTED_SCHEMA_VERSIONS]);
     expect(r1.stampedNow).toBe(true);
     for (const t of ['users', 'otp_codes', 'auth_audit', 'schema_migrations', 'contake_db_identity']) {
@@ -421,7 +429,7 @@ describe('release-migration runner', () => {
       expect(q.rows[0]?.['r'], `table ${t}`).toBe(t);
     }
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
-    const r2 = await runMigrations(conn, { deployment: 'staging' });
+    const r2 = await stagingRunMigrations(conn, { deployment: 'staging' });
     expect([r2.appliedNow, r2.stampedNow]).toEqual([[], false]);
     await pg.close();
   });
@@ -430,7 +438,7 @@ describe('release-migration runner', () => {
     const { pg, conn } = await freshDb();
     const { GRAPH_DDL } = await import('../src/repo/postgres.js');
     for (const stmt of GRAPH_DDL.split(';').map(s => s.trim()).filter(Boolean)) await conn.query(stmt);
-    const r = await runMigrations(conn, { deployment: 'production-pilot' });
+    const r = await stagingRunMigrations(conn, { deployment: 'production-pilot' });
     expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     await pg.close();
@@ -440,7 +448,7 @@ describe('release-migration runner', () => {
     const { pg, conn } = await freshDb();
     // Wrong deployment label on an UNSTAMPED db: fine (first run). Wrong PIN
     // on a STAMPED db must refuse with zero writes.
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     const stamped = await conn.query(`SELECT instance_id FROM contake_db_identity`);
     const iid = String(stamped.rows[0]!['instance_id']);
     await expect(verifyTargetPreconditions(conn, { deployment: 'staging', expectInstanceId: 'wrong-pin' })).rejects.toThrow(/INSTANCE BINDING refusal/);
@@ -449,7 +457,7 @@ describe('release-migration runner', () => {
       { firstRun: false, identity: { deploymentLabel: 'staging', instanceId: iid } },
     );
     // runMigrations with a wrong pin refuses too (defense in depth, pre-step).
-    await expect(runMigrations(conn, { deployment: 'staging', expectInstanceId: 'wrong-pin' })).rejects.toThrow(/INSTANCE BINDING refusal/);
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', expectInstanceId: 'wrong-pin' })).rejects.toThrow(/INSTANCE BINDING refusal/);
     // Fresh DB + supplied pin: refused BEFORE any write (TOFU requires an
     // omitted pin + attended verification).
     const { pg: pg2, conn: conn2 } = await freshDb();
@@ -464,7 +472,7 @@ describe('release-migration runner', () => {
 
   it('runtime boot: EVERY PG boot requires validated deployment + instance identity', async () => {
     const { pg, conn } = await freshDb();
-    const r = await runMigrations(conn, { deployment: 'staging' });
+    const r = await stagingRunMigrations(conn, { deployment: 'staging' });
     const iid = r.identity.instanceId;
     // missing/malformed instance id fails closed for ANY deployment shape
     expect(() => requiredBootIdentity('staging', undefined)).toThrow(/CONTAKE_DB_INSTANCE_ID/);
@@ -479,18 +487,18 @@ describe('release-migration runner', () => {
 
   it('forward-only: unknown/gapped history refuses; boot gate flags it', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     await conn.query(`INSERT INTO schema_migrations(version, name, sha256, applied_by) VALUES('0099', 'foreign', 'x', 'test')`);
-    await expect(runMigrations(conn, { deployment: 'staging' })).rejects.toThrow(/FORWARD-ONLY/);
+    await expect(stagingRunMigrations(conn, { deployment: 'staging' })).rejects.toThrow(/FORWARD-ONLY/);
     await expect(assertSchemaCurrent(conn)).rejects.toThrow(/unknown=\[0099\]/);
     await pg.close();
   });
 
   it('edited applied history (name or digest) fails runner AND boot gate', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     await conn.query(`UPDATE schema_migrations SET name = 'renamed' WHERE version = '0001'`);
-    await expect(runMigrations(conn, { deployment: 'staging' })).rejects.toThrow(/INTEGRITY refusal/);
+    await expect(stagingRunMigrations(conn, { deployment: 'staging' })).rejects.toThrow(/INTEGRITY refusal/);
     await conn.query(`UPDATE schema_migrations SET name = 'init-schema', sha256 = 'deadbeef' WHERE version = '0001'`);
     await expect(assertSchemaCurrent(conn)).rejects.toThrow(/INTEGRITY refusal/);
     await pg.close();
@@ -508,11 +516,11 @@ describe('release-migration runner', () => {
   it('param-level edit of an applied step (tampered artifact bytes) fails rerun AND boot', async () => {
     const { pg, conn } = await freshDb();
     const implA = step('0004', 'sa', 'ddl.create-index', SA_PARAMS);
-    const r = await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implA] });
+    const r = await stagingRunMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implA] });
     expect(r.appliedNow).toEqual(['0001', '0002', '0003', '0004']);
     const implB = step('0004', 'sa', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique_v2' });
     let observed = '';
-    try { await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implB] }); } catch (e) { observed = String(e); }
+    try { await stagingRunMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implB] }); } catch (e) { observed = String(e); }
     console.log(`OBSERVED[tampered artifact refused]: ${observed.slice(0, 160)}`);
     expect(observed).toMatch(/INTEGRITY refusal/);
     await expect(assertSchemaCurrent(conn, [...MIGRATIONS, implA])).resolves.toBeUndefined();
@@ -525,7 +533,7 @@ describe('release-migration runner', () => {
     await conn.query(`CREATE INDEX partial_idx ON public.partial_leak(id)`);
     // strict duplicate: the rendered statement fails mid-step
     const failing = step('0001', 'partial', 'ddl.create-index', { index: 'partial_idx', table: 'partial_leak', unique: 'plain', expression: 'EXPR_NONE', predicate: 'PRED_NONE', ifNotExists: 'strict' });
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [failing] })).rejects.toThrow();
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', migrations: [failing] })).rejects.toThrow();
     // the step rolled back atomically: no version row, pre-existing objects
     // untouched (the table/index were planted OUTSIDE the runner).
     const v = await conn.query(`SELECT count(*)::int AS n FROM schema_migrations`);
@@ -533,30 +541,30 @@ describe('release-migration runner', () => {
     const t = await conn.query(`SELECT to_regclass('partial_leak') AS r, to_regclass('partial_idx') AS i`);
     expect(t.rows[0]?.['r']).toBe('partial_leak');
     expect(t.rows[0]?.['i']).toBe('partial_idx');
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     await pg.close();
   });
 
   it('version-record integrity: foreign history refuses before any step (squatter class)', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     await conn.query(`UPDATE schema_migrations SET sha256 = 'deadbeef' WHERE version = '0001'`);
-    await expect(runMigrations(conn, { deployment: 'staging' })).rejects.toThrow(/INTEGRITY refusal/);
+    await expect(stagingRunMigrations(conn, { deployment: 'staging' })).rejects.toThrow(/INTEGRITY refusal/);
     await expect(assertSchemaCurrent(conn)).rejects.toThrow(/fail-closed/);
     await pg.close();
   });
 
   it('guard primitives: assertion hard-fails inside the tx and rolls the step back', async () => {
     const { pg, conn } = await freshDb();
-    await runMigrations(conn, { deployment: 'staging' });
+    await stagingRunMigrations(conn, { deployment: 'staging' });
     await conn.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u1', 'o1', '+972555111111', '{}')`);
     const guarded = step('0004', 'guarded-index', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique_guarded' }, {
       xactLockKey: 4242,
       lockTables: ['users'],
       assertions: [{ kind: 'table-empty', table: 'users' }],
     });
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, guarded] })).rejects.toThrow(/ASSERTION refusal - guard 'table-empty'/);
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, guarded] })).rejects.toThrow(/ASSERTION refusal - guard 'table-empty'/);
     const idx = await conn.query(`SELECT to_regclass('users_phone_unique_guarded') AS r`);
     expect(idx.rows[0]?.['r']).toBeNull(); // artifact never applied
     const v = await conn.query(`SELECT count(*)::int AS n FROM schema_migrations WHERE version = '0004'`);
@@ -571,7 +579,7 @@ describe('release-migration runner', () => {
       lockTables: ['users'],
       assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim' }],
     });
-    const r = await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
+    const r = await stagingRunMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, sa] });
     expect(r.appliedNow).toEqual(['0001', '0002', '0003', '0004']);
     const idx = await conn.query(`SELECT to_regclass('users_phone_unique_v2') AS r`);
     expect(idx.rows[0]?.['r']).toBe('users_phone_unique_v2');
@@ -582,16 +590,16 @@ describe('release-migration runner', () => {
     const { pg: pg2, conn: conn2 } = await freshDb();
     await runMigrations(conn2, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
     await conn2.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('a', 'o', '+972555111111', '{}'), ('b', 'o', ' +972555111111 ', '{}')`);
-    await expect(runMigrations(conn2, { deployment: 'staging', migrations: [...MIGRATIONS, sa] })).rejects.toThrow(/ASSERTION refusal - guard 'no-duplicates'/);
+    await expect(stagingRunMigrations(conn2, { deployment: 'staging', migrations: [...MIGRATIONS, sa] })).rejects.toThrow(/ASSERTION refusal - guard 'no-duplicates'/);
     await pg2.close();
     await pg.close();
   });
 
   it('rejects a non-sequential registry and invalid primitive declarations', async () => {
     const { pg, conn } = await freshDb();
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [step('0007', 'x', 'ddl.create-index', SA_PARAMS)] })).rejects.toThrow(/strictly sequential/);
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', SA_PARAMS, { lockTables: ['evil; DROP TABLE users'] })] })).rejects.toThrow(/invalid lockTables/);
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, table: 'users; DROP' })] })).rejects.toThrow(/TEMPLATE refusal/);
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', migrations: [step('0007', 'x', 'ddl.create-index', SA_PARAMS)] })).rejects.toThrow(/strictly sequential/);
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', SA_PARAMS, { lockTables: ['evil; DROP TABLE users'] })] })).rejects.toThrow(/invalid lockTables/);
+    await expect(stagingRunMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, table: 'users; DROP' })] })).rejects.toThrow(/TEMPLATE refusal/);
     await pg.close();
   });
 
