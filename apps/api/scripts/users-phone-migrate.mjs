@@ -34,7 +34,7 @@
 import { readFile, lstat, realpath } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
 import { Pool } from 'pg';
-import { assertAuthAllowed, backupUsers, migrateUsersPhone, parseBackupEnv, parseBackupKeyId, parseBackupMacKey, restoreUsers } from '../dist/services/phone-migration.js';
+import { backupUsers, migrateUsersPhone, parseBackupEnv, parseBackupKeyId, parseBackupMacKey, parseDeploymentTuples, restoreUsers, validateBackupArtifact } from '../dist/services/phone-migration.js';
 import { publishBackupFile } from '../dist/services/backup-publisher.js';
 import { parseMigrateCliArgs } from '../dist/services/phone-migration-cli-args.js';
 
@@ -53,15 +53,17 @@ if (!key || !keyId || !env) {
   process.exit(64);
 }
 let auth;
+let allowed;
 try {
   auth = { key, keyId: parseBackupKeyId(keyId), env: parseBackupEnv(env) };
   parseBackupMacKey(key); // canonical + strength; errors name the CLASS only, never the value
-  // AUTHORITATIVE allowlist gate (v7): deployment ID + key version must be
-  // explicitly allowlisted for the RESOLVED deployment, provisioned as
-  // managed per-deployment config - not merely syntactically valid.
-  const allowedEnvs = (process.env['CONTAKE_BACKUP_ALLOWED_ENVS'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
-  const allowedKeyIds = (process.env['CONTAKE_BACKUP_ALLOWED_KEY_IDS'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
-  assertAuthAllowed(auth, { allowedEnvs, allowedKeyIds });
+  // AUTHORITATIVE ACTUAL-DB binding (v8): approved (deployment ID, ACTUAL
+  // database identity, key versions) tuples from the managed secret store.
+  // The database identity is resolved LIVE from the connection under lock
+  // inside the service - never trusted from here. Ambiguous config (one
+  // env ID bound twice) and shared config (one DB bound to two env IDs)
+  // are rejected at parse time.
+  allowed = parseDeploymentTuples(JSON.parse(process.env['CONTAKE_BACKUP_ALLOWED_TUPLES'] ?? '[]'));
 } catch (e) {
   console.error(`FATAL: artifact MAC credentials invalid: ${e.message}`);
   process.exit(64);
@@ -85,13 +87,22 @@ if (args.restore) {
     console.error('FATAL: --backup and --restore resolve to the SAME actual file (alias/hard-link/relative) - refused');
     process.exit(64);
   }
+  // HARD-LINK identity (security v8): compare device/inode, not strings -
+  // a hard-linked --backup target IS the restore input even when paths differ.
+  if (args.backup) {
+    const sb = await lstat(args.backup).catch(() => undefined);
+    if (sb && sb.dev === st.dev && sb.ino === st.ino) {
+      console.error('FATAL: --backup and --restore are the SAME inode (hard link) - refused');
+      process.exit(64);
+    }
+  }
 }
 
 const pool = new Pool({ connectionString: args.databaseUrl });
 try {
   if (args.backup) {
     const lines = [];
-    await backupUsers(pool, (l) => lines.push(l), { auth });
+    await backupUsers(pool, (l) => lines.push(l), { auth, allowed });
     let n;
     try {
       n = await publishBackupFile(args.backup, lines, { auth });
@@ -107,14 +118,18 @@ try {
   }
   if (args.restore) {
     const artifactLines = (await readFile(args.restore, 'utf8')).split('\n').filter(Boolean);
-    const peek = JSON.parse(artifactLines[0]);
-    console.log(`restore: applying backupId=${peek.backupId} createdAt=${peek.createdAt} env=${peek.env} keyId=${peek.keyId}`);
+    // AUTHENTICATE BEFORE ANY OUTPUT (QA v8): nothing from the artifact
+    // is printed until structure + MAC have verified; every printed field
+    // is a strict printable canonical value (128-bit backupId, canonical
+    // createdAt, bounded keyId/env) - raw untrusted bytes are never echoed.
+    const v = validateBackupArtifact(artifactLines, auth);
+    console.log(`restore: applying backupId=${v.header.backupId} createdAt=${v.header.createdAt} env=${v.header.env} keyId=${v.header.keyId}`);
     console.error('MANDATORY OPERATOR GATE: replay/freshness is NOT mechanically prevented - a human operator MUST have approved THIS backupId for THIS deployment/database before this restore runs.');
-    const r = await restoreUsers(pool, artifactLines, auth);
+    const r = await restoreUsers(pool, artifactLines, auth, { allowed });
     console.log(`restore: ${r.restoredRows} rows written back; post-backup rows removed explicitly: [${r.removedPostBackupRows.join(', ')}]; index recreated=${r.indexRestored} (canonical statement only); verified=${r.verified}`);
   }
   if (args.maintenance) {
-    const r = await migrateUsersPhone(pool);
+    const r = await migrateUsersPhone(pool, { auth, allowed });
     if (!r.migrated) {
       console.error(`maintenance: ABORTED - preflight blocking under lock: ${r.preflight.blockingReasons.join('; ')}`);
       console.error(JSON.stringify({ collisionGroups: r.preflight.collisionGroups, inconsistentRows: r.preflight.inconsistentRows }, null, 2));
@@ -123,4 +138,10 @@ try {
     }
     console.log(`maintenance: migrated under advisory + table lock - normalized=${r.normalized}; index present=${r.indexPresent}; final preflight clean=${!r.finalPreflight.blocking}`);
   }
+} catch (e) {
+  if (e && /artifact auth:|deployment tuples:/.test(String(e.message))) {
+    console.error(`FATAL: authoritative gate refused: ${e.message}`);
+    process.exit(64);
+  }
+  throw e;
 } finally { await pool.end(); }

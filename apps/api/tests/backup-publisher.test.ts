@@ -17,7 +17,7 @@ const makeLines = async (auth: ArtifactAuth, row = { user_id: 'u-1', org_id: 'o-
   const { rowDigest, manifestDigest, artifactMac } = await import('../src/services/phone-migration.js');
   const digests = [rowDigest(row)];
   const base = { type: 'users-phone-backup-header' as const, version: 2 as const, createdAt: new Date().toISOString(), rowCount: 1, usersPhoneUniqueIndex: { existed: false, definition: null } };
-  const sans = { ...base, manifestSha256: manifestDigest(base, digests), backupId: `bkp-${base.createdAt}-abcd1234`, keyId: auth.keyId, env: auth.env };
+  const sans = { ...base, manifestSha256: manifestDigest(base, digests), backupId: `bkp-${randomBytes(16).toString('hex')}`, keyId: auth.keyId, env: auth.env };
   const rows = [{ ...row, rowSha256: digests[0]! }];
   return [JSON.stringify({ ...sans, macSha256: artifactMac(auth.key, sans, rows) }), JSON.stringify(rows[0])];
 };
@@ -74,14 +74,30 @@ describe('canonical MAC key + bounded ids (v6)', () => {
   });
 });
 
-describe('authoritative deployment/key allowlist gate (v7)', () => {
-  it('accepts allowlisted env + key version; rejects non-allowlisted and empty lists', async () => {
-    const { assertAuthAllowed } = await import('../src/services/phone-migration.js');
+describe('authoritative ACTUAL-DB deployment tuples (v8)', () => {
+  it('parse: accepts canonical tuples; rejects empty, malformed, AMBIGUOUS (env twice) and SHARED (db twice) config', async () => {
+    const { parseDeploymentTuples } = await import('../src/services/phone-migration.js');
+    const ok = parseDeploymentTuples([{ env: 'test-deploy-01', db: 'postgres@127.0.0.1:55432', keyIds: ['test-key-v1'] }]);
+    expect(ok[0]!.db).toBe('postgres@127.0.0.1:55432');
+    expect(() => parseDeploymentTuples([])).toThrow(/EMPTY/);
+    expect(() => parseDeploymentTuples([{ env: 'x', db: 'y' }])).toThrow(/malformed/);
+    expect(() => parseDeploymentTuples([
+      { env: 'test-deploy-01', db: 'a@h:1', keyIds: ['test-key-v1'] },
+      { env: 'test-deploy-01', db: 'b@h:1', keyIds: ['test-key-v1'] }])).toThrow(/AMBIGUOUS/);
+    expect(() => parseDeploymentTuples([
+      { env: 'test-deploy-01', db: 'a@h:1', keyIds: ['test-key-v1'] },
+      { env: 'test-deploy-02', db: 'a@h:1', keyIds: ['test-key-v1'] }])).toThrow(/SHARED/);
+  });
+
+  it('gate: accepts the exact approved tuple; rejects unbound env, wrong resolved DB identity, unapproved key version, missing tuples', async () => {
+    const { assertDeploymentAllowed, requireDeploymentTuples } = await import('../src/services/phone-migration.js');
     const a = auth();
-    assertAuthAllowed(a, { allowedEnvs: ['test-deploy-01', 'test-deploy-02'], allowedKeyIds: ['test-key-v1'] });
-    expect(() => assertAuthAllowed(a, { allowedEnvs: ['other-deploy'], allowedKeyIds: ['test-key-v1'] })).toThrow(/NOT in the authoritative allowlist/);
-    expect(() => assertAuthAllowed(a, { allowedEnvs: ['test-deploy-01'], allowedKeyIds: ['test-key-v9'] })).toThrow(/NOT in the authoritative allowlist/);
-    expect(() => assertAuthAllowed(a, { allowedEnvs: [], allowedKeyIds: [] })).toThrow(/allowlist is EMPTY/);
+    const tuples = [{ env: 'test-deploy-01', db: 'postgres@127.0.0.1:55432', keyIds: ['test-key-v1'] }];
+    assertDeploymentAllowed(a, 'postgres@127.0.0.1:55432', tuples);
+    expect(() => assertDeploymentAllowed(a, 'otherdb@127.0.0.1:55432', tuples)).toThrow(/RESOLVED database identity does NOT match/);
+    expect(() => assertDeploymentAllowed({ ...a, env: 'other-deploy-01' }, 'postgres@127.0.0.1:55432', tuples)).toThrow(/NO authoritative approved tuple/);
+    expect(() => assertDeploymentAllowed({ ...a, keyId: 'test-key-v9' }, 'postgres@127.0.0.1:55432', tuples)).toThrow(/NOT approved for the authoritative/);
+    expect(() => requireDeploymentTuples(undefined)).toThrow(/REQUIRED/);
   });
 });
 
@@ -175,7 +191,17 @@ describe('durable race-safe publication (v6)', () => {
     await publishBackupFile(file, lines, { auth: a }, { fsyncDir: async () => { const e = new Error('x') as NodeJS.ErrnoException; e.code = 'EINVAL'; throw e; } });
     expect(existsSync(file)).toBe(true);
     const file2 = join(dir, 'c.jsonl');
-    await expect(publishBackupFile(file2, lines, { auth: a }, { fsyncDir: async () => { const e = new Error('disk gone') as NodeJS.ErrnoException; e.code = 'EIO'; throw e; } })).rejects.toThrow(/disk gone/);
+    // v8: a PERSISTENT real dir-fsync error (also failing on the cleanup
+    // fsync) makes durable absence unprovable -> explicit INDETERMINATE
+    // status with the original error as cause; the file is still cleaned.
+    const { PublishIndeterminateError } = await import('../src/services/backup-publisher.js');
+    let ind: unknown;
+    try {
+      await publishBackupFile(file2, lines, { auth: a }, { fsyncDir: async () => { const e = new Error('disk gone') as NodeJS.ErrnoException; e.code = 'EIO'; throw e; } });
+    } catch (e) { ind = e; }
+    expect(ind).toBeInstanceOf(PublishIndeterminateError);
+    expect(((ind as { cause?: Error }).cause)?.message).toMatch(/disk gone/);
+    expect((ind as InstanceType<typeof PublishIndeterminateError>).reconciliation.finalContentVerified).toBe(true);
     expect(existsSync(file2)).toBe(false);
     expect(readdirSync(dir).filter(f => f.includes('.tmp-')).length).toBe(0);
   });

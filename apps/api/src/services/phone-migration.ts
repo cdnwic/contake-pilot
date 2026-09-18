@@ -278,20 +278,68 @@ export const requireAuth = (auth: ArtifactAuth | undefined): ArtifactAuth => {
   return auth;
 };
 
-/** Authoritative allowlist gate (QA 2026-09-18 v7): the deployment ID and
- *  key VERSION must be explicitly allowlisted for the RESOLVED deployment
- *  (managed per-deployment config), not merely syntactically valid. The
- *  CLI provisions both lists from the managed secret store. */
-export const assertAuthAllowed = (auth: ArtifactAuth, allowed: { allowedEnvs: readonly string[]; allowedKeyIds: readonly string[] }): void => {
-  if (allowed.allowedEnvs.length === 0 || allowed.allowedKeyIds.length === 0) {
-    throw new Error('artifact auth: authoritative allowlist is EMPTY - provision the per-deployment allowed env IDs and key versions from the managed secret store');
+/** Authoritative ACTUAL-DB binding (QA+security 2026-09-18 v8): an
+ *  approved tuple binds ONE deployment ID to the ONE actual database
+ *  identity (resolved live from the connection under lock) plus its
+ *  approved key versions. Ambiguous config (the same env ID bound to
+ *  more than one database) and shared config (the same database bound
+ *  to more than one env ID) are REJECTED at config-validation time. */
+export interface DeploymentTuple { env: string; db: string; keyIds: string[] }
+
+/** Stable identity of the RESOLVED connection, retrieved under lock:
+ *  current_database() + server endpoint (local sockets resolve 'local'). */
+export const resolveDbIdentity = async (c: { query: Connectable['query'] }): Promise<string> => {
+  const r = await c.query(`SELECT current_database() AS db, COALESCE(host(inet_server_addr()), 'local') AS host, COALESCE(inet_server_port()::text, 'local') AS port`);
+  const row = r.rows[0] as { db: string; host: string; port: string };
+  return `${row.db}@${row.host}:${row.port}`;
+};
+
+export const parseDeploymentTuples = (raw: unknown): DeploymentTuple[] => {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error('deployment tuples: authoritative config is EMPTY - provision approved (deployment ID, actual database identity, key versions) tuples from the managed secret store');
   }
-  if (!allowed.allowedEnvs.includes(auth.env)) {
-    throw new Error(`artifact auth: deployment ID "${auth.env}" is NOT in the authoritative allowlist for the resolved database - refused`);
+  const tuples = raw.map((t, i) => {
+    const o = t as Record<string, unknown>;
+    if (typeof o?.['env'] !== 'string' || typeof o?.['db'] !== 'string' || !Array.isArray(o?.['keyIds']) || (o['keyIds'] as unknown[]).length === 0) {
+      throw new Error(`deployment tuples: entry ${i + 1} malformed (need {env, db, keyIds[]})`);
+    }
+    parseBackupEnv(o['env']);
+    if (!/^[A-Za-z0-9._-]+@[A-Za-z0-9:._/-]+$/.test(o['db'])) { // opaque identity; IPv6 hosts carry colons
+      throw new Error(`deployment tuples: entry ${i + 1} db identity is not the canonical <database>@<host>:<port> form`);
+    }
+    (o['keyIds'] as unknown[]).forEach(k => { if (typeof k !== 'string') throw new Error(`deployment tuples: entry ${i + 1} keyIds must be strings`); parseBackupKeyId(k as string); });
+    return { env: o['env'], db: o['db'], keyIds: [...(o['keyIds'] as string[])] };
+  });
+  const envs = tuples.map(t => t.env);
+  if (new Set(envs).size !== envs.length) {
+    throw new Error('deployment tuples: AMBIGUOUS config - the same deployment ID is bound more than once; exactly ONE actual database per deployment ID is allowed');
   }
-  if (!allowed.allowedKeyIds.includes(auth.keyId)) {
-    throw new Error(`artifact auth: key version "${auth.keyId}" is NOT in the authoritative allowlist for the resolved database - refused`);
+  const dbs = tuples.map(t => t.db);
+  if (new Set(dbs).size !== dbs.length) {
+    throw new Error('deployment tuples: SHARED config - the same database identity is bound to more than one deployment ID; database identities are never shared');
   }
+  return tuples;
+};
+
+/** Gate executed UNDER LOCK against the LIVE resolved identity. */
+export const assertDeploymentAllowed = (auth: ArtifactAuth, dbIdentity: string, tuples: readonly DeploymentTuple[]): void => {
+  const t = tuples.find(x => x.env === auth.env);
+  if (!t) throw new Error(`artifact auth: deployment ID "${auth.env}" has NO authoritative approved tuple - refused`);
+  if (t.db !== dbIdentity) {
+    throw new Error(`artifact auth: the RESOLVED database identity does NOT match the authoritative binding for deployment "${auth.env}" (cross-database replay/ambiguous target) - refused`);
+  }
+  if (!t.keyIds.includes(auth.keyId)) {
+    throw new Error(`artifact auth: key version "${auth.keyId}" is NOT approved for the authoritative deployment/database tuple - refused`);
+  }
+};
+
+/** requireAuth + required authoritative tuples (v8): artifact operations
+ *  are impossible without both. */
+export const requireDeploymentTuples = (allowed: readonly DeploymentTuple[] | undefined): readonly DeploymentTuple[] => {
+  if (!allowed || allowed.length === 0) {
+    throw new Error('artifact auth: authoritative deployment tuples are REQUIRED (approved env ID + actual database identity + key versions from the managed secret store)');
+  }
+  return allowed;
 };
 
 /** HMAC-SHA256 over the FULL canonical artifact content: the header
@@ -417,11 +465,15 @@ const indexState = async (c: { query: Connectable['query'] }): Promise<{ existed
  *  mutation BLOCKS for the backup's duration. Emits a v2 header (row
  *  count, index state as existence + evidence, manifest, keyId, env, MAC)
  *  then every users row as JSONL with a canonical full-row digest. */
-export async function backupUsers(conn: Connectable, sink: (line: string) => void, opts: { now?: () => Date; auth: ArtifactAuth }): Promise<number> {
+export async function backupUsers(conn: Connectable, sink: (line: string) => void, opts: { now?: () => Date; auth: ArtifactAuth; allowed?: readonly DeploymentTuple[] }): Promise<number> {
   const auth = requireAuth(opts.auth);
+  const allowed = requireDeploymentTuples(opts.allowed);
   const now = opts.now ?? (() => new Date());
   return withTx(conn, async c => {
     await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`); // 1st: advisory
+    // authoritative ACTUAL-DB binding UNDER LOCK (v8): identity resolved
+    // live from THIS connection before any data is read or mutated
+    assertDeploymentAllowed(auth, await resolveDbIdentity(c), allowed);
     await c.query(`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`); // 2nd: table (blocks row AND schema mutation)
     const r = await c.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
     const rows = r.rows as unknown as BackupRow[];
@@ -430,7 +482,7 @@ export async function backupUsers(conn: Connectable, sink: (line: string) => voi
       type: 'users-phone-backup-header' as const, version: 2 as const, createdAt: now().toISOString(),
       rowCount: rows.length, usersPhoneUniqueIndex: await indexState(c),
     };
-    const headerSansMac = { ...base, manifestSha256: manifestDigest(base, digests), backupId: `bkp-${base.createdAt}-${randomBytes(4).toString('hex')}`, keyId: auth.keyId, env: auth.env };
+    const headerSansMac = { ...base, manifestSha256: manifestDigest(base, digests), backupId: `bkp-${randomBytes(16).toString('hex')}`, keyId: auth.keyId, env: auth.env };
     const rowLines = rows.map((row, i) => ({ ...row, rowSha256: digests[i]! }));
     const header: BackupHeader = { ...headerSansMac, macSha256: artifactMac(auth.key, headerSansMac, rowLines) };
     sink(JSON.stringify(header));
@@ -463,9 +515,15 @@ export function validateBackupArtifact(lines: string[], auth: ArtifactAuth): Val
       typeof header.macSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(header.macSha256)) {
     throw new Error('restore: unsigned artifact (missing keyId/env/macSha256) - refused');
   }
-  if (typeof header.backupId !== 'string' || !/^bkp-\S{10,80}$/.test(header.backupId)) {
-    throw new Error('restore: backupId missing/invalid (freshness/replay evidence) - refused');
+  // backupId is a canonical >=128-bit random identity (security v8),
+  // STRICT PRINTABLE form - control/ESC/newline/bidi bytes never pass.
+  if (typeof header.backupId !== 'string' || !/^bkp-[0-9a-f]{32}$/.test(header.backupId)) {
+    throw new Error('restore: backupId missing/invalid (canonical 128-bit identity required; freshness/replay evidence) - refused');
   }
+  // Strict printable canonical keyId/env on the ARTIFACT values too
+  // (QA v8): validated before any comparison and NEVER echoed raw.
+  try { parseBackupKeyId(header.keyId); parseBackupEnv(header.env); }
+  catch { throw new Error('restore: artifact keyId/env are not strict printable canonical identifiers - refused'); }
   // createdAt must be a FINITE CANONICAL timestamp (exact ISO-8601 UTC
   // round-trip): freshness evidence the operator gate can rely on.
   if (typeof header.createdAt !== 'string' ||
@@ -475,8 +533,8 @@ export function validateBackupArtifact(lines: string[], auth: ArtifactAuth): Val
     throw new Error('restore: createdAt is not a finite canonical timestamp (freshness evidence untrustworthy) - refused');
   }
   requireAuth(auth);
-  if (header.keyId !== auth.keyId) throw new Error(`restore: key version mismatch (artifact keyId "${header.keyId}" != provided "${auth.keyId}")`);
-  if (header.env !== auth.env) throw new Error(`restore: cross-environment replay refused (artifact env "${header.env}" != provided "${auth.env}")`);
+  if (header.keyId !== auth.keyId) throw new Error('restore: key version mismatch (artifact keyId does not match the provided key version)');
+  if (header.env !== auth.env) throw new Error('restore: cross-environment replay refused (artifact env does not match the provided deployment ID)');
   const rowsForMac = parsed.slice(1) as Record<string, unknown>[];
   const { macSha256, ...headerSansMac } = header as unknown as Record<string, unknown> & { macSha256: string };
   const expected = artifactMac(auth.key, headerSansMac, rowsForMac);
@@ -538,12 +596,15 @@ export interface RestoreResult {
  *  - final verification inside the tx: exact row count, exact id set, and
  *    per-row org_id/email/phone/data-sha256 against the artifact, plus the
  *    index definition/absence. */
-export async function restoreUsers(conn: Connectable, lines: string[], auth: ArtifactAuth): Promise<RestoreResult> {
+export async function restoreUsers(conn: Connectable, lines: string[], auth: ArtifactAuth, opts?: { allowed?: readonly DeploymentTuple[] }): Promise<RestoreResult> {
   const { header, rows } = validateBackupArtifact(lines, auth); // BEFORE any mutation
+  const allowed = requireDeploymentTuples(opts?.allowed);
   const artifactIds = new Set(rows.map(r => r.user_id));
   return withTx(conn, async c => {
     // ONE documented lock order (security 2026-09-18): advisory FIRST...
     await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`);
+    // authoritative ACTUAL-DB binding UNDER LOCK (v8) before any mutation
+    assertDeploymentAllowed(requireAuth(auth), await resolveDbIdentity(c), allowed);
     // ...then the table lock: real write exclusion (blocks app writers)
     await c.query(`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`);
     // schema first: make the target state reachable
@@ -656,9 +717,14 @@ export type MaintenanceResult =
  *  creation, final preflight - so no concurrent writer can slip a collision
  *  between the check and the index. ANY blocking state or failure rolls
  *  back EVERYTHING (rows and schema unchanged). */
-export async function migrateUsersPhone(conn: Connectable): Promise<MaintenanceResult> {
+export async function migrateUsersPhone(conn: Connectable, opts?: { auth?: ArtifactAuth; allowed?: readonly DeploymentTuple[] }): Promise<MaintenanceResult> {
   return withTx(conn, async c => {
     await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`); // 'users-phone-migration'
+    // when credentials are provided, the authoritative ACTUAL-DB binding
+    // is enforced UNDER LOCK before any mutation (v8)
+    if (opts?.auth !== undefined) {
+      assertDeploymentAllowed(requireAuth(opts.auth), await resolveDbIdentity(c), requireDeploymentTuples(opts.allowed));
+    }
     // REAL write exclusion (security 2026-09-18): blocks application
     // INSERT/UPDATE/DELETE (ROW EXCLUSIVE) for the whole transaction, so no
     // writer can slip a collision between preflight and index creation.
