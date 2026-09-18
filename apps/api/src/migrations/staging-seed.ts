@@ -104,9 +104,16 @@ export function canonicalJson(v: unknown): string {
 
 export const rowDigest = (row: unknown): string => createHash('sha256').update(canonicalJson(row)).digest('hex');
 
-/** Canonical manifest over the ordered (table, pk, digest) row set. */
-export const manifestDigest = (rows: readonly { table: string; pk: string; digest: string }[]): string =>
-  createHash('sha256').update(canonicalJson(rows)).digest('hex');
+/** Canonical manifest over the ordered (table, pk, digest) row set AND the
+ *  zero-row business tables (independent security: exact rerun must cover ALL
+ *  application business tables - exact seeded rows in the intended tables and
+ *  ZERO rows everywhere else, except explicit bookkeeping). */
+export const manifestDigest = (manifest: { rows: readonly { table: string; pk: string; digest: string }[]; emptyTables: readonly string[] }): string =>
+  createHash('sha256').update(canonicalJson(manifest)).digest('hex');
+
+/** Explicit bookkeeping tables owned by the runner/seed (excluded from the
+ *  zero-row business-table proof). */
+export const SEED_BOOKKEEPING_TABLES: readonly string[] = ['contake_db_identity', 'schema_migrations', 'staging_seed_state'];
 
 /** Business tables written by the seed, with their primary-key column, in
  *  canonical order (rerun-integrity scans use exactly this list). */
@@ -131,7 +138,7 @@ export interface StagingSeedOptions {
 }
 
 export interface StagingInventory {
-  schema: 'contake-staging-inventory/v2';
+  schema: 'contake-staging-inventory/v3';
   seedInstanceId: string;
   deployment: string;
   dbInstanceId: string;
@@ -148,6 +155,8 @@ export interface StagingInventory {
   counts: Record<string, number>;
   /** Canonical per-row digests of every seeded row (rerun-integrity proof). */
   rowDigests: { table: string; pk: string; digest: string }[];
+  /** Every other public business table, verified to carry ZERO rows. */
+  emptyTables: string[];
   manifestSha256: string;
   absenceProof: {
     fixtureIdentifiersChecked: number;
@@ -186,9 +195,15 @@ CREATE TABLE IF NOT EXISTS staging_seed_state(
 );
 `;
 
-/** Recomputes the canonical row-digest manifest over the LIVE business rows. */
+export interface LiveManifest { rows: { table: string; pk: string; digest: string }[]; emptyTables: string[] }
+
+/** Recomputes the canonical manifest over the LIVE database: exact row
+ *  digests for every seeded table PLUS the verified-zero-row list of every
+ *  other public business table (all application tables except explicit
+ *  bookkeeping). A non-seeded business table carrying ANY row throws -
+ *  foreign state, not a manifest detail. */
 async function computeLiveManifest(tx: { query(t: string, p?: unknown[]): Promise<{ rows: Record<string, unknown>[] }> }):
-  Promise<{ table: string; pk: string; digest: string }[]> {
+  Promise<LiveManifest> {
   const rows: { table: string; pk: string; digest: string }[] = [];
   for (const { table, pk } of SEEDED_TABLES) {
     const r = await tx.query(`SELECT ${pk}::text AS pk, data FROM ${table} ORDER BY ${pk}`);
@@ -196,7 +211,24 @@ async function computeLiveManifest(tx: { query(t: string, p?: unknown[]): Promis
       rows.push({ table, pk: String(row['pk']), digest: rowDigest(row['data']) });
     }
   }
-  return rows;
+  const others = await tx.query(
+    `SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+       AND tablename <> ALL($1::text[]) AND tablename <> ALL($2::text[]) ORDER BY tablename`,
+    [SEEDED_TABLES.map(t => t.table), [...SEED_BOOKKEEPING_TABLES]],
+  );
+  const emptyTables: string[] = [];
+  for (const t of others.rows) {
+    const name = String(t['tablename']);
+    const c = await tx.query(`SELECT count(*)::int AS n FROM "${name}"`);
+    if (Number(c.rows[0]?.['n'] ?? 0) > 0) {
+      throw new Error(
+        `seed:staging: FOREIGN STATE refusal - business table ${name} carries rows outside the seeded set ` +
+        `(only ${SEEDED_TABLES.map(t2 => t2.table).join(', ')} may carry seeded rows; bookkeeping: ${SEED_BOOKKEEPING_TABLES.join(', ')}) - rolling back`,
+      );
+    }
+    emptyTables.push(name);
+  }
+  return { rows, emptyTables };
 }
 
 export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions): Promise<StagingSeedResult> {
@@ -247,7 +279,7 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
       if (liveManifest !== String(state.rows[0]['manifest_sha256'])) {
         throw new Error(
           'seed:staging: RERUN INTEGRITY refusal - live rows no longer match the seeded canonical manifest ' +
-          '(drift/dirty/foreign state; investigate or rebuild the staging database) - rolling back',
+          '(exact seeded rows in intended tables + zero rows elsewhere; drift/dirty/foreign state; investigate or rebuild the staging database) - rolling back',
         );
       }
       const org = await client.query(`SELECT org_id FROM users LIMIT 1`);
@@ -257,7 +289,7 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
         alreadyApplied: true,
         seedInstanceId: String(state.rows[0]['seed_instance_id']),
         inventory: {
-          schema: 'contake-staging-inventory/v2',
+          schema: 'contake-staging-inventory/v3',
           seedInstanceId: String(state.rows[0]['seed_instance_id']),
           deployment: identity.deploymentLabel,
           dbInstanceId: identity.instanceId,
@@ -266,22 +298,30 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
           userIds: [], emails: [], phones: [], channelAddresses: [],
           eventIds: [], resourceIds: [], taskIds: [], dependencyIds: [],
           counts: {},
-          rowDigests: live,
+          rowDigests: live.rows,
+          emptyTables: live.emptyTables,
           manifestSha256: liveManifest,
           absenceProof: {
             fixtureIdentifiersChecked: fixtureForbidden.length,
             forbiddenIdentifiersChecked: envForbidden.length,
             collisions: [],
-            method: 'exact rerun: live canonical row digests recomputed and verified equal to the stored manifest',
+            method: 'exact rerun: live canonical row digests over every seeded table + verified zero rows in every other business table, equal to the stored manifest',
           },
           inventorySha256: String(state.rows[0]['inventory_sha256']),
         },
       };
     }
-    for (const { table } of SEEDED_TABLES) {
-      const c = await client.query(`SELECT count(*)::int AS n FROM ${table}`);
-      if (Number(c.rows[0]?.['n'] ?? 0) > 0) {
-        throw new Error(`seed:staging: table ${table} is not empty and no staging_seed_state exists - refusing to seed a database with pre-existing data (fail-closed)`);
+    {
+      const others = await client.query(
+        `SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> ALL($1::text[]) ORDER BY tablename`,
+        [[...SEED_BOOKKEEPING_TABLES]],
+      );
+      for (const t of others.rows) {
+        const name = String(t['tablename']);
+        const c = await client.query(`SELECT count(*)::int AS n FROM "${name}"`);
+        if (Number(c.rows[0]?.['n'] ?? 0) > 0) {
+          throw new Error(`seed:staging: table ${name} is not empty and no staging_seed_state exists - refusing to seed a database with pre-existing data (fail-closed)`);
+        }
       }
     }
 
@@ -393,12 +433,14 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
       throw new Error(`seed:staging: POST-WRITE absence proof FAILED - forbidden identifiers present: ${collisions.join(', ')} (rolling back)`);
     }
 
-    // Canonical row-digest manifest (rerun integrity) over the live written rows.
-    const rowDigests = await computeLiveManifest(client);
-    const manifestSha256 = manifestDigest(rowDigests);
+    // Canonical manifest (rerun integrity) over the live written rows AND the
+    // verified zero-row business tables (full coverage).
+    const live = await computeLiveManifest(client);
+    const rowDigests = live.rows;
+    const manifestSha256 = manifestDigest(live);
 
     const inventoryBody: Omit<StagingInventory, 'inventorySha256'> = {
-      schema: 'contake-staging-inventory/v2',
+      schema: 'contake-staging-inventory/v3',
       seedInstanceId: rid('seed'),
       deployment: identity.deploymentLabel,
       dbInstanceId: identity.instanceId,
@@ -418,12 +460,13 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
         dependencies: seed.dependencies.length, whitelist: workers.length,
       },
       rowDigests,
+      emptyTables: live.emptyTables,
       manifestSha256,
       absenceProof: {
         fixtureIdentifiersChecked: fixtureForbidden.length,
         forbiddenIdentifiersChecked: envForbidden.length,
         collisions: [],
-        method: 'pre-write set intersection + post-write per-table equality and boundary-aware jsonb scan over the derived fixture identifier set and env-supplied production identifiers',
+        method: 'pre-write set intersection + post-write per-table equality and boundary-aware jsonb scan over the derived fixture identifier set and env-supplied production identifiers; full business-table coverage: exact seeded rows in intended tables, verified zero rows elsewhere (bookkeeping excluded)',
       },
     };
     const inventorySha256 = createHash('sha256').update(JSON.stringify(inventoryBody)).digest('hex');

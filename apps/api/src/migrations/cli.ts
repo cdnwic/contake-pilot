@@ -10,8 +10,12 @@
  *  - ONE deliberate URL source (--database-url XOR env);
  *  - the OPERATOR-PROVISIONED TARGET TUPLE (--expect-host/--expect-db) must
  *    match the URL AND the actually-connected database BEFORE any DDL;
- *  - the deployment label must match the database's stamped identity (first
- *    run stamps it); staging uses `--deployment staging`;
+ *  - the deployment label must match the database's stamped identity. The
+ *    first-run stamp is an OPERATOR-ATTENDED gate (trust-on-first-use), NOT
+ *    authentication: the stamped instance id is printed for out-of-band
+ *    operator verification, and later runs may pin it with
+ *    --expect-instance-id (pre-provisioned immutable binding). Staging uses
+ *    `--deployment staging`;
  *  - requires the DIRECT endpoint ('-pooler' hosts are refused: pooled is the
  *    runtime role); DATABASE_URL is never printed;
  *  - forward-only + applied-step integrity digests; runs zero seeding. */
@@ -20,7 +24,7 @@ import { parseCliArgs, resolveDatabaseUrl, validateActor } from './cli-args.js';
 
 const args = parseCliArgs(process.argv.slice(2), {
   required: ['--deployment', '--expect-host', '--expect-db'],
-  optional: ['--by', '--database-url'],
+  optional: ['--by', '--database-url', '--expect-instance-id'],
 });
 const databaseUrl = resolveDatabaseUrl(args['--database-url'], process.env['DATABASE_URL']);
 const appliedBy = validateActor(args['--by'] ?? 'release-job');
@@ -44,10 +48,24 @@ try {
     throw new Error(`release-migrations: connected database '${String(c.rows[0]?.['db'])}' is not the expected '${args['--expect-db']}' - refusing (fail-closed)`);
   }
   const result = await runMigrations(pool, { deployment: args['--deployment']!, appliedBy });
+  if (args['--expect-instance-id'] !== undefined && result.identity.instanceId !== args['--expect-instance-id']) {
+    throw new Error(
+      `release-migrations: INSTANCE BINDING refusal - operator pinned instance '${args['--expect-instance-id']}' ` +
+      `but this database is stamped '${result.identity.instanceId}'. Refusing to treat it as the provisioned target.`,
+    );
+  }
+  if (result.stampedNow) {
+    console.error(
+      `release-migrations: OPERATOR GATE (first run) - stamped deployment '${result.identity.deploymentLabel}' ` +
+      `instance '${result.identity.instanceId}' on ${target.host}/${target.database}. This stamp is trust-on-first-use, ` +
+      `NOT authentication: verify the target out-of-band NOW and pin later runs with --expect-instance-id ${result.identity.instanceId}.`,
+    );
+  }
   console.log(JSON.stringify({
     ok: true,
     deployment: result.identity.deploymentLabel,
     dbInstanceId: result.identity.instanceId,
+    stampedNow: result.stampedNow,
     appliedNow: result.appliedNow,
     versions: result.versions,
   }));

@@ -13,6 +13,7 @@
  *  Usage: tsx evidence-realpg-release-migrations.mts <phase1|phase2> <socketDirOrHost> <port>
  */
 import { Pool } from 'pg';
+import { randomBytes } from 'node:crypto';
 import {
   MIGRATIONS, assertDirectDatabaseUrl, assertSchemaCurrent, runMigrations, stepDigest, type MigrationStep,
 } from './src/migrations/runner.js';
@@ -28,7 +29,10 @@ const check = (name: string, ok: boolean, detail?: unknown) => {
   (out.checks as unknown[]).push({ name, ok, detail });
   if (!ok) { console.log(JSON.stringify(out, null, 2)); throw new Error(`EVIDENCE FAIL: ${name}`); }
 };
-const CREDS = { adminPassword: 'evidence-admin-pw-0123456789', managerPassword: 'evidence-manager-pw-0123456789' };
+// Evidence-harness credentials are generated EPHEMERALLY at runtime (CSPRNG)
+// and never printed, persisted or committed (independent security).
+const CREDS = { adminPassword: randomBytes(12).toString('base64url'), managerPassword: randomBytes(12).toString('base64url') };
+check('evidence credentials are ephemeral (>=16 chars, runtime-generated)', CREDS.adminPassword.length >= 16 && CREDS.managerPassword.length >= 16);
 
 const admin = mk('postgres');
 if (phase === 'phase1') {
@@ -69,7 +73,8 @@ if (phase === 'phase1') {
   await admin.query(`CREATE DATABASE contake_evidence`);
   const db2 = mk('contake_evidence');
   const failing: MigrationStep = {
-    version: '0001', name: 'partial-ddl', description: 'creates then throws', artifact: 'x',
+    kind: 'fn',
+    version: '0001', name: 'partial-ddl', description: 'creates then throws',
     up: async tx => { await tx.query('CREATE TABLE partial_leak(id int)'); throw new Error('boom'); },
   };
   let threw = false;
@@ -79,6 +84,26 @@ if (phase === 'phase1') {
   check('partial DDL rolled back on REAL postgres', leak.rows[0]?.['r'] === null, leak.rows[0]);
   const vv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations`);
   check('no version row after rollback', Number(vv.rows[0]?.['n']) === 0);
+
+  // 3b) Restricted capability on REAL postgres: tx-control + session-lock escape.
+  const txEscape: MigrationStep = {
+    kind: 'fn',
+    version: '0001', name: 'tx-escape', description: 'attempts COMMIT mid-DDL',
+    up: async tx => { await tx.query('CREATE TABLE escape_leak(id int)'); await tx.query('COMMIT'); },
+  };
+  let escapeRefused = false;
+  try { await runMigrations(db2, { deployment: 'staging', migrations: [txEscape] }); } catch (e) { escapeRefused = /TRANSACTION-CONTROL refusal/.test(String(e)); }
+  check('COMMIT inside a step mechanically rejected', escapeRefused);
+  const el = await db2.query(`SELECT to_regclass('escape_leak') AS r`);
+  check('no partial DDL persists after escape rejection', el.rows[0]?.['r'] === null);
+  const lockEscape: MigrationStep = {
+    kind: 'fn',
+    version: '0001', name: 'lock-escape', description: 'attempts to drop the runner session lock',
+    up: async tx => { await tx.query('SELECT pg_advisory_unlock(841000001)'); },
+  };
+  let lockRefused = false;
+  try { await runMigrations(db2, { deployment: 'staging', migrations: [lockEscape] }); } catch (e) { lockRefused = /SESSION-LOCK refusal/.test(String(e)); }
+  check('session-lock escape mechanically rejected', lockRefused);
 
   // 4) Staging seed on real Postgres: transaction, exact rerun, drift, rollback.
   const sd = mk('contake_seed');

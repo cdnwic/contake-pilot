@@ -23,9 +23,7 @@
  *  hardcoded. */
 import { runStagingSeed, deriveForbiddenIdentifiers } from './staging-seed.js';
 import { assertDirectDatabaseUrl } from './runner.js';
-import { parseCliArgs, resolveDatabaseUrl, assertFreshOutputPath } from './cli-args.js';
-import { writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { parseCliArgs, resolveDatabaseUrl, writeFileExclusive } from './cli-args.js';
 
 const args = parseCliArgs(process.argv.slice(2), {
   required: ['--expect-host', '--expect-db'],
@@ -67,9 +65,8 @@ try {
   const inventoryJson = JSON.stringify(result.inventory, null, 2);
   const out = args['--inventory-out'];
   if (out) {
-    const path = assertFreshOutputPath(out, existsSync);
-    await writeFile(path, inventoryJson, { mode: 0o600 });
-    console.log(`seed:staging: non-secret inventory written to ${path} (manifest sha256 ${result.inventory.manifestSha256})`);
+    writeFileExclusive(out, inventoryJson);
+    console.log(`seed:staging: non-secret inventory written to ${out} (manifest sha256 ${result.inventory.manifestSha256})`);
   } else {
     console.log('seed:staging: non-secret inventory:');
     console.log(inventoryJson);

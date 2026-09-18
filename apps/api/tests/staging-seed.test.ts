@@ -132,9 +132,19 @@ describe('staging synthetic seed', () => {
     const u = await conn.query(`SELECT data FROM users WHERE user_id = $1`, [inv.userIds[0]]);
     const rec = u.rows[0]?.['data'] as { passwordHash?: string };
     expect(verifyPassword(CREDS.adminPassword, rec.passwordHash ?? '')).toBe(true);
-    // Canonical rerun-integrity manifest: every seeded row, digested.
+    // Canonical rerun-integrity manifest: every seeded row digested AND every
+    // other business table verified zero-row (full coverage).
     expect(inv.rowDigests).toHaveLength(23);
     expect(inv.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(inv.emptyTables.length).toBeGreaterThan(0);
+    expect(inv.emptyTables).not.toContain('users');
+    for (const t of ['schema_migrations', 'contake_db_identity', 'staging_seed_state']) {
+      expect(inv.emptyTables).not.toContain(t); // explicit bookkeeping, not business tables
+    }
+    for (const t of inv.emptyTables) {
+      const c = await conn.query(`SELECT count(*)::int AS n FROM "${t}"`);
+      expect(Number(c.rows[0]?.['n']), `business table ${t} must be zero-row`).toBe(0);
+    }
     // Whitelist: synthetic worker phones approved for OTP login.
     const wl = await conn.query(`SELECT phone, status FROM whitelist_entries ORDER BY phone`);
     expect(wl.rows).toHaveLength(3);
@@ -164,18 +174,34 @@ describe('staging synthetic seed', () => {
     await pg.close();
   });
 
+  it('full coverage: rows in a NON-seeded business table are refused as foreign state on rerun', async () => {
+    const { pg, conn } = await stagingDb();
+    await runStagingSeed(conn, { marker: '1', credentials: CREDS });
+    // Foreign write into a business table the seed does not own.
+    await conn.query(`INSERT INTO auth_audit(phone, kind, data) VALUES('+972555000000', 'foreign', '{}')`);
+    await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS })).rejects.toThrow(/FOREIGN STATE refusal/);
+    await pg.close();
+  });
+
+  it('full coverage: first run refuses a database with rows in ANY business table, not just seeded ones', async () => {
+    const { pg, conn } = await stagingDb();
+    await conn.query(`INSERT INTO auth_audit(phone, kind, data) VALUES('+972555000001', 'foreign', '{}')`);
+    await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS })).rejects.toThrow(/not empty/);
+    await pg.close();
+  });
+
   it('pre-vaulted credentials are used and never echoed anywhere', async () => {
     const { pg, conn } = await stagingDb();
     const r = await runStagingSeed(conn, {
       marker: '1',
-      credentials: { adminPassword: 'pre-vaulted-admin-pw-1', managerPassword: 'pre-vaulted-fm-pw-1' },
+      credentials: { adminPassword: CREDS.adminPassword, managerPassword: CREDS.managerPassword },
     });
     expect('secrets' in r).toBe(false);
-    expect(JSON.stringify(r.inventory)).not.toContain('pre-vaulted-admin-pw-1');
-    expect(JSON.stringify(r.inventory)).not.toContain('pre-vaulted-fm-pw-1');
+    expect(JSON.stringify(r.inventory)).not.toContain(CREDS.adminPassword);
+    expect(JSON.stringify(r.inventory)).not.toContain(CREDS.managerPassword);
     const u = await conn.query(`SELECT data FROM users WHERE user_id = $1`, [r.inventory.userIds[0]]);
     const rec = u.rows[0]?.['data'] as { passwordHash?: string };
-    expect(verifyPassword('pre-vaulted-admin-pw-1', rec.passwordHash ?? '')).toBe(true);
+    expect(verifyPassword(CREDS.adminPassword, rec.passwordHash ?? '')).toBe(true);
     await pg.close();
   });
 

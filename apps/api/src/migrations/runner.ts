@@ -1,6 +1,7 @@
 /** Release-migration runner (architecture convergence 2026-09-18: external
  *  research + TL ruling + QA's SA v8 finding "migrateUsersPhone has no shipped
- *  standard runner/caller"; hardened after independent QA FAIL of f9854cd6).
+ *  standard runner/caller"; hardened after independent QA FAILs of f9854cd6
+ *  and 9182487e).
  *
  *  ONE shared runner owns ALL schema evolution:
  *  - VERSIONED, FORWARD-ONLY migrations with EXPLICIT invocation (12-factor
@@ -9,22 +10,32 @@
  *  - App startup NEVER creates/migrates schema; it calls assertSchemaCurrent()
  *    and FAILS CLOSED on any mismatch (missing table, unknown version, gap,
  *    or integrity drift).
- *  - PER-STEP TRANSACTION (QA stop-ship #1): every step runs on ONE leased
- *    client inside ONE transaction - step body AND its version record commit
+ *  - PER-STEP TRANSACTION (QA #1): every step runs on ONE leased client
+ *    inside ONE transaction - step body AND its version record commit
  *    together or roll back together. Partial DDL can never persist versionless.
- *    A step receives an ALREADY-TRANSACTIONAL client and must NOT begin,
- *    commit or roll back its own transaction (a function step that
- *    self-manages a tx is adapted at registration - see the SA contract).
+ *  - RESTRICTED TX CAPABILITY (QA v2 #2): steps NEVER see the raw client.
+ *    They receive a restricted capability whose query() mechanically REJECTS
+ *    transaction-control statements (BEGIN/START/COMMIT/ROLLBACK/ABORT/END/
+ *    SAVEPOINT/RELEASE/PREPARE TRANSACTION/SET TRANSACTION/SET CONSTRAINTS),
+ *    tolerant of case, whitespace and SQL comment disguise. A step cannot
+ *    escape the runner's transaction; a rejected statement throws, the step
+ *    rolls back, nothing persists.
+ *  - MECHANICALLY BOUND ARTIFACT DIGESTS (QA v2 #1): the integrity digest is
+ *    computed over the EXACT thing that executes, not a caller-declared label:
+ *      * sql steps: the runner executes step.sql verbatim (single query call)
+ *        and hashes step.sql. The hashed bytes ARE the executed bytes.
+ *      * fn steps: the digest covers up.toString() - the exact function source
+ *        that runs. Any implementation-only edit changes the digest and fails
+ *        the runner history check and the boot gate.
  *  - WHOLE-RUN SERIALIZATION: one session-level advisory lock held on the
  *    leased client for the ENTIRE run (bootstrap + every step), so concurrent
  *    runners serialize; the second observes the first's committed history and
  *    becomes a no-op.
- *  - APPLIED-STEP INTEGRITY (QA stop-ship #2): schema_migrations stores
- *    version + name + sha256, where sha256 = digest over the step's ACTUAL
- *    artifact (exact SQL text / implementation source), not editable
- *    metadata. The runner and the boot gate require exact version+name+digest
- *    equality for every applied step. NEVER edit a shipped migration's
- *    artifact - a changed artifact is a new migration version.
+ *  - APPLIED-STEP INTEGRITY (QA #2): schema_migrations stores version + name
+ *    + sha256 (the mechanically bound digest above). The runner and the boot
+ *    gate require exact version+name+digest equality for every applied step.
+ *    NEVER edit a shipped migration - a changed implementation is a new
+ *    migration version.
  *  - ROLE SEPARATION (Neon dual-URL): this runner requires the DIRECT
  *    (schema-owner) endpoint - a '-pooler' host is refused. The runtime app
  *    uses the pooled least-privileged endpoint and never runs this code path.
@@ -34,57 +45,147 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { GRAPH_DDL, OTP_DDL, type Connectable, type Queryable } from '../repo/postgres.js';
 
-export interface MigrationStep {
+/** A migration step is one of two mechanically bound shapes:
+ *  - sql: declarative artifact ONLY. The runner executes `sql` verbatim and
+ *    hashes the same bytes. There is no code path where executed SQL and
+ *    hashed SQL can diverge.
+ *  - fn: an escape hatch for migrations that need programmatic logic (the SA
+ *    users-phone preflight). The digest covers up.toString() - the exact
+ *    source of the function that runs - so an implementation-only edit is an
+ *    integrity failure. fn steps run on the restricted tx capability. */
+interface StepBase {
   /** Zero-padded, strictly increasing ('0001', '0002', ...). */
   readonly version: string;
   readonly name: string;
   readonly description: string;
-  /** The EXACT artifact this migration applies (SQL text / implementation
-   *  source). Hashed into the integrity digest; frozen once shipped. */
-  readonly artifact: string;
-  /** Step body. Runs inside the runner's per-step transaction on an
-   *  already-transactional client: MUST NOT BEGIN/COMMIT/ROLLBACK itself.
-   *  Must be idempotent ONLY in the sense that a retry after full rollback
-   *  succeeds; partial state cannot survive a failure. */
+}
+export interface SqlMigrationStep extends StepBase {
+  readonly kind: 'sql';
+  /** The EXACT SQL text executed verbatim by the runner (and hashed). Frozen
+   *  once shipped: editing it is a new migration version. */
+  readonly sql: string;
+}
+export interface FnMigrationStep extends StepBase {
+  readonly kind: 'fn';
+  /** Step body on the RESTRICTED transaction capability. The digest covers
+   *  this function's exact source (up.toString()). Transaction-control
+   *  statements are mechanically rejected; the runner owns the tx. */
   readonly up: (tx: Queryable) => Promise<void>;
 }
+export type MigrationStep = SqlMigrationStep | FnMigrationStep;
 
-/** Integrity digest over the step's ACTUAL artifact (QA stop-ship #2):
- *  version + name + artifact bytes. Editing the artifact of a shipped
- *  migration changes the digest and FAILS the boot gate / runner history
- *  check - that is the enforcement, not a bug: ship a new version instead. */
-export const stepDigest = (m: Pick<MigrationStep, 'version' | 'name' | 'artifact'>): string =>
-  createHash('sha256').update(`contake-migration/v1\n${m.version}\n${m.name}\n${m.artifact}`).digest('hex');
+/** The bytes a step's integrity digest mechanically binds to: the exact SQL
+ *  text for sql steps, the exact function source for fn steps. */
+export const stepArtifactBytes = (m: MigrationStep): string =>
+  m.kind === 'sql' ? m.sql : m.up.toString();
 
-/** 0001: the schema that used to be applied implicitly at server boot
- *  (PostgresGraphRepository.create graph DDL + createPgOtpState OTP DDL),
- *  extracted into an explicit versioned step. All statements are
- *  IF NOT EXISTS, so pre-migration databases adopt the runner as a no-op
- *  baseline and fresh databases are built fully here. */
-async function applyInitSchema(tx: Queryable): Promise<void> {
-  for (const stmt of `${GRAPH_DDL};${OTP_DDL}`.split(';').map(s => s.trim()).filter(Boolean)) {
-    await tx.query(stmt);
+/** Integrity digest over the step's EXECUTED implementation (QA #2, QA v2 #1):
+ *  version + name + exact-executed bytes. Editing the implementation of a
+ *  shipped migration changes the digest and FAILS the boot gate / runner
+ *  history check - ship a new version instead. */
+export const stepDigest = (m: MigrationStep): string =>
+  createHash('sha256').update(`contake-migration/v2\n${m.version}\n${m.name}\n${stepArtifactBytes(m)}`).digest('hex');
+
+/** Transaction-control statements a step must never issue (the runner owns
+ *  the transaction). Matched per statement after comment stripping, first
+ *  keyword only, case-insensitive (QA v2 #2). */
+const TX_CONTROL = /^(?:begin|start|commit|rollback|abort|end|savepoint|release|prepare\s+transaction|set\s+transaction|set\s+constraints)\b/i;
+
+/** Strips SQL line and block comments (block comments nest in PostgreSQL) so
+ *  comment-disguised transaction control is still caught. String literals are
+ *  NOT parsed: a statement whose first post-comment keyword is transaction
+ *  control is rejected even inside an exotic literal - fail closed. */
+export function stripSqlComments(sql: string): string {
+  let out = '';
+  let i = 0;
+  let depth = 0;
+  while (i < sql.length) {
+    if (depth === 0 && sql.startsWith('--', i)) {
+      const nl = sql.indexOf('\n', i);
+      i = nl === -1 ? sql.length : nl;
+      out += ' ';
+    } else if (sql.startsWith('/*', i)) {
+      depth += 1;
+      i += 2;
+      out += ' ';
+    } else if (depth > 0 && sql.startsWith('*/', i)) {
+      depth -= 1;
+      i += 2;
+      out += ' ';
+    } else {
+      out += depth === 0 ? sql[i] : ' ';
+      i += 1;
+    }
+  }
+  return out;
+}
+
+/** Session-scoped advisory-lock functions a step must never call: unlocking
+ *  would drop the runner's whole-run serialization from inside a step, and
+ *  taking a second session lock mutates session state the runner owns. The
+ *  transaction-scoped family (pg_advisory_xact_lock / pg_try_advisory_xact_lock)
+ *  stays legal - SA's migration body uses it inside the runner's tx. */
+const SESSION_LOCK_ESCAPE = /\bpg_(?:try_)?advisory_(?:lock|unlock|unlock_all)\s*\(/i;
+
+/** Rejects transaction-control statements and session-lock escape anywhere in
+ *  a (possibly multi-statement) SQL text. Throws on the first hit. */
+export function assertNoTransactionControl(sql: string): void {
+  const stripped = stripSqlComments(sql);
+  for (const stmt of stripped.split(';')) {
+    const t = stmt.trim();
+    if (t && TX_CONTROL.test(t)) {
+      throw new Error(
+        `release-migrations: TRANSACTION-CONTROL refusal - a migration step attempted ${JSON.stringify(t.slice(0, 40))}... ` +
+        `The runner owns the transaction; steps receive a restricted capability and cannot BEGIN/COMMIT/ROLLBACK/SAVEPOINT/... themselves.`,
+      );
+    }
+    if (SESSION_LOCK_ESCAPE.test(t)) {
+      throw new Error(
+        `release-migrations: SESSION-LOCK refusal - a migration step attempted a session-scoped advisory-lock call ` +
+        `(${JSON.stringify(t.slice(0, 40))}...). The runner owns the session lock for the whole run; only transaction-scoped ` +
+        `pg_advisory_xact_lock is legal inside a step.`,
+      );
+    }
   }
 }
 
+/** The restricted transaction capability handed to every step (QA v2 #2): a
+ *  mechanical wrapper over the leased client whose query() rejects
+ *  transaction-control statements (case/whitespace/comment tolerant). The raw
+ *  client never reaches step code. */
+export function restrictTx(client: Queryable): Queryable {
+  return {
+    query: (text: string, params?: unknown[]) => {
+      assertNoTransactionControl(text);
+      return client.query(text, params);
+    },
+  };
+}
+
+/** 0001: the schema that used to be applied implicitly at server boot
+ *  (PostgresGraphRepository.create graph DDL + createPgOtpState OTP DDL),
+ *  extracted into an explicit versioned step. Declarative SQL artifact ONLY:
+ *  the runner executes exactly these bytes and hashes exactly these bytes.
+ *  All statements are IF NOT EXISTS, so pre-migration databases adopt the
+ *  runner as a no-op baseline and fresh databases are built fully here. */
 export const MIGRATIONS: readonly MigrationStep[] = [
   {
+    kind: 'sql',
     version: '0001',
     name: 'init-schema',
     description: 'Graph + OTP schema baseline (schema ownership moved out of app boot; idempotent IF NOT EXISTS).',
-    artifact: `${GRAPH_DDL};${OTP_DDL}`,
-    up: applyInitSchema,
+    sql: `${GRAPH_DDL};${OTP_DDL}`,
   },
   // SA lane plug-in contract (QA SA v8 finding, TL convergence 2026-09-18):
   // register migrateUsersPhone as version '0002' when the SA track lands.
-  // IMPORTANT: up() receives an ALREADY-TRANSACTIONAL client. migrateUsersPhone
-  // currently wraps itself in withTx(BEGIN/COMMIT); at integration the SA lane
-  // must register a tx-scoped entry point (same preflight -> normalize ->
-  // preflight -> index -> final preflight body, same advisory xact lock and
-  // LOCK TABLE - both legal inside the runner's transaction) instead of its
-  // own BEGIN/COMMIT. Example:
-  // { version: '0002', name: 'users-phone-unique-index',
-  //   artifact: migrateUsersPhoneTxSource,   // implementation source text
+  // It is a fn step (programmatic preflight): the integrity digest covers the
+  // registered function's EXACT source (up.toString()), and it runs on the
+  // RESTRICTED tx capability - migrateUsersPhone currently wraps itself in
+  // withTx(BEGIN/COMMIT), so at integration the SA lane must register a
+  // tx-scoped entry point (same preflight -> normalize -> preflight -> index
+  // -> final preflight body, same advisory xact lock and LOCK TABLE - both
+  // legal inside the runner's transaction). Example:
+  // { kind: 'fn', version: '0002', name: 'users-phone-unique-index',
   //   up: async (tx) => { await migrateUsersPhoneTx(tx); } }
   // No second runner may be introduced.
 ];
@@ -119,6 +220,8 @@ export interface DbIdentity { deploymentLabel: string; instanceId: string }
 
 export interface MigrationRunResult {
   identity: DbIdentity;
+  /** True when THIS run stamped the identity (operator-attended TOFU gate). */
+  stampedNow: boolean;
   appliedNow: string[];
   versions: string[];
 }
@@ -143,6 +246,23 @@ async function readAppliedRows(conn: Queryable): Promise<AppliedMigrationRow[]> 
   return r.rows.map(row => ({ version: String(row['version']), name: String(row['name']), sha256: String(row['sha256']) }));
 }
 
+/** Executes one step on the restricted capability: sql steps run their exact
+ *  sql text verbatim (single multi-statement query - the hashed bytes ARE the
+ *  executed bytes); fn steps run their exact hashed function source. */
+async function executeStep(m: MigrationStep, tx: Queryable): Promise<void> {
+  if (m.kind === 'sql') {
+    // The digest hashes m.sql and ONLY m.sql is executed: the text is scanned
+    // whole by the restricted capability, then run statement-by-statement
+    // (drivers on the extended protocol reject multi-statement strings; the
+    // executed statements are exactly the hashed text, nothing else).
+    for (const stmt of m.sql.split(';').map(x => x.trim()).filter(Boolean)) {
+      await tx.query(stmt);
+    }
+  } else {
+    await m.up(tx);
+  }
+}
+
 /** History gate shared by the runner and the boot check: the applied rows must
  *  be an EXACT registry prefix with exact version+name+digest integrity. */
 function verifyHistoryPrefix(applied: AppliedMigrationRow[], migrations: readonly MigrationStep[]): void {
@@ -157,9 +277,9 @@ function verifyHistoryPrefix(applied: AppliedMigrationRow[], migrations: readonl
     }
     if (row.name !== reg.name || row.sha256 !== stepDigest(reg)) {
       throw new Error(
-        `release-migrations: INTEGRITY refusal - applied '${row.version}' does not match the registry artifact ` +
+        `release-migrations: INTEGRITY refusal - applied '${row.version}' does not match the registered implementation ` +
         `(stored name='${row.name}' sha256=${row.sha256.slice(0, 12)}..., expected name='${reg.name}' sha256=${stepDigest(reg).slice(0, 12)}...). ` +
-        `History was edited outside the runner or the artifact drifted; manual review required.`,
+        `History was edited outside the runner or the implementation drifted; manual review required.`,
       );
     }
   }
@@ -187,6 +307,7 @@ export async function runMigrations(
   // serialize; the loser replays history and no-ops).
   const client = await conn.connect();
   let identity: DbIdentity;
+  let stampedNow = false;
   let applied: AppliedMigrationRow[];
   const appliedNow: string[] = [];
   try {
@@ -207,6 +328,7 @@ export async function runMigrations(
           identity = existing;
         } else {
           identity = { deploymentLabel: opts.deployment, instanceId: randomBytes(8).toString('hex') };
+          stampedNow = true;
           await client.query(
             `INSERT INTO contake_db_identity(id, deployment_label, instance_id) VALUES(1, $1, $2)`,
             [identity.deploymentLabel, identity.instanceId],
@@ -221,11 +343,14 @@ export async function runMigrations(
       }
 
       // Pending steps: ONE transaction per step - body AND version record
-      // commit together or roll back together (QA stop-ship #1).
+      // commit together or roll back together (QA #1). Step code only ever
+      // sees the RESTRICTED capability (QA v2 #2): transaction control is
+      // mechanically rejected before it can reach the connection.
+      const tx = restrictTx(client);
       for (const m of migrations.slice(applied.length)) {
         await client.query('BEGIN');
         try {
-          await m.up(client);
+          await executeStep(m, tx);
           const ins = await client.query(
             `INSERT INTO schema_migrations(version, name, sha256, applied_by) VALUES($1, $2, $3, $4)
              ON CONFLICT (version) DO NOTHING`,
@@ -250,7 +375,7 @@ export async function runMigrations(
   } finally {
     client.release();
   }
-  return { identity, appliedNow, versions: [...applied.map(r => r.version), ...appliedNow] };
+  return { identity, stampedNow, appliedNow, versions: [...applied.map(r => r.version), ...appliedNow] };
 }
 
 /** Boot-time gate (fail-closed): the database must carry EXACTLY the expected
@@ -260,6 +385,7 @@ export async function runMigrations(
 export async function assertSchemaCurrent(
   conn: Connectable | Queryable,
   expected: readonly MigrationStep[] = MIGRATIONS,
+  opts?: { deployment?: string },
 ): Promise<void> {
   const t = await conn.query(`SELECT to_regclass('schema_migrations') AS r`);
   if (!t.rows[0]?.['r']) {
@@ -285,6 +411,19 @@ export async function assertSchemaCurrent(
     verifyHistoryPrefix(applied, expected);
   } catch (e) {
     throw new Error(`release-migrations: ${(e as Error).message} - refusing to boot (fail-closed)`);
+  }
+  if (opts?.deployment !== undefined) {
+    const identity = await readDbIdentity(conn);
+    if (!identity) {
+      throw new Error('release-migrations: no database identity stamped - refusing to boot (fail-closed)');
+    }
+    if (identity.deploymentLabel !== opts.deployment) {
+      throw new Error(
+        `release-migrations: DEPLOYMENT refusal - this database is stamped '${identity.deploymentLabel}' ` +
+        `(instance ${identity.instanceId}) but this runtime expects '${opts.deployment}'. Refusing to serve ` +
+        `another deployment's database (fail-closed).`,
+      );
+    }
   }
 }
 

@@ -5,6 +5,8 @@
  *    is an error (the operator must choose deliberately);
  *  - bounded/canonical scalar values (actor, output path). */
 
+import { closeSync, constants, fsyncSync, openSync, writeSync } from 'node:fs';
+
 export interface CliSpec {
   readonly required: readonly string[];
   readonly optional: readonly string[];
@@ -56,12 +58,29 @@ export function validateActor(actor: string): string {
 }
 
 /** Output path: must not clobber an existing file. */
-export function assertFreshOutputPath(path: string, exists: (p: string) => boolean): string {
+/** Atomic inventory publication (independent QA + security): ONE exclusive
+ *  create - O_CREAT|O_EXCL atomically refuses an existing path (no
+ *  check-then-write race), O_NOFOLLOW refuses symlinks, mode 0600, and the
+ *  contents are fsync'd before close so a crash cannot leave a torn file
+ *  that looks published. There is no window in which a second writer can win. */
+export function writeFileExclusive(path: string, contents: string): void {
   if (path.length === 0 || path.length > 512 || path.includes('\0')) {
     throw new Error('cli: invalid output path');
   }
-  if (exists(path)) {
-    throw new Error(`cli: output path ${JSON.stringify(path)} already exists - refusing to clobber (choose a fresh path)`);
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST' || code === 'ELOOP') {
+      throw new Error(`cli: output path ${JSON.stringify(path)} already exists or is a symlink - refusing to clobber (atomic exclusive create)`);
+    }
+    throw new Error(`cli: cannot publish inventory at ${JSON.stringify(path)}: ${code ?? String(e)}`);
   }
-  return path;
+  try {
+    writeSync(fd, contents);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }

@@ -83,7 +83,15 @@ if (process.env['DATABASE_URL']) {
   // (assertBootPolicy) and staging data comes only from the explicit
   // synthetic-only `seed:staging` job. The former boot-time demo/camp-demo PG
   // seeding path is removed with this change.
-  await assertSchemaCurrent(pool);
+  // Independent security (2026-09-18): a Postgres boot must verify the
+  // EXPECTED DEPLOYMENT against the database's stamped immutable identity
+  // before serving - a runtime pointed at another deployment's database
+  // fails closed. CONTAKE_DEPLOYMENT is required for every PG boot.
+  const expectedDeployment = process.env['CONTAKE_DEPLOYMENT'];
+  if (!expectedDeployment) {
+    throw new Error('CONTAKE_DEPLOYMENT is required for a Postgres boot - the runtime must declare which deployment identity it expects (fail-closed)');
+  }
+  await assertSchemaCurrent(pool, undefined, { deployment: expectedDeployment });
   repo = PostgresGraphRepository.connect(pool);
   dispatchState = pgDispatchState(pool);
   otpState = await createPgOtpState(pool, { applyDdl: false }); // pilot-prep #4: shared OTP state (schema via migrations)

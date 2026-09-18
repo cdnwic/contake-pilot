@@ -1,13 +1,20 @@
-/** Release-migration runner gates (2026-09-18, hardened after QA FAIL of
- *  f9854cd6): hermetic PGlite proofs that
+/** Release-migration runner gates (2026-09-18, hardened after QA FAILs of
+ *  f9854cd6 and 9182487e + security FAIL of 9182487e): hermetic PGlite proofs
+ *  that
  *  - a fresh database is initialized explicitly and becomes boot-able;
  *  - re-runs are idempotent; history is forward-only (unknown/gap refuses);
  *  - EVERY step is one transaction: body AND version record commit or roll
  *    back together (partial DDL can never persist versionless);
- *  - applied-step integrity is enforced: stored version+name+digest must
- *    match the registry artifact digest, in the runner AND the boot gate;
+ *  - digests are MECHANICALLY BOUND to the executed implementation: sql steps
+ *    hash the exact executed text; fn steps hash the exact executed function
+ *    source - an implementation-only edit is an integrity failure;
+ *  - steps run on a RESTRICTED capability: transaction control and
+ *    session-lock escape are mechanically rejected (case/whitespace/comment
+ *    variants), and the rejection rolls the whole step back;
+ *  - applied-step integrity is enforced in the runner AND the boot gate;
+ *  - the runtime boot verifies the expected DEPLOYMENT against the stamped
+ *    database identity before serving;
  *  - cross-deployment runs are refused by the stamped identity;
- *  - function steps on the SA plug-in contract are applied and recorded;
  *  - pooled endpoints are refused for schema work.
  *  Advisory-lock concurrency, real-Postgres DDL rollback, restart durability
  *  and real-PG seed transactions are proven by
@@ -18,8 +25,8 @@ import { describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { pgliteConnectable } from '../src/repo/postgres.js';
 import {
-  MIGRATIONS, EXPECTED_SCHEMA_VERSIONS, assertDirectDatabaseUrl, assertSchemaCurrent,
-  runMigrations, stepDigest, type MigrationStep,
+  MIGRATIONS, EXPECTED_SCHEMA_VERSIONS, assertDirectDatabaseUrl, assertNoTransactionControl,
+  assertSchemaCurrent, runMigrations, stepDigest, type MigrationStep,
 } from '../src/migrations/runner.js';
 
 async function freshDb() {
@@ -28,9 +35,11 @@ async function freshDb() {
   return { pg, conn };
 }
 
-const step = (version: string, name: string, sql: string): MigrationStep => ({
-  version, name, description: `test step ${name}`, artifact: sql,
-  up: async tx => { for (const st of sql.split(';').map(s => s.trim()).filter(Boolean)) await tx.query(st); },
+const sqlStep = (version: string, name: string, sql: string): MigrationStep => ({
+  kind: 'sql', version, name, description: `test step ${name}`, sql,
+});
+const fnStep = (version: string, name: string, up: (tx: { query(t: string, p?: unknown[]): Promise<unknown> }) => Promise<void>): MigrationStep => ({
+  kind: 'fn', version, name, description: `test step ${name}`, up: up as never,
 });
 
 describe('release-migration runner', () => {
@@ -44,6 +53,7 @@ describe('release-migration runner', () => {
     const { pg, conn } = await freshDb();
     const r1 = await runMigrations(conn, { deployment: 'staging' });
     expect(r1.appliedNow).toEqual([...EXPECTED_SCHEMA_VERSIONS]);
+    expect(r1.stampedNow).toBe(true);
     expect(r1.identity.deploymentLabel).toBe('staging');
     expect(r1.identity.instanceId).toMatch(/^[0-9a-f]{16}$/);
     for (const t of ['users', 'otp_codes', 'otp_requests', 'otp_verify_state', 'auth_audit', 'schema_migrations', 'contake_db_identity']) {
@@ -53,6 +63,7 @@ describe('release-migration runner', () => {
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     const r2 = await runMigrations(conn, { deployment: 'staging' });
     expect(r2.appliedNow).toEqual([]);
+    expect(r2.stampedNow).toBe(false);
     expect(r2.identity.instanceId).toBe(r1.identity.instanceId);
     await pg.close();
   });
@@ -91,46 +102,45 @@ describe('release-migration runner', () => {
     await pg.close();
   });
 
-  it('QA stop-ship #1: a step that throws mid-DDL leaves NO partial DDL and NO version row', async () => {
+  it('runtime boot verifies the expected deployment against the stamped identity', async () => {
     const { pg, conn } = await freshDb();
-    const failing: MigrationStep = {
-      version: '0001', name: 'partial-ddl', description: 'creates a table then throws',
-      artifact: 'CREATE TABLE partial_leak(id int); THROW',
-      up: async tx => {
-        await tx.query('CREATE TABLE partial_leak(id int)');
-        throw new Error('boom mid-DDL');
-      },
-    };
+    await runMigrations(conn, { deployment: 'staging' });
+    await expect(assertSchemaCurrent(conn, undefined, { deployment: 'staging' })).resolves.toBeUndefined();
+    await expect(assertSchemaCurrent(conn, undefined, { deployment: 'production-pilot' })).rejects.toThrow(/DEPLOYMENT refusal/);
+    await pg.close();
+  });
+
+  it('a step that throws mid-DDL leaves NO partial DDL and NO version row', async () => {
+    const { pg, conn } = await freshDb();
+    const failing = fnStep('0001', 'partial-ddl', async tx => {
+      await tx.query('CREATE TABLE partial_leak(id int)');
+      throw new Error('boom mid-DDL');
+    });
     await expect(runMigrations(conn, { deployment: 'staging', migrations: [failing] })).rejects.toThrow(/boom mid-DDL/);
     const t = await conn.query(`SELECT to_regclass('partial_leak') AS r`);
     expect(t.rows[0]?.['r']).toBeNull(); // DDL rolled back with the step tx
     const v = await conn.query(`SELECT count(*)::int AS n FROM schema_migrations`);
-    expect(Number(v.rows[0]?.['n'])).toBe(0); // no versionless persistence, no orphaned version
-    // A later good run on the same database proceeds cleanly.
+    expect(Number(v.rows[0]?.['n'])).toBe(0);
     await runMigrations(conn, { deployment: 'staging' });
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     await pg.close();
   });
 
-  it('QA stop-ship #1: a version-record collision rolls back the step body too', async () => {
+  it('a version-record collision rolls back the step body too', async () => {
     const { pg, conn } = await freshDb();
-    const colliding: MigrationStep = {
-      version: '0001', name: 'self-colliding', description: 'inserts its own version row inside up()',
-      artifact: 'CREATE TABLE coll_leak(id int)',
-      up: async tx => {
-        await tx.query('CREATE TABLE coll_leak(id int)');
-        await tx.query(`INSERT INTO schema_migrations(version, name, sha256, applied_by) VALUES('0001', 'squatter', 'x', 'test')`);
-      },
-    };
+    const colliding = fnStep('0001', 'self-colliding', async tx => {
+      await tx.query('CREATE TABLE coll_leak(id int)');
+      await tx.query(`INSERT INTO schema_migrations(version, name, sha256, applied_by) VALUES('0001', 'squatter', 'x', 'test')`);
+    });
     await expect(runMigrations(conn, { deployment: 'staging', migrations: [colliding] })).rejects.toThrow(/collided inside its own transaction/);
     const t = await conn.query(`SELECT to_regclass('coll_leak') AS r`);
-    expect(t.rows[0]?.['r']).toBeNull(); // step DDL rolled back
+    expect(t.rows[0]?.['r']).toBeNull();
     const v = await conn.query(`SELECT version FROM schema_migrations`);
-    expect(v.rows).toHaveLength(0); // the squatter row rolled back with it
+    expect(v.rows).toHaveLength(0);
     await pg.close();
   });
 
-  it('QA stop-ship #2: edited applied history (name or digest) fails runner AND boot gate', async () => {
+  it('edited applied history (name or digest) fails runner AND boot gate', async () => {
     const { pg, conn } = await freshDb();
     await runMigrations(conn, { deployment: 'staging' });
     await conn.query(`UPDATE schema_migrations SET name = 'renamed' WHERE version = '0001'`);
@@ -142,25 +152,100 @@ describe('release-migration runner', () => {
     await pg.close();
   });
 
-  it('QA stop-ship #2: the digest covers the actual artifact, not metadata', () => {
-    const a = step('0001', 'x', 'CREATE TABLE a(id int)');
-    const b = step('0001', 'x', 'CREATE TABLE b(id int)');
+  it('digest is mechanically bound: sql text change flips it, metadata edit does not', () => {
+    const a = sqlStep('0001', 'x', 'CREATE TABLE a(id int)');
+    const b = sqlStep('0001', 'x', 'CREATE TABLE b(id int)');
     const c = { ...a, description: 'edited description only' };
-    expect(stepDigest(a)).not.toBe(stepDigest(b)); // artifact change -> digest change
+    expect(stepDigest(a)).not.toBe(stepDigest(b)); // executed text change -> digest change
     expect(stepDigest(a)).toBe(stepDigest(c)); // editable metadata is not the artifact
   });
 
-  it('SA plug-in contract: a function step (migrateUsersPhone shape) is applied and recorded', async () => {
+  it('digest is mechanically bound: fn implementation-only change with unchanged declaration flips it', () => {
+    const decl = { kind: 'fn' as const, version: '0002', name: 'users-phone', description: 'same declaration' };
+    const a: MigrationStep = { ...decl, up: async tx => { await tx.query('CREATE UNIQUE INDEX i1 ON users(phone)'); } };
+    const b: MigrationStep = { ...decl, up: async tx => { await tx.query('CREATE UNIQUE INDEX i2 ON users(phone)'); } };
+    expect(stepDigest(a)).not.toBe(stepDigest(b)); // the EXECUTED source is the digest input
+  });
+
+  it('implementation-only edit of an applied fn step fails the rerun and the boot gate', async () => {
+    const { pg, conn } = await freshDb();
+    const decl = { version: '0002', name: 'users-phone-unique-index', description: 'sa shape' };
+    const implA: MigrationStep = { kind: 'fn', ...decl, up: async tx => { await tx.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`); } };
+    const r = await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implA] });
+    expect(r.appliedNow).toEqual(['0001', '0002']);
+    // Same declaration, silently edited implementation body:
+    const implB: MigrationStep = { kind: 'fn', ...decl, up: async tx => { await tx.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(phone) WHERE phone IS NOT NULL`); } };
+    await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implB] })).rejects.toThrow(/INTEGRITY refusal/);
+    await expect(assertSchemaCurrent(conn, [...MIGRATIONS, implB])).rejects.toThrow(/INTEGRITY refusal/);
+    await expect(assertSchemaCurrent(conn, [...MIGRATIONS, implA])).resolves.toBeUndefined();
+    await pg.close();
+  });
+
+  it('restricted capability: transaction control is rejected in case/whitespace/comment/multi-statement variants', () => {
+    for (const bad of [
+      'COMMIT', 'commit', 'CoMmIt', '  COMMIT  ', '/* sneaky */ COMMIT', '-- lead\nCOMMIT',
+      'SELECT 1; COMMIT', 'BEGIN', 'START TRANSACTION', 'ROLLBACK', 'END;', 'SAVEPOINT sp1',
+      'RELEASE SAVEPOINT sp1', 'PREPARE TRANSACTION \'x\'', 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE',
+      '/* multi\nline */ rollback /* tail */',
+    ]) {
+      expect(() => assertNoTransactionControl(bad), JSON.stringify(bad)).toThrow(/TRANSACTION-CONTROL refusal/);
+    }
+    for (const good of [
+      'CREATE TABLE t(id int)', 'SELECT pg_advisory_xact_lock(1)', "INSERT INTO t VALUES('commit')",
+      'SELECT 1; SELECT 2', 'SELECT pg_try_advisory_xact_lock(2)',
+    ]) {
+      expect(() => assertNoTransactionControl(good), JSON.stringify(good)).not.toThrow();
+    }
+  });
+
+  it('restricted capability: session-advisory-lock escape is rejected; xact-scoped stays legal', () => {
+    for (const bad of [
+      'SELECT pg_advisory_unlock(841000001)', 'select pg_advisory_unlock_all()', 'SELECT pg_advisory_lock(1)',
+      '/*x*/ SELECT pg_try_advisory_lock(1)',
+    ]) {
+      expect(() => assertNoTransactionControl(bad), JSON.stringify(bad)).toThrow(/SESSION-LOCK refusal/);
+    }
+    expect(() => assertNoTransactionControl('SELECT pg_advisory_xact_lock(841000001)')).not.toThrow();
+  });
+
+  it('a step attempting COMMIT mid-DDL is rejected and NOTHING persists (no partial DDL/DML)', async () => {
+    const { pg, conn } = await freshDb();
+    const escaping = fnStep('0001', 'tx-escape', async tx => {
+      await tx.query('CREATE TABLE escape_leak(id int)');
+      await tx.query(`INSERT INTO escape_leak VALUES (1)`);
+      await tx.query('COMMIT'); // mechanical rejection -> step rolls back
+    });
+    await expect(runMigrations(conn, { deployment: 'staging', migrations: [escaping] })).rejects.toThrow(/TRANSACTION-CONTROL refusal/);
+    const t = await conn.query(`SELECT to_regclass('escape_leak') AS r`);
+    expect(t.rows[0]?.['r']).toBeNull(); // no partial DDL
+    const v = await conn.query(`SELECT count(*)::int AS n FROM schema_migrations`);
+    expect(Number(v.rows[0]?.['n'])).toBe(0); // no version row
+    await pg.close();
+  });
+
+  it('a step attempting to drop the runner session lock is rejected and rolled back', async () => {
+    const { pg, conn } = await freshDb();
+    const escaping = fnStep('0001', 'lock-escape', async tx => {
+      await tx.query('CREATE TABLE lock_leak(id int)');
+      await tx.query('SELECT pg_advisory_unlock(841000001)');
+    });
+    await expect(runMigrations(conn, { deployment: 'staging', migrations: [escaping] })).rejects.toThrow(/SESSION-LOCK refusal/);
+    const t = await conn.query(`SELECT to_regclass('lock_leak') AS r`);
+    expect(t.rows[0]?.['r']).toBeNull();
+    await pg.close();
+  });
+
+  it('SA plug-in contract: a tx-scoped function step (migrateUsersPhone shape) is applied and recorded', async () => {
     const { pg, conn } = await freshDb();
     let called = 0;
     const saStep: MigrationStep = {
+      kind: 'fn',
       version: '0002',
       name: 'users-phone-unique-index',
       description: 'test double matching the tx-scoped MigrationStep contract',
-      artifact: 'CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL',
       up: async tx => {
         called += 1;
-        // Legal inside the runner's transaction: advisory xact lock + index.
+        // Legal inside the runner's transaction: advisory XACT lock + index.
         await tx.query(`SELECT pg_advisory_xact_lock(123456)`);
         await tx.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
       },
@@ -175,7 +260,7 @@ describe('release-migration runner', () => {
 
   it('rejects a non-sequential registry', async () => {
     const { pg, conn } = await freshDb();
-    const bad: MigrationStep[] = [step('0007', 'x', 'SELECT 1')];
+    const bad: MigrationStep[] = [sqlStep('0007', 'x', 'SELECT 1')];
     await expect(runMigrations(conn, { deployment: 'staging', migrations: bad })).rejects.toThrow(/strictly sequential/);
     await pg.close();
   });
