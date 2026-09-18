@@ -17,11 +17,13 @@ import { isCanonicalSandboxSession, isValidSessionCursor } from '../src/repo/gra
 import { makeTestRepo, REPO_IMPL } from './helpers/repo.js';
 import { SUPERADMIN_SANDBOX_ORG } from '../src/services/superadmin.js';
 
+const PINNED_NOW_MS = Date.parse('2026-09-18T12:00:00.000Z');
+
 let repo: GraphRepository;
 let app: FastifyInstance;
 beforeEach(async () => {
   vi.useFakeTimers({ toFake: ['Date'] });
-  vi.setSystemTime(new Date('2026-09-18T12:00:00.000Z'));
+  vi.setSystemTime(new Date(PINNED_NOW_MS));
   repo = await makeTestRepo();
   app = buildApp(repo, new AuthService(repo));
   await app.ready();
@@ -63,17 +65,17 @@ const MALFORMED: [string, Partial<UserRecord>][] = [
   ['legacy: no createdAt/expiresAt/sessionState', { createdAt: undefined, expiresAt: undefined, sessionState: undefined }],
   ['garbage createdAt', { createdAt: 'not-a-date' }],
   ['non-canonical timestamp format (offset)', { createdAt: '2026-09-18T12:00:00+03:00' }],
-  ['expiresAt before createdAt', { expiresAt: new Date(Date.now() - 1000).toISOString() }],
-  ['expiresAt == createdAt', { expiresAt: new Date(Date.now()).toISOString() }],
+  ['expiresAt before createdAt', { expiresAt: new Date(PINNED_NOW_MS - 1000).toISOString() }],
+  ['expiresAt == createdAt', { expiresAt: new Date(PINNED_NOW_MS).toISOString() }],
   ['bogus sessionState', { sessionState: 'weird' as never }],
   ['missing sessionState (legacy active default)', { sessionState: undefined }],
-  ['active but carries end metadata', { sessionEndedAt: new Date(Date.now()).toISOString(), sessionEndBy: 'u-admin-1' }],
+  ['active but carries end metadata', { sessionEndedAt: new Date(PINNED_NOW_MS).toISOString(), sessionEndBy: 'u-admin-1' }],
   ['stopped but missing sessionEndedAt', { sessionState: 'stopped', active: false }],
-  ['stopped but missing sessionEndBy', { sessionState: 'stopped', active: false, sessionEndedAt: new Date(Date.now()).toISOString() }],
+  ['stopped but missing sessionEndBy', { sessionState: 'stopped', active: false, sessionEndedAt: new Date(PINNED_NOW_MS).toISOString() }],
   ['stopped with garbage sessionEndedAt', { sessionState: 'stopped', active: false, sessionEndedAt: 'yesterday', sessionEndBy: 'u-admin-1' }],
   ['empty impersonationOf', { impersonationOf: '' }],
   ['whitespace-only impersonationOf', { impersonationOf: '   ' }],
-  ['whitespace-only sessionEndBy', { sessionState: 'stopped', active: false, sessionEndedAt: new Date(Date.now()).toISOString(), sessionEndBy: '  ' }],
+  ['whitespace-only sessionEndBy', { sessionState: 'stopped', active: false, sessionEndedAt: new Date(PINNED_NOW_MS).toISOString(), sessionEndBy: '  ' }],
   ['calendar-impossible: Feb 30', { createdAt: '2026-02-30T00:00:00.000Z' }],
   ['calendar-impossible: non-leap Feb 29', { createdAt: '2026-02-29T00:00:00.000Z' }],
   ['calendar-impossible: Apr 31 expiresAt', { expiresAt: '2026-04-31T00:00:00.000Z' }],
