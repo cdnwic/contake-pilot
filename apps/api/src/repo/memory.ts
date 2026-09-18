@@ -6,7 +6,7 @@ import type {
   AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, ImpersonationEndState, ImpersonationSessionPage, SeedData, UserRecord } from './graph-repository.js';
-import { ReportClientIdConflictError, isCanonicalSandboxSession,} from './graph-repository.js';
+import { isCanonicalSandboxSession, paginateSessions, ReportClientIdConflictError } from './graph-repository.js';
 import { SUPERADMIN_SANDBOX_ORG } from '../services/superadmin.js';
 
 /** In-memory GraphRepository (M1). Atomic batch semantics mirror the future
@@ -67,6 +67,10 @@ export class MemoryGraphRepository implements GraphRepository {
     return rec;
   }
   async getUser(userId: ID): Promise<UserRecord | undefined> { return this.users.get(userId); }
+  async getUserWithStorageOrg(userId: ID): Promise<{ record: UserRecord; storageOrgId: ID } | undefined> {
+    const record = this.users.get(userId);
+    return record && { record, storageOrgId: record.orgId }; // memory: the record IS the only representation
+  }
   async findUserByEmail(email: string): Promise<UserRecord | undefined> {
     return [...this.users.values()].find(u => u.email === email);
   }
@@ -113,22 +117,10 @@ export class MemoryGraphRepository implements GraphRepository {
     limit: number;
     cursor?: string;
   }): Promise<ImpersonationSessionPage> {
-    let rows = [...this.users.values()].filter(u => isCanonicalSandboxSession(u, SUPERADMIN_SANDBOX_ORG));
-    if (opts.state) rows = rows.filter(u => (u.sessionState ?? 'active') === opts.state);
-    rows.sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? '') || a.userId.localeCompare(b.userId));
-    if (opts.cursor !== undefined) {
-      const sep = opts.cursor.lastIndexOf('|');
-      const cCreated = opts.cursor.slice(0, sep); const cId = opts.cursor.slice(sep + 1);
-      rows = rows.filter(u => (u.createdAt ?? '') > cCreated || ((u.createdAt ?? '') === cCreated && u.userId > cId));
-    }
-    const page = rows.slice(0, opts.limit + 1);
-    const sessions = page.slice(0, opts.limit);
-    const out: ImpersonationSessionPage = { sessions };
-    if (page.length > opts.limit && sessions.length > 0) {
-      const last = sessions[sessions.length - 1]!;
-      out.nextCursor = `${last.createdAt ?? ''}|${last.userId}`;
-    }
-    return out;
+    // QA hardening v2: shared pipeline (exact PG parity); memory records are
+    // their own storage representation.
+    const rows = [...this.users.values()].map(record => ({ record, storageOrgId: record.orgId }));
+    return paginateSessions(rows, SUPERADMIN_SANDBOX_ORG, opts);
   }
   async listUsers(orgId: ID): Promise<UserRecord[]> { return [...this.users.values()].filter(u => u.orgId === orgId); }
 

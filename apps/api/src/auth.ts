@@ -1,6 +1,8 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import type { ID, Principal, Role, Scope, WhitelistEntry, WhitelistStatus } from '@contake/core';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
+import { isCanonicalSandboxSession } from './repo/graph-repository.js';
+import { SUPERADMIN_SANDBOX_ORG } from './services/superadmin.js';
 
 /**
  * Alpha auth (architecture §2: JWT access 15' + OTP for field workers).
@@ -109,7 +111,11 @@ export function parseSuperAdminPhones(raw: string | undefined): readonly string[
  *  phone. An unset CONTAKE_SUPER_ADMIN_PHONES means an empty allowlist: no
  *  phone enrolls as Super Admin, period. Ops sets the comma-separated
  *  allowlist explicitly per environment. Frontend state can never set this. */
-export const SUPER_ADMIN_PHONES: readonly string[] = parseSuperAdminPhones(process.env['CONTAKE_SUPER_ADMIN_PHONES']);
+// QA+security (2026-09-18): the backing array is MODULE-PRIVATE; the export
+// is a detached FROZEN copy so no importer can mutate the live allowlist
+// (same alias-hardening pattern as the auth-secret denylist).
+const SUPER_ADMIN_PHONES_BACKING: readonly string[] = parseSuperAdminPhones(process.env['CONTAKE_SUPER_ADMIN_PHONES']);
+export const SUPER_ADMIN_PHONES: readonly string[] = Object.freeze([...SUPER_ADMIN_PHONES_BACKING]);
 
 /** QA lifecycle gate (2026-09-17): impersonation sessions expire
  *  server-side. Recommended pilot TTL: 15 minutes (matches the access-token
@@ -163,6 +169,13 @@ export class AuthService {
     if (!parsed.sub || !parsed.exp) return null;
     const user = await this.repo.getUser(parsed.sub);
     if (!user) return null;
+    // QA+security (2026-09-18): ANY impersonation-shaped record that is not
+    // fully canonical (wrong/non-sandbox org in either representation,
+    // malformed lifecycle shape) is rejected at authentication.
+    if (user.impersonationOf !== undefined) {
+      const withOrg = await this.repo.getUserWithStorageOrg(parsed.sub);
+      if (!withOrg || !isCanonicalSandboxSession(withOrg.record, SUPERADMIN_SANDBOX_ORG, withOrg.storageOrgId)) return null;
+    }
     // QA lifecycle gate (2026-09-17): server-side session expiry, enforced on
     // EVERY authentication of a sandbox impersonation identity. The first
     // request observed at/after expiresAt atomically transitions

@@ -14,7 +14,7 @@ import { buildApp } from '../src/app.js';
 import { AuthService, SANDBOX_SESSION_TTL_MS } from '../src/auth.js';
 import type { GraphRepository, UserRecord } from '../src/repo/graph-repository.js';
 import { isCanonicalSandboxSession, isValidSessionCursor } from '../src/repo/graph-repository.js';
-import { makeTestRepo } from './helpers/repo.js';
+import { makeTestRepo, REPO_IMPL } from './helpers/repo.js';
 import { SUPERADMIN_SANDBOX_ORG } from '../src/services/superadmin.js';
 
 let repo: GraphRepository;
@@ -72,12 +72,23 @@ const MALFORMED: [string, Partial<UserRecord>][] = [
   ['stopped but missing sessionEndBy', { sessionState: 'stopped', active: false, sessionEndedAt: new Date(Date.now()).toISOString() }],
   ['stopped with garbage sessionEndedAt', { sessionState: 'stopped', active: false, sessionEndedAt: 'yesterday', sessionEndBy: 'u-admin-1' }],
   ['empty impersonationOf', { impersonationOf: '' }],
+  ['whitespace-only impersonationOf', { impersonationOf: '   ' }],
+  ['whitespace-only sessionEndBy', { sessionState: 'stopped', active: false, sessionEndedAt: new Date(Date.now()).toISOString(), sessionEndBy: '  ' }],
+  ['calendar-impossible: Feb 30', { createdAt: '2026-02-30T00:00:00.000Z' }],
+  ['calendar-impossible: non-leap Feb 29', { createdAt: '2026-02-29T00:00:00.000Z' }],
+  ['calendar-impossible: Apr 31 expiresAt', { expiresAt: '2026-04-31T00:00:00.000Z' }],
+  ['second 60 (leap-second shape)', { createdAt: '2026-09-18T12:00:60.000Z' }],
+  ['month 13', { createdAt: '2026-13-01T00:00:00.000Z' }],
 ];
 
 describe('canonical scope: non-sandbox / malformed legacy records', () => {
   it('predicate unit: every crafted malformed record is rejected; the minted shape is accepted', () => {
     const good = baseSession({});
     expect(isCanonicalSandboxSession(good, SUPERADMIN_SANDBOX_ORG)).toBe(true);
+    // leap-year Feb 29 is calendar-POSSIBLE and stays canonical
+    expect(isCanonicalSandboxSession(baseSession({ createdAt: '2028-02-29T00:00:00.000Z', expiresAt: '2028-02-29T01:00:00.000Z' }), SUPERADMIN_SANDBOX_ORG)).toBe(true);
+    // cross-representation: storage org column disagreeing with the record is non-canonical
+    expect(isCanonicalSandboxSession(baseSession({}), SUPERADMIN_SANDBOX_ORG, 'org-1')).toBe(false);
     for (const [label, over] of MALFORMED) {
       expect(isCanonicalSandboxSession(baseSession(over), SUPERADMIN_SANDBOX_ORG), label).toBe(false);
     }
@@ -179,5 +190,93 @@ describe('strict cursor validation', () => {
     }
     expect(seen.length).toBe(5);
     expect(new Set(seen).size).toBe(5);
+  });
+});
+
+describe('auth rejection of non-canonical impersonation-shaped records', () => {
+  it('a minted session corrupted into non-canonical shape is rejected at authentication (401), record untouched', async () => {
+    const t = await otpLogin(SA1);
+    const s = await start(t);
+    const stok = s.json().token as string;
+    const sid = s.json().principal.userId as string;
+    expect((await app.inject({ method: 'GET', url: '/v1/whoami', headers: H(stok) })).statusCode).toBe(200);
+    const before = await repo.getUser(sid);
+    // corrupt: expiresAt becomes calendar-impossible
+    await repo.updateUser(sid, { expiresAt: '2026-02-30T00:00:00.000Z' });
+    expect((await app.inject({ method: 'GET', url: '/v1/whoami', headers: H(stok) })).statusCode).toBe(401);
+    const after = await repo.getUser(sid);
+    expect(after!.expiresAt).toBe('2026-02-30T00:00:00.000Z'); // preserved, not repaired/deleted
+    expect(after!.userId).toBe(before!.userId);
+  });
+});
+
+describe('cross-representation org adversary (PG lanes: raw SQL shapes)', () => {
+  it.skipIf(REPO_IMPL === 'memory')('storage org_id != data.orgId sandbox session: invisible to list, 404 on stop/revoke, byte-identical afterwards', async () => {
+    const t = await otpLogin(SA1);
+    const now = Date.now();
+    const data = {
+      userId: 'sa-xrep-1', orgId: SUPERADMIN_SANDBOX_ORG, name: 'x', role: 'admin', scopes: [], active: true,
+      impersonationOf: 'u-admin-1', createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + SANDBOX_SESSION_TTL_MS).toISOString(), sessionState: 'active',
+    };
+    const raw = JSON.stringify(data);
+    // cross-representation: storage column org-1, embedded JSON sandbox
+    const { Pool } = REPO_IMPL === 'realpg' ? await import('pg') : { Pool: undefined as never };
+    void Pool;
+    // write through raw SQL on the lane's connection
+    const rawConn = (repo as unknown as { db?: never }).db; void rawConn;
+    // use a dedicated connection per lane
+    let c: import('../src/repo/postgres.js').Connectable;
+    let close: () => Promise<void>;
+    if (REPO_IMPL === 'realpg') {
+      const pg = await import('pg');
+      const pool = new pg.Pool({ connectionString: process.env['DATABASE_URL'] });
+      c = pool as unknown as import('../src/repo/postgres.js').Connectable;
+      close = () => pool.end();
+    } else {
+      // PGlite lane: reach the file-scoped instance through a fresh write is
+      // impossible (single connection); use repo.createUser for the JSON side
+      // and a direct SQL UPDATE through the adapter's own connection is not
+      // exposed - so craft via createUser then FIX the column via the
+      // transition path is not possible; instead assert via getUserWithStorageOrg.
+      const crafted = baseSession({ userId: 'sa-xrep-1' });
+      await repo.createUser(crafted);
+      const wso = await repo.getUserWithStorageOrg('sa-xrep-1');
+      expect(wso?.storageOrgId).toBe(SUPERADMIN_SANDBOX_ORG); // adapter writes column from record: consistent
+      return; // cross-representation divergence is a realpg-only raw-SQL craft
+    }
+    try {
+      await c.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('sa-xrep-1','org-1',NULL,NULL,$1)`, [raw]);
+      const wso = await repo.getUserWithStorageOrg('sa-xrep-1');
+      expect(wso?.record.orgId).toBe(SUPERADMIN_SANDBOX_ORG);
+      expect(wso?.storageOrgId).toBe('org-1'); // divergent representations
+      const l = await list(t);
+      expect((l.json().sessions as { userId: string }[]).some(x => x.userId === 'sa-xrep-1')).toBe(false); // invisible
+      expect((await stopBy(t, 'sa-xrep-1')).statusCode).toBe(404);
+      expect((await revoke(t, 'sa-xrep-1')).statusCode).toBe(404);
+      const after = await repo.getUserWithStorageOrg('sa-xrep-1');
+      expect(after!.record).toEqual(wso!.record); // byte-identical (untouched)
+      expect(after!.storageOrgId).toBe('org-1');
+    } finally { await close(); }
+  });
+});
+
+describe('SUPER_ADMIN_PHONES allowlist immutability (security)', () => {
+  it('the export is a detached FROZEN copy: mutation attempts throw and membership is unchanged', async () => {
+    const { SUPER_ADMIN_PHONES } = await import('../src/auth.js');
+    expect(Object.isFrozen(SUPER_ADMIN_PHONES)).toBe(true);
+    expect(SUPER_ADMIN_PHONES instanceof Array).toBe(true);
+    const members = [...SUPER_ADMIN_PHONES];
+    const mutable = SUPER_ADMIN_PHONES as unknown as string[];
+    expect(() => { mutable.push('+19999999999'); }).toThrow(TypeError);
+    expect(() => { mutable.length = 0; }).toThrow(TypeError);
+    expect(() => { mutable[0] = '+19999999999'; }).toThrow(TypeError);
+    expect(() => { mutable.splice(0, 1); }).toThrow(TypeError);
+    expect([...SUPER_ADMIN_PHONES]).toEqual(members);
+    expect(members).toContain(SA1);
+    // membership behavior unchanged: the allowlisted login still provisions SA
+    const t = await otpLogin(SA1);
+    const w = await app.inject({ method: 'GET', url: '/v1/whoami', headers: H(t) });
+    expect(w.json().isSuperAdmin).toBe(true);
   });
 });

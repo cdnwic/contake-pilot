@@ -1,21 +1,38 @@
 /** users-phone duplicate preflight + reversible migration (QA 21:06 stop-ship,
- *  2026-09-18): for deployments whose users data predates the
- *  users_phone_unique partial unique index on btrim(phone).
+ *  v2 2026-09-18 after QA/security review): for deployments whose users data
+ *  predates the users_phone_unique partial unique index on btrim(phone).
+ *  The index is NOT created at bootstrap (preservation-first): it is created
+ *  ONLY by this tool, after a clean preflight, on the resolved database.
  *
  *  Guarantees:
- *  - PREFLIGHT IS READ-ONLY: groups users by btrim(phone) and reports every
- *    collision with ids, orgs, content hashes and provenance. It NEVER picks
- *    a winner, NEVER deletes, NEVER mutates. Collisions are an operator
- *    decision, prepared here as evidence, never executed.
- *  - REVERSIBLE: every mutating step requires a prior backup artifact;
- *    restore() writes the backed-up rows back (upsert by user_id).
- *  - NORMALIZATION trims the phone column AND the embedded data->>'phone'
- *    JSON field together, in one transaction, idempotently.
- *  - INDEX CREATION is resolved-DB-only: these functions touch ONLY the
- *    connection passed in; the CLI wrapper requires an explicit
- *    --database-url (no default, no ambient env). Creation runs a preflight
- *    first and ABORTS LOUDLY when collisions exist.
- *  - IDEMPOTENT: normalize/createIndex are safe to re-run (restart-safe). */
+ *  - PREFLIGHT IS READ-ONLY and models EVERY distinct normalized phone
+ *    identity a row carries (column phone AND embedded JSON phone, trimmed).
+ *    A row with both representations belongs to BOTH identity groups. A
+ *    collision (one normalized phone, >1 user) or an inconsistency (column
+ *    and JSON trim to DIFFERENT values) BLOCKS normalization and index
+ *    creation pending an explicit operator decision - the tool never
+ *    silently picks the column (or any) winner, never deletes, never mutates.
+ *  - usersWithPhone counts a row when EITHER representation carries a phone.
+ *  - REVERSIBLE: backup captures every users row PLUS the users_phone_unique
+ *    index state (existence + definition); restore writes the rows back in
+ *    one transaction, restores the index state (recreate or verified drop),
+ *    and VERIFIES the final state against the backup header, failing loud
+ *    on mismatch.
+ *  - NORMALIZATION is ONE REAL TRANSACTION (BEGIN/COMMIT, ROLLBACK on any
+ *    failure) trimming the column and the embedded JSON to their own values.
+ *  - RESOLVED-DB-ONLY: functions touch ONLY the passed connection; the CLI
+ *    requires an explicit --database-url (no default, no ambient env).
+ *  - IDEMPOTENT: normalize/createIndex/restore are safe to re-run.
+ *
+ *  OPERATOR GATES for later live use (carried; NO live action now):
+ *  1. explicit approval to run the read-only preflight against the live DB;
+ *  2. an explicit operator decision per collision/inconsistency group
+ *     (which identity wins, per row) - never automatic;
+ *  3. verified backup + restore rehearsal on a SCRATCH copy before any live
+ *     mutation;
+ *  4. an approved atomic migration window for normalize + index creation;
+ *  5. idempotent post-migration verification (preflight clean, index
+ *     present, restart re-check). */
 import { createHash } from 'node:crypto';
 import type { Connectable } from '../repo/postgres.js';
 
@@ -24,10 +41,11 @@ export interface PhoneMember {
   orgId: string;
   columnPhone: string | null;
   jsonPhone: string | null;
-  normalizedPhone: string | null;
+  /** ALL distinct normalized (trimmed, non-empty) phone identities this row
+   *  carries across BOTH representations. */
+  normalizedIdentities: string[];
   /** sha256 over the stored data JSON (content identity, preservation proof). */
   dataHash: string;
-  /** Provenance markers for the operator's claim decision. */
   createdAt: string | null;
   isSuperAdmin: boolean;
   impersonationOf: string | null;
@@ -42,12 +60,18 @@ export interface PreflightReport {
   kind: 'users-phone-preflight';
   generatedAt: string;
   scannedUsers: number;
+  /** Rows carrying a phone in EITHER representation (column or JSON). */
   usersWithPhone: number;
-  groups: number;
+  /** Distinct normalized phone identities seen across all rows. */
+  identities: number;
   collisionGroups: PhoneGroup[];
-  /** Rows whose column phone and JSON phone disagree after trim. */
+  /** Rows whose column and JSON phones BOTH exist and trim to DIFFERENT
+   *  values. Blocking: the tool never silently chooses either side. */
   inconsistentRows: PhoneMember[];
-  /** Operator decision required ONLY when collisions exist; never resolved here. */
+  /** True when ANY operator decision is required (collisions OR
+   *  inconsistencies); normalization and index creation refuse to run. */
+  blocking: boolean;
+  blockingReasons: string[];
   operatorDecisionRequired: boolean;
 }
 
@@ -59,7 +83,11 @@ interface RawRow {
   data: unknown;
 }
 
-const trimOrNull = (v: string | null): string | null => (v === null ? null : v.trim());
+const norm = (v: string | null): string | null => {
+  if (v === null) return null;
+  const t = v.trim();
+  return t === '' ? null : t;
+};
 const hashData = (data: unknown): string => createHash('sha256').update(JSON.stringify(data)).digest('hex');
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 const bool = (v: unknown): boolean => v === true;
@@ -67,16 +95,19 @@ const bool = (v: unknown): boolean => v === true;
 const SELECT_PHONE_ROWS =
   `SELECT user_id, org_id, phone, data->>'phone' AS json_phone, data FROM users
    WHERE phone IS NOT NULL OR (data->>'phone') IS NOT NULL
-   ORDER BY btrim(COALESCE(phone, data->>'phone')), user_id`;
+   ORDER BY user_id`;
 
 const toMember = (r: RawRow): PhoneMember => {
   const data = (r.data ?? {}) as Record<string, unknown>;
+  const ids = new Set<string>();
+  const c = norm(r.phone); if (c !== null) ids.add(c);
+  const j = norm(r.json_phone); if (j !== null) ids.add(j);
   return {
     userId: r.user_id,
     orgId: r.org_id,
     columnPhone: r.phone,
     jsonPhone: r.json_phone,
-    normalizedPhone: trimOrNull(r.phone) ?? trimOrNull(r.json_phone),
+    normalizedIdentities: [...ids].sort(),
     dataHash: hashData(r.data),
     createdAt: str(data['createdAt']),
     isSuperAdmin: bool(data['isSuperAdmin']),
@@ -84,104 +115,175 @@ const toMember = (r: RawRow): PhoneMember => {
   };
 };
 
-/** READ-ONLY duplicate preflight: group by btrim(phone), report collisions
- *  with full provenance. No winner, no deletion, no writes. */
+/** READ-ONLY preflight over ALL normalized identities (column + JSON). */
 export async function preflightUsersPhone(conn: Connectable, now: () => Date = () => new Date()): Promise<PreflightReport> {
   const r = await conn.query(SELECT_PHONE_ROWS);
   const rows = r.rows as unknown as RawRow[];
   const byKey = new Map<string, PhoneMember[]>();
   const inconsistent: PhoneMember[] = [];
+  let usersWithPhone = 0;
   for (const row of rows) {
     const m = toMember(row);
-    const key = trimOrNull(row.phone) ?? trimOrNull(row.json_phone);
-    if (key === null || key === '') continue;
-    const list = byKey.get(key) ?? [];
-    list.push(m);
-    byKey.set(key, list);
-    if (m.columnPhone !== null && m.jsonPhone !== null && m.columnPhone.trim() !== m.jsonPhone.trim()) {
-      inconsistent.push(m);
+    if (m.normalizedIdentities.length > 0) usersWithPhone += 1;
+    for (const id of m.normalizedIdentities) {
+      const list = byKey.get(id) ?? [];
+      list.push(m);
+      byKey.set(id, list);
     }
+    const c = norm(row.phone); const j = norm(row.json_phone);
+    if (c !== null && j !== null && c !== j) inconsistent.push(m);
   }
   const collisions = [...byKey.entries()]
     .filter(([, members]) => new Set(members.map(m => m.userId)).size > 1)
     .map(([normalizedPhone, members]) => ({ normalizedPhone, members }));
+  const blockingReasons: string[] = [];
+  if (collisions.length > 0) blockingReasons.push(`${collisions.length} collision group(s): one normalized phone maps to >1 user`);
+  if (inconsistent.length > 0) blockingReasons.push(`${inconsistent.length} inconsistent row(s): column and JSON phones trim to different values`);
   return {
     kind: 'users-phone-preflight',
     generatedAt: now().toISOString(),
     scannedUsers: rows.length,
-    usersWithPhone: rows.filter(x => trimOrNull(x.phone) !== null && trimOrNull(x.phone) !== '').length,
-    groups: byKey.size,
+    usersWithPhone,
+    identities: byKey.size,
     collisionGroups: collisions,
     inconsistentRows: inconsistent,
-    operatorDecisionRequired: collisions.length > 0,
+    blocking: blockingReasons.length > 0,
+    blockingReasons,
+    operatorDecisionRequired: blockingReasons.length > 0,
   };
 }
 
+/** Run fn inside ONE real transaction on a leased connection
+ *  (Connectable.connect(): node-pg checks out a single client; PGlite's
+ *  adapter serializes the lease behind its single-connection mutex), so
+ *  BEGIN/COMMIT/ROLLBACK never hop connections. */
+export async function withTx<T>(conn: Connectable, fn: (c: { query: Connectable['query'] }) => Promise<T>): Promise<T> {
+  const client = await conn.connect();
+  try {
+    await client.query('BEGIN');
+    const out = await fn(client);
+    await client.query('COMMIT');
+    return out;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 export interface BackupRow { user_id: string; org_id: string; email: string | null; phone: string | null; data: unknown; }
+export interface BackupHeader {
+  type: 'users-phone-backup-header';
+  version: 1;
+  createdAt: string;
+  rowCount: number;
+  /** Index state at backup time, so restore can reverse schema changes too. */
+  usersPhoneUniqueIndex: { existed: boolean; definition: string | null };
+}
 
-/** Full users-table backup (JSONL lines, one row per line, sha256 per line). */
-export async function backupUsers(conn: Connectable, sink: (line: string) => void): Promise<number> {
+const indexState = async (conn: Connectable): Promise<{ existed: boolean; definition: string | null }> => {
+  const r = await conn.query(`SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'users_phone_unique'`);
+  const def = r.rows[0]?.['indexdef'] as string | undefined;
+  return { existed: def !== undefined, definition: def ?? null };
+};
+
+/** Full backup: header (row count + index state) then every users row as
+ *  JSONL with a per-row sha256. */
+export async function backupUsers(conn: Connectable, sink: (line: string) => void, now: () => Date = () => new Date()): Promise<number> {
   const r = await conn.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
-  let n = 0;
-  for (const row of r.rows as unknown as BackupRow[]) {
-    sink(JSON.stringify({ ...row, sha256: hashData(row.data) }));
-    n += 1;
-  }
-  return n;
+  const rows = r.rows as unknown as BackupRow[];
+  const header: BackupHeader = {
+    type: 'users-phone-backup-header', version: 1, createdAt: now().toISOString(),
+    rowCount: rows.length, usersPhoneUniqueIndex: await indexState(conn),
+  };
+  sink(JSON.stringify(header));
+  for (const row of rows) sink(JSON.stringify({ ...row, sha256: hashData(row.data) }));
+  return rows.length;
 }
 
-/** Restore backed-up rows (upsert by user_id). Reverses a migration. */
-export async function restoreUsers(conn: Connectable, lines: string[]): Promise<number> {
-  let n = 0;
-  for (const line of lines) {
-    const row = JSON.parse(line) as BackupRow;
-    await conn.query(
-      `INSERT INTO users(user_id, org_id, email, phone, data) VALUES($1,$2,$3,$4,$5)
-       ON CONFLICT (user_id) DO UPDATE SET org_id=$2, email=$3, phone=$4, data=$5`,
-      [row.user_id, row.org_id, row.email, row.phone, JSON.stringify(row.data)]);
-    n += 1;
+/** Restore rows (one transaction) AND the backed-up index state, then VERIFY
+ *  the final state against the header (verified reversal, fail loud). */
+export async function restoreUsers(conn: Connectable, lines: string[]): Promise<{
+  restoredRows: number;
+  indexRestored: boolean;
+  verified: boolean;
+}> {
+  const parsed = lines.filter(l => l.trim() !== '').map(l => JSON.parse(l) as Record<string, unknown>);
+  const header = parsed[0] as unknown as BackupHeader;
+  if (header?.type !== 'users-phone-backup-header') throw new Error('restore: first line is not a users-phone backup header');
+  const rows = parsed.slice(1) as unknown as BackupRow[];
+  await withTx(conn, async c => {
+    for (const row of rows) {
+      await c.query(
+        `INSERT INTO users(user_id, org_id, email, phone, data) VALUES($1,$2,$3,$4,$5)
+         ON CONFLICT (user_id) DO UPDATE SET org_id=$2, email=$3, phone=$4, data=$5`,
+        [row.user_id, row.org_id, row.email, row.phone, JSON.stringify(row.data)]);
+    }
+  });
+  // reverse schema/index state: recreate if it existed, verified drop if not
+  let indexRestored = false;
+  if (header.usersPhoneUniqueIndex.existed) {
+    await conn.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
+    indexRestored = true;
+  } else {
+    await conn.query(`DROP INDEX IF EXISTS users_phone_unique`);
   }
-  return n;
+  const after = await indexState(conn);
+  const verified = after.existed === header.usersPhoneUniqueIndex.existed;
+  if (!verified) throw new Error(`restore: index state mismatch (wanted existed=${header.usersPhoneUniqueIndex.existed}, got ${after.existed})`);
+  return { restoredRows: rows.length, indexRestored, verified };
 }
 
-/** Normalize existing phone column + embedded JSON phone: btrim both, one tx
- *  per row, idempotent. Returns the rows changed (0 on re-run). */
-export async function normalizeUsersPhones(conn: Connectable): Promise<{ normalized: number; userIds: string[] }> {
-  const r = await conn.query(
-    `SELECT user_id, phone, data->>'phone' AS json_phone FROM users
-     WHERE (phone IS NOT NULL AND phone <> btrim(phone))
-        OR ((data->>'phone') IS NOT NULL AND (data->>'phone') <> btrim(data->>'phone'))`);
-  const userIds: string[] = [];
-  for (const row of r.rows as unknown as { user_id: string; phone: string | null; json_phone: string | null }[]) {
-    const trimmed = row.phone === null ? null : row.phone.trim();
-    await conn.query(
-      `UPDATE users SET phone=$2,
-         data = CASE WHEN (data->>'phone') IS NOT NULL
-                     THEN jsonb_set(data, '{phone}', to_jsonb($2::text), false)
-                     ELSE data END
-       WHERE user_id=$1`,
-      [row.user_id, trimmed ?? (row.json_phone === null ? null : row.json_phone.trim())]);
-    userIds.push(row.user_id);
-  }
-  return { normalized: userIds.length, userIds };
-}
+export type NormalizeResult =
+  | { normalized: number; userIds: string[] }
+  | { aborted: true; reason: string; preflight: PreflightReport };
 
-/** Create the unique index on the RESOLVED database connection only, after a
- *  fresh internal preflight. ABORTS LOUDLY (no index, no mutation) when
- *  collisions exist; the collision report is the operator-decision input. */
-export async function createUsersPhoneIndex(conn: Connectable): Promise<
-  { created: true; preflight: PreflightReport } | { created: false; reason: 'collisions'; preflight: PreflightReport }
-> {
+/** Normalize column AND embedded JSON phone, each to its OWN trimmed value,
+ *  in ONE real transaction. Refuses to run (loud) when the preflight is
+ *  blocking - never silently chooses a representation. Idempotent. */
+export async function normalizeUsersPhones(conn: Connectable): Promise<NormalizeResult> {
   const preflight = await preflightUsersPhone(conn);
-  if (preflight.collisionGroups.length > 0) {
-    return { created: false, reason: 'collisions', preflight };
+  if (preflight.blocking) {
+    return { aborted: true, reason: preflight.blockingReasons.join('; '), preflight };
   }
+  const r = await conn.query(
+    `SELECT user_id FROM users
+     WHERE (phone IS NOT NULL AND phone <> btrim(phone))
+        OR ((data->>'phone') IS NOT NULL AND (data->>'phone') <> btrim(data->>'phone'))
+     ORDER BY user_id`);
+  const ids = (r.rows as { user_id: string }[]).map(x => x.user_id);
+  if (ids.length === 0) return { normalized: 0, userIds: [] };
+  await withTx(conn, async c => {
+    for (const userId of ids) {
+      await c.query(
+        `UPDATE users SET
+           phone = CASE WHEN phone IS NULL THEN NULL ELSE btrim(phone) END,
+           data = CASE WHEN (data->>'phone') IS NOT NULL
+                       THEN jsonb_set(data, '{phone}', to_jsonb(btrim(data->>'phone')), false)
+                       ELSE data END
+         WHERE user_id=$1`,
+        [userId]);
+    }
+  });
+  return { normalized: ids.length, userIds: ids };
+}
+
+export type CreateIndexResult =
+  | { created: true; preflight: PreflightReport }
+  | { created: false; reason: 'blocked'; preflight: PreflightReport };
+
+/** Create the unique index on the RESOLVED connection only, after a fresh
+ *  internal preflight. ABORTS LOUDLY (no index, no mutation) when the
+ *  preflight blocks (collisions OR inconsistencies). */
+export async function createUsersPhoneIndex(conn: Connectable): Promise<CreateIndexResult> {
+  const preflight = await preflightUsersPhone(conn);
+  if (preflight.blocking) return { created: false, reason: 'blocked', preflight };
   await conn.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
   return { created: true, preflight };
 }
 
-/** Index presence probe (diagnostics/tests). */
+/** Index presence probe (diagnostics/tests/verification). */
 export async function usersPhoneIndexExists(conn: Connectable): Promise<boolean> {
-  const r = await conn.query(`SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'users_phone_unique'`);
-  return r.rows.length > 0;
+  return (await indexState(conn)).existed;
 }

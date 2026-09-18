@@ -1,15 +1,22 @@
 #!/usr/bin/env node
-/** Reversible users-phone migration (QA 21:06, 2026-09-18).
+/** Reversible users-phone migration (QA 21:06, v2 2026-09-18).
  *  Steps (explicit flags, in this recommended order):
- *    --backup <file>      dump ALL users rows (JSONL + per-row sha256)
- *    --normalize          btrim existing phone column + embedded JSON phone
- *    --create-index       preflight first; ABORTS LOUDLY on collisions
- *    --restore <file>     write backed-up rows back (reverses a migration)
+ *    --backup <file>      dump ALL users rows + index state (JSONL, header
+ *                         first line, per-row sha256)
+ *    --normalize          ONE transaction; btrim column + embedded JSON to
+ *                         their own values; REFUSES when preflight blocks
+ *    --create-index       preflight first; ABORTS LOUDLY on collisions OR
+ *                         column/JSON inconsistencies (exit 2)
+ *    --restore <file>     reverse rows AND index state from a backup
+ *                         artifact; verified against the backup header
  *  Resolved-DB-only: REQUIRES --database-url (no default, no ambient env).
- *  Mutating steps REFUSE to run without --backup having completed in the
- *  SAME invocation (reversible-by-construction). Idempotent: safe to re-run.
- *  Requires a prior build: pnpm --filter @contake/api build.
- *  Usage: node scripts/users-phone-migrate.mjs --database-url postgres://... --backup /path/users.jsonl --normalize --create-index */
+ *  Mutating steps REFUSE to run without --backup in the SAME invocation.
+ *  Idempotent: safe to re-run. Requires a prior build.
+ *  OPERATOR GATES (carried, no live action without them):
+ *  1. approved read-only live preflight; 2. explicit operator decision per
+ *  collision/inconsistency group; 3. verified backup + SCRATCH restore
+ *  rehearsal; 4. approved atomic migration window; 5. idempotent
+ *  post-migration verification. */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { Pool } from 'pg';
 import { backupUsers, createUsersPhoneIndex, normalizeUsersPhones, restoreUsers } from '../dist/services/phone-migration.js';
@@ -32,26 +39,30 @@ try {
     const lines = [];
     const n = await backupUsers(pool, (l) => lines.push(l));
     writeFileSync(backupFile, lines.join('\n') + '\n');
-    console.log(`backup: ${n} users rows -> ${backupFile}`);
+    console.log(`backup: ${n} users rows + index state -> ${backupFile}`);
   }
   if (has('--restore')) {
     const restoreFile = arg('--restore');
-    const lines = readFileSync(restoreFile, 'utf8').split('\n').filter(Boolean);
-    const n = await restoreUsers(pool, lines);
-    console.log(`restore: ${n} rows written back from ${restoreFile}`);
+    const r = await restoreUsers(pool, readFileSync(restoreFile, 'utf8').split('\n').filter(Boolean));
+    console.log(`restore: ${r.restoredRows} rows written back; index state reversed (recreated=${r.indexRestored}); verified=${r.verified}`);
   }
   if (has('--normalize')) {
     const r = await normalizeUsersPhones(pool);
-    console.log(`normalize: ${r.normalized} row(s) trimmed${r.normalized ? ': ' + r.userIds.join(', ') : ' (idempotent no-op)'}`);
+    if (r.aborted) {
+      console.error(`normalize: ABORTED - ${r.reason}. No row touched. Explicit operator decision required.`);
+      console.error(JSON.stringify({ collisionGroups: r.preflight.collisionGroups, inconsistentRows: r.preflight.inconsistentRows }, null, 2));
+      process.exit(2);
+    }
+    console.log(`normalize: ${r.normalized} row(s) trimmed in one transaction${r.normalized ? ': ' + r.userIds.join(', ') : ' (idempotent no-op)'}`);
   }
   if (has('--create-index')) {
     const r = await createUsersPhoneIndex(pool);
     if (r.created) {
       console.log('create-index: users_phone_unique created (or already present) on the resolved database');
     } else {
-      console.error(`create-index: ABORTED - ${r.preflight.collisionGroups.length} collision group(s). Report:`);
-      console.error(JSON.stringify(r.preflight.collisionGroups, null, 2));
-      console.error('No index created. No winner picked, nothing deleted, nothing mutated. Smallest operator decision required.');
+      console.error(`create-index: ABORTED - preflight blocking: ${r.preflight.blockingReasons.join('; ')}`);
+      console.error(JSON.stringify({ collisionGroups: r.preflight.collisionGroups, inconsistentRows: r.preflight.inconsistentRows }, null, 2));
+      console.error('No index created. No winner picked, nothing deleted, nothing mutated. Smallest explicit operator decision required.');
       process.exit(2);
     }
   }

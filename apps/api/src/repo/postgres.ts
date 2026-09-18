@@ -6,7 +6,7 @@ import type {
   WhitelistEntry, WhitelistStatus, AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, ImpersonationEndState, ImpersonationSessionPage, SeedData, UserRecord } from './graph-repository.js';
-import { ReportClientIdConflictError, isCanonicalSandboxSession,} from './graph-repository.js';
+import { ReportClientIdConflictError, isCanonicalSandboxSession, paginateSessions,} from './graph-repository.js';
 import { SUPERADMIN_SANDBOX_ORG } from '../services/superadmin.js';
 import type { DispatchStateStore } from '../services/dispatch.js';
 import type { AuthAuditEntry, OtpCodeEntry, OtpStateStore, OtpVerifyState } from '../auth.js';
@@ -90,7 +90,10 @@ CREATE INDEX IF NOT EXISTS tasks_event_id ON tasks(event_id);
 CREATE INDEX IF NOT EXISTS resources_event_id ON resources(event_id);
 CREATE INDEX IF NOT EXISTS channels_address ON channels(address);
 CREATE UNIQUE INDEX IF NOT EXISTS reports_client_report_id_unique ON reports(client_report_id);
-CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL;
+-- users_phone_unique is intentionally NOT created at bootstrap (QA 2026-09-18,
+-- preservation-first): a legacy deployment may hold colliding/padded phones;
+-- the unique index is created ONLY by the approved migration tool
+-- (services/phone-migration.ts: preflight -> backup -> normalize -> index).
 CREATE INDEX IF NOT EXISTS notification_jobs_idem ON notification_jobs(idempotency_key);
 CREATE INDEX IF NOT EXISTS audit_log_org_id ON audit_log(org_id);
 CREATE INDEX IF NOT EXISTS change_requests_event_id ON change_requests(event_id);
@@ -183,6 +186,11 @@ export class PostgresGraphRepository implements GraphRepository {
     const r = await this.q(`SELECT data FROM users WHERE user_id=$1`, [userId]);
     return r.rows[0]?.['data'] as UserRecord | undefined;
   }
+  async getUserWithStorageOrg(userId: ID): Promise<{ record: UserRecord; storageOrgId: ID } | undefined> {
+    const r = await this.q(`SELECT org_id, data FROM users WHERE user_id=$1`, [userId]);
+    const row = r.rows[0];
+    return row && { record: row['data'] as UserRecord, storageOrgId: row['org_id'] as ID };
+  }
   async findUserByEmail(email: string): Promise<UserRecord | undefined> {
     const r = await this.q(`SELECT data FROM users WHERE email=$1 LIMIT 1`, [email]);
     return r.rows[0]?.['data'] as UserRecord | undefined;
@@ -214,12 +222,14 @@ export class PostgresGraphRepository implements GraphRepository {
     at: string, auditEntry: AuditLogEntry, endBy: string,
   ): Promise<'transitioned' | 'not-active' | 'not-found'> {
     return this.inTx(async c => {
-      const r = await c.query(`SELECT data FROM users WHERE user_id=$1 FOR UPDATE`, [userId]);
-      const cur = r.rows[0]?.['data'] as UserRecord | undefined;
-      // QA hardening (2026-09-18): only CANONICAL sandbox sessions transition;
-      // non-sandbox or malformed legacy records are not-found (route -> 404),
-      // never mutated, never deleted.
-      if (!cur || !isCanonicalSandboxSession(cur, SUPERADMIN_SANDBOX_ORG)) return 'not-found';
+      const r = await c.query(`SELECT org_id, data FROM users WHERE user_id=$1 FOR UPDATE`, [userId]);
+      const row0 = r.rows[0];
+      const cur = row0?.['data'] as UserRecord | undefined;
+      // QA hardening v2 (2026-09-18, QA+security): only CANONICAL sandbox
+      // sessions transition - authoritative org_id column AND embedded
+      // data.orgId must BOTH be the sandbox org; non-sandbox or malformed
+      // legacy records are not-found (route -> 404), never mutated/deleted.
+      if (!cur || !isCanonicalSandboxSession(cur, SUPERADMIN_SANDBOX_ORG, row0?.['org_id'] as ID)) return 'not-found';
       if ((cur.sessionState ?? 'active') !== expected) return 'not-active';
       // Row lock held: state flip + immutable audit row commit together.
       const nextU: UserRecord = { ...cur, active: false, sessionState: next, sessionEndedAt: at, sessionEndBy: endBy };
@@ -234,46 +244,16 @@ export class PostgresGraphRepository implements GraphRepository {
     limit: number;
     cursor?: string;
   }): Promise<ImpersonationSessionPage> {
-    // QA hardening (2026-09-18): CANONICAL sessions only - exact SQL mirror of
-    // isCanonicalSandboxSession (graph-repository.ts). Non-sandbox or
-    // malformed legacy records are invisible here and 404 on transition.
-    const isoZ = "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$";
-    const isoOk = (expr: string): string =>
-      `(${expr}) ~ '${isoZ}'`
-      + ` AND substring(${expr} from 6 for 2) BETWEEN '01' AND '12'`
-      + ` AND substring(${expr} from 9 for 2) BETWEEN '01' AND '31'`
-      + ` AND substring(${expr} from 12 for 2) BETWEEN '00' AND '23'`
-      + ` AND substring(${expr} from 15 for 2) BETWEEN '00' AND '59'`
-      + ` AND substring(${expr} from 18 for 2) BETWEEN '00' AND '60'`;
-    const params: unknown[] = [SUPERADMIN_SANDBOX_ORG];
-    const conds: string[] = [
-      `(data->>'orgId') = $1`,
-      `btrim(COALESCE(data->>'impersonationOf','')) <> ''`,
-      isoOk(`data->>'createdAt'`),
-      isoOk(`data->>'expiresAt'`),
-      `(data->>'expiresAt') > (data->>'createdAt')`,
-      `(data->>'sessionState') IN ('active','stopped','expired','revoked')`,
-      `( ((data->>'sessionState') = 'active' AND (data->>'sessionEndedAt') IS NULL AND (data->>'sessionEndBy') IS NULL)
-       OR ((data->>'sessionState') IN ('stopped','expired','revoked') AND ${isoOk(`data->>'sessionEndedAt'`)} AND btrim(COALESCE(data->>'sessionEndBy','')) <> '') )`,
-    ];
-    if (opts.state) { params.push(opts.state); conds.push(`COALESCE(data->>'sessionState','active') = $${params.length}`); }
-    if (opts.cursor !== undefined) {
-      const sep = opts.cursor.lastIndexOf('|');
-      params.push(opts.cursor.slice(0, sep), opts.cursor.slice(sep + 1));
-      conds.push(`(COALESCE(data->>'createdAt',''), user_id) > ($${params.length - 1}, $${params.length})`);
-    }
-    params.push(opts.limit + 1);
+    // QA hardening v2 (2026-09-18, QA+security): SQL is ONLY a superset
+    // prefilter (both org representations already sandbox + impersonation
+    // marker present); the SHARED canonical pipeline (same code as the
+    // memory adapter) owns filter/state/sort/cursor/page - exact parity.
     const r = await this.q(
-      `SELECT data FROM users WHERE ${conds.join(' AND ')}
-       ORDER BY COALESCE(data->>'createdAt',''), user_id LIMIT $${params.length}`, params);
-    const rows = r.rows.map(row => row['data'] as UserRecord);
-    const sessions = rows.slice(0, opts.limit);
-    const out: ImpersonationSessionPage = { sessions };
-    if (rows.length > opts.limit && sessions.length > 0) {
-      const last = sessions[sessions.length - 1]!;
-      out.nextCursor = `${last.createdAt ?? ''}|${last.userId}`;
-    }
-    return out;
+      `SELECT org_id, data FROM users
+       WHERE org_id = $1 AND (data->>'orgId') = $1 AND (data->>'impersonationOf') IS NOT NULL`,
+      [SUPERADMIN_SANDBOX_ORG]);
+    const rows = (r.rows as { org_id: ID; data: UserRecord }[]).map(row => ({ record: row.data, storageOrgId: row.org_id }));
+    return paginateSessions(rows, SUPERADMIN_SANDBOX_ORG, opts);
   }
 
   // whitelist onboarding (v1.18 §15): upsert on phone, org-scoped list.

@@ -30,6 +30,7 @@ import { PostgresGraphRepository, pgliteConnectable, createPgOtpState, type Conn
 import { memoryOtpState, type OtpStateStore } from '../../src/auth.js';
 import { probe } from './g4-diag.js';
 import { applySeed, seedDemo } from '../../src/seed.js';
+import { createUsersPhoneIndex } from '../../src/services/phone-migration.js';
 import type { SeedData } from '../../src/repo/graph-repository.js';
 
 export const REPO_IMPL = process.env['REPO_IMPL'] ?? 'memory';
@@ -127,8 +128,13 @@ async function makeRealPgRepo(): Promise<GraphRepository> {
   const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
   await pool.query('DROP SCHEMA public CASCADE');
   await pool.query('CREATE SCHEMA public');
-  const repo = await PostgresGraphRepository.create(pool as unknown as Connectable);
+  const conn = pool as unknown as Connectable;
+  const repo = await PostgresGraphRepository.create(conn);
   await applySeed(repo, seedDemo());
+  // QA 2026-09-18: bootstrap no longer creates users_phone_unique
+  // (preservation-first migration); test lanes create it explicitly via the
+  // migration tool, exactly as an operator would after a clean preflight.
+  await createUsersPhoneIndex(conn);
   return repo;
 }
 
@@ -141,6 +147,10 @@ export async function makeTestRepo(): Promise<GraphRepository> {
     fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, seedDemo());
+  // QA 2026-09-18: bootstrap no longer creates users_phone_unique
+  // (preservation-first migration); test lanes create it explicitly via the
+  // migration tool, exactly as an operator would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     return repo;
   }
   return MemoryGraphRepository.seeded(seedDemo());
@@ -153,8 +163,13 @@ export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository>
     const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
     await pool.query('DROP SCHEMA public CASCADE');
     await pool.query('CREATE SCHEMA public');
-    const repo = await PostgresGraphRepository.create(pool as unknown as Connectable);
+    const conn = pool as unknown as Connectable;
+    const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, data);
+  // QA 2026-09-18: bootstrap no longer creates users_phone_unique
+  // (preservation-first migration); test lanes create it explicitly via the
+  // migration tool, exactly as an operator would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     return repo;
   }
   if (REPO_IMPL === 'postgres') {
@@ -164,6 +179,10 @@ export async function makeTestRepoFrom(data: SeedData): Promise<GraphRepository>
     fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, data);
+  // QA 2026-09-18: bootstrap no longer creates users_phone_unique
+  // (preservation-first migration); test lanes create it explicitly via the
+  // migration tool, exactly as an operator would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     return repo;
   }
   return MemoryGraphRepository.seeded(data);
@@ -179,6 +198,10 @@ export async function makeTestBackend(): Promise<{ repo: GraphRepository; otpSto
     fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, seedDemo());
+  // QA 2026-09-18: bootstrap no longer creates users_phone_unique
+  // (preservation-first migration); test lanes create it explicitly via the
+  // migration tool, exactly as an operator would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     const otpStore = await createPgOtpState(conn);
     return { repo, otpStore };
   }
@@ -235,6 +258,10 @@ export async function makeTestBackendFrom(data: SeedData): Promise<TestBackend> 
     fp.lastConn = conn;
     const repo = await PostgresGraphRepository.create(conn);
     await applySeed(repo, data);
+  // QA 2026-09-18: bootstrap no longer creates users_phone_unique
+  // (preservation-first migration); test lanes create it explicitly via the
+  // migration tool, exactly as an operator would after a clean preflight.
+  await createUsersPhoneIndex(conn);
     const otpStore = await createPgOtpState(conn);
     return { repo, otpStore, setAuditHook: h => { hook = h; } };
   }

@@ -37,52 +37,81 @@ export interface UserRecord extends Principal {
   sessionEndBy?: string;
 }
 
-/** QA hardening (2026-09-18): CANONICAL sandbox impersonation-session shape.
- *  A user record is a listable/transitionable impersonation session ONLY in
- *  the canonical sandbox org with the FULL lifecycle metadata minted since
- *  the lifecycle gate: non-empty impersonationOf, strict fixed-width ISO-Z
- *  createdAt/expiresAt with expiresAt > createdAt, a known sessionState, and
- *  consistent end metadata (active: none; ended: endedAt ISO-Z + endBy).
- *  Non-sandbox or malformed legacy records are INVISIBLE to the session
- *  surface (404) and are never mutated or deleted by it.
- *  Pure string/shape validation (no Date.parse), mirrored EXACTLY by the
- *  Postgres adapter's SQL filter so both adapters agree by construction.
- *  Fixed-width ISO-Z (...T hh:mm:ss.sssZ) compares lexicographically ==
- *  chronologically. */
+/** QA hardening v2 (2026-09-18, QA+security): CANONICAL sandbox
+ *  impersonation-session shape. A user record is a listable/transitionable
+ *  impersonation session ONLY when EVERY canonical condition holds:
+ *  - storage org column AND embedded data.orgId BOTH equal the canonical
+ *    sandbox org (cross-representation adversaries are invisible);
+ *  - impersonationOf is present and TRIMMED non-empty;
+ *  - createdAt/expiresAt are canonical timestamps: strict fixed-width ISO-Z
+ *    (...T hh:mm:ss.sssZ), parse finite, and EXACTLY round-trip through
+ *    Date -> ISO (rejects impossible dates, non-leap Feb 29, second 60);
+ *  - expiresAt > createdAt;
+ *  - sessionState is known; active carries NO end metadata; ended states
+ *    carry canonical sessionEndedAt + TRIMMED non-empty sessionEndBy.
+ *  Non-canonical records (non-sandbox or malformed legacy) are INVISIBLE to
+ *  the session surface (404), are REJECTED at authentication, and are never
+ *  mutated or deleted by it.
+ *  The predicate is shared verbatim by BOTH adapters (exact memory/PG
+ *  parity); the PG adapter additionally proves the storage-column org. */
 export const CANONICAL_ISO_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const isoRangeOk = (v: string, from: number, lo: string, hi: string): boolean => {
-  const s = v.slice(from, from + 2);
-  return s >= lo && s <= hi;
-};
 export function isCanonicalIsoZ(v: unknown): v is string {
-  return typeof v === 'string' && CANONICAL_ISO_Z.test(v)
-    && isoRangeOk(v, 5, '01', '12')   // month
-    && isoRangeOk(v, 8, '01', '31')   // day
-    && isoRangeOk(v, 11, '00', '23')  // hour
-    && isoRangeOk(v, 14, '00', '59')  // minute
-    && isoRangeOk(v, 17, '00', '60'); // second (60: leap-second tolerant)
+  if (typeof v !== 'string' || !CANONICAL_ISO_Z.test(v)) return false;
+  const ms = Date.parse(v);
+  if (Number.isNaN(ms)) return false; // finite parse
+  return new Date(ms).toISOString() === v; // exact round-trip: no impossible dates
 }
 
-/** Full canonical session check; sandboxOrg is the ONLY org a session may
- *  live in (SUPERADMIN_SANDBOX_ORG, passed in so the repo layer stays
- *  free of service imports). */
-export function isCanonicalSandboxSession(u: UserRecord, sandboxOrg: ID): boolean {
-  if (u.orgId !== sandboxOrg) return false;
-  if (typeof u.impersonationOf !== 'string' || u.impersonationOf.length === 0) return false;
+/** Full canonical session check. storageOrgId is the authoritative storage
+ *  org column; the memory adapter's only representation is the record
+ *  itself, so it passes u.orgId. Mismatch between representations is
+ *  non-canonical. */
+export function isCanonicalSandboxSession(u: UserRecord, sandboxOrg: ID, storageOrgId: ID = u.orgId): boolean {
+  if (storageOrgId !== sandboxOrg || u.orgId !== sandboxOrg) return false;
+  if (typeof u.impersonationOf !== 'string' || u.impersonationOf.trim().length === 0) return false;
   if (!isCanonicalIsoZ(u.createdAt) || !isCanonicalIsoZ(u.expiresAt)) return false;
   if ((u.expiresAt as string) <= (u.createdAt as string)) return false;
   if (u.sessionState === 'active') {
     return u.sessionEndedAt === undefined && u.sessionEndBy === undefined;
   }
   if (u.sessionState === 'stopped' || u.sessionState === 'expired' || u.sessionState === 'revoked') {
-    return isCanonicalIsoZ(u.sessionEndedAt) && typeof u.sessionEndBy === 'string' && u.sessionEndBy.length > 0;
+    return isCanonicalIsoZ(u.sessionEndedAt) && typeof u.sessionEndBy === 'string' && u.sessionEndBy.trim().length > 0;
   }
   return false;
 }
 
+/** Shared session pipeline (QA hardening v2): BOTH adapters run the SAME
+ *  filter + state-filter + sort + cursor + page logic over canonical
+ *  candidates, so list results are identical across memory and Postgres by
+ *  construction. The PG adapter's SQL is only a superset prefilter. */
+export function paginateSessions(
+  rows: { record: UserRecord; storageOrgId: ID }[],
+  sandboxOrg: ID,
+  opts: { state?: 'active' | 'stopped' | 'expired' | 'revoked'; limit: number; cursor?: string },
+): ImpersonationSessionPage {
+  let rows2 = rows.filter(r => isCanonicalSandboxSession(r.record, sandboxOrg, r.storageOrgId)).map(r => r.record);
+  if (opts.state) rows2 = rows2.filter(u => (u.sessionState ?? 'active') === opts.state);
+  rows2.sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? '') || a.userId.localeCompare(b.userId));
+  if (opts.cursor !== undefined) {
+    const sep = opts.cursor.lastIndexOf('|');
+    const cCreated = opts.cursor.slice(0, sep);
+    const cId = opts.cursor.slice(sep + 1);
+    rows2 = rows2.filter(u => (u.createdAt ?? '') > cCreated || ((u.createdAt ?? '') === cCreated && u.userId > cId));
+  }
+  const page = rows2.slice(0, opts.limit + 1);
+  const sessions = page.slice(0, opts.limit);
+  const out: ImpersonationSessionPage = { sessions };
+  if (page.length > opts.limit && sessions.length > 0) {
+    const last = sessions[sessions.length - 1]!;
+    out.nextCursor = `${last.createdAt ?? ''}|${last.userId}`;
+  }
+  return out;
+}
+
 /** Strict cursor shape for session listing (QA hardening 2026-09-18):
- *  `<createdAt ISO-Z>|<userId>` - exactly one separator, canonical ISO
- *  timestamp, non-empty id of safe charset, bounded length. */
+ *  `<createdAt canonical ISO-Z>|<userId>` - exactly one separator, canonical
+ *  timestamp (finite parse + exact round-trip), non-empty safe-charset id,
+ *  bounded length. */
 export function isValidSessionCursor(cursor: unknown): cursor is string {
   if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > 256) return false;
   const parts = cursor.split('|');
@@ -118,6 +147,10 @@ export interface GraphRepository {
   // users & channels
   createUser(u: UserRecord): Promise<UserRecord>;
   getUser(userId: ID): Promise<UserRecord | undefined>;
+  /** QA hardening v2 (2026-09-18): the record PLUS its authoritative storage
+   *  org column, so canonical checks can prove both representations. The
+   *  memory adapter's only representation is the record itself. */
+  getUserWithStorageOrg(userId: ID): Promise<{ record: UserRecord; storageOrgId: ID } | undefined>;
   findUserByEmail(email: string): Promise<UserRecord | undefined>;
   findUserByPhone(phone: string): Promise<UserRecord | undefined>;
   updateUser(userId: ID, patch: Partial<UserRecord>): Promise<UserRecord | undefined>;
