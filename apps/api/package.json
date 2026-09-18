@@ -10,7 +10,9 @@
     "seed": "tsx src/seed.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "seed:camp-demo": "tsx src/demo/load-camp-demo.ts"
+    "seed:camp-demo": "tsx src/demo/load-camp-demo.ts",
+    "migrate:release": "tsx src/migrations/cli.ts",
+    "seed:staging": "tsx src/migrations/staging-seed-cli.ts"
   },
   "dependencies": {
     "@contake/core": "workspace:*",
@@ -25,10 +27,10 @@
     "@electric-sql/pglite": "^0.5.8",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.23.1",
+    "@types/web-push": "^3.6.4",
     "socket.io-client": "^4.8.3",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0",
-    "@types/web-push": "^3.6.4"
+    "vitest": "^3.0.0"
   }
 }

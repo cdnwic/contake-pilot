@@ -3,6 +3,7 @@ import { buildApp } from './app.js';
 import { AuthService, type OtpStateStore } from './auth.js';
 import { MemoryGraphRepository } from './repo/memory.js';
 import { PostgresGraphRepository, pgDispatchState, createPgOtpState } from './repo/postgres.js';
+import { assertSchemaCurrent, requiredBootIdentity } from './migrations/runner.js';
 import type { GraphRepository } from './repo/graph-repository.js';
 import { applySeed, seedDemo } from './seed.js';
 import { assertBootPolicy, resolveAuthSecret, resolveSeedMode } from './boot-config.js';
@@ -11,7 +12,7 @@ import { createDispatcher, type DispatchStateStore, type MessageProvider } from 
 import { createTwilioProvider, twilioConfigFromEnv } from './services/twilio.js';
 import { createWhatsAppCloudProvider, whatsAppCloudConfigFromEnv } from './services/whatsapp-cloud.js';
 import { createLogPushProvider, createVapidPushProvider, vapidConfigFromEnv } from './services/webpush.js';
-import { campDemoSeed, campWhitelistEntries, ensureCampDemoStaging, ensureCampWhitelist } from './demo/camp-demo.js';
+import { campDemoSeed, campWhitelistEntries } from './demo/camp-demo.js';
 import { seedFilmShoot } from './seeds/film-shoot.seed.js';
 import { seedEventProduction } from './seeds/event-production.seed.js';
 import { seedEducation } from './seeds/education.seed.js';
@@ -75,27 +76,24 @@ const allDemoSeeds = (): SeedData[] => {
 if (process.env['DATABASE_URL']) {
   const { Pool } = await import('pg');
   const pool = new Pool({ connectionString: process.env['DATABASE_URL'] });
-  repo = await PostgresGraphRepository.create(pool);
-  const seed = seedMode === 'demo' ? seedDemo() : seedMode === 'camp-demo' ? campDemoSeed() : undefined;
-  if (seed && (await repo.listEvents(seed.orgId)).length === 0) {
-    await applySeed(repo, seed);
-    console.log(`Postgres: empty database, ${seedMode} seed applied (explicit CONTAKE_SEED)`);
-  } else if (!seed) {
-    console.log('Postgres: CONTAKE_SEED unset/unrecognized - NO seed applied (production seed-free)');
-  } else if (seedMode === 'camp-demo') {
-    // TL 2026-09-14: QA staging slice is additive-if-absent - the prod DB already
-    // holds cd-ev1 (Chaim's live event), which this never touches.
-    await ensureCampDemoStaging(repo);
-    console.log('Postgres: camp-demo QA staging slice ensured (additive-if-absent)');
-  }
-  // v1.18 §15 camp protection: pilot phones pre-approved ONLY on the explicit
-  // camp-demo demo boot (fail-closed hotfix v2: never unconditional in a
-  // production-shaped boot; already-seeded public credentials are
-  // rotation/deletion work, not code).
-  if (seedMode === 'camp-demo') await ensureCampWhitelist(repo);
+  // Release-migration architecture (2026-09-18): schema is owned ONLY by the
+  // explicit versioned release-migration job; startup verifies the exact
+  // expected migration versions and FAILS CLOSED on any mismatch. A Postgres
+  // boot NEVER applies DDL and NEVER seeds: production is seed-free
+  // (assertBootPolicy) and staging data comes only from the explicit
+  // synthetic-only `seed:staging` job. The former boot-time demo/camp-demo PG
+  // seeding path is removed with this change.
+  // Independent QA + security (2026-09-18): EVERY Postgres boot must declare
+  // the expected deployment AND the immutable database instance identity
+  // (CONTAKE_DEPLOYMENT + CONTAKE_DB_INSTANCE_ID, the 16-hex stamp verified
+  // out-of-band at the operator TOFU gate) and both are verified against the
+  // database's stamped identity before serving - fail closed.
+  const bootIdentity = requiredBootIdentity(process.env['CONTAKE_DEPLOYMENT'] ?? '', process.env['CONTAKE_DB_INSTANCE_ID']);
+  await assertSchemaCurrent(pool, undefined, bootIdentity);
+  repo = PostgresGraphRepository.connect(pool);
   dispatchState = pgDispatchState(pool);
-  otpState = await createPgOtpState(pool); // pilot-prep #4: shared OTP state
-  console.log('Contake API: Postgres adapter (DATABASE_URL)');
+  otpState = await createPgOtpState(pool, { applyDdl: false }); // pilot-prep #4: shared OTP state (schema via migrations)
+  console.log('Contake API: Postgres adapter (DATABASE_URL); schema at expected migration version; no boot seeding (release-migration architecture)');
 } else if (seedMode === 'all-demo') {
   repo = new MemoryGraphRepository();
   for (const seed of allDemoSeeds()) await applySeed(repo, seed);
