@@ -82,10 +82,10 @@ if (phase === 'phase1') {
   const appliedNow = [ra, rb].map(r => (r.status === 'fulfilled' ? r.value.appliedNow : []));
   const [an0 = [], an1 = []] = appliedNow;
   check('exactly one racer applied; the loser no-oped',
-    (an0.length === 1 && an1.length === 0) || (an0.length === 0 && an1.length === 1),
+    (an0.length === 3 && an1.length === 0) || (an0.length === 0 && an1.length === 3),
     appliedNow);
   const v = await db.query(`SELECT count(*)::int AS n FROM schema_migrations`);
-  check('exactly one version row after the race', Number(v.rows[0]?.['n']) === 1, v.rows[0]?.['n']);
+  check('exactly the registry rows after the race', Number(v.rows[0]?.['n']) === 3, v.rows[0]?.['n']);
   await assertSchemaCurrent(db);
   check('boot gate green after race', true);
 
@@ -297,19 +297,19 @@ if (phase === 'phase1') {
   // R4: there is no exported render - every attack is driven THROUGH
   // runMigrations as a not-yet-applied version (registration-time refusal).
   const registryAttacks: [string, MigrationStep, RegExp][] = [
-    ['caller SQL as template name', { version: '0002', name: 'x', description: 'x', template: `CREATE OPERATOR public.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = f)`, params: {} }, /unknown template name/],
-    ['DO block as template name', { version: '0002', name: 'x', description: 'x', template: `DO $$ BEGIN RAISE NOTICE 'x'; END $$`, params: {} }, /unknown template name/],
-    ['mutating CTE as template name', { version: '0002', name: 'x', description: 'x', template: `WITH d AS (DELETE FROM public.users RETURNING *) SELECT 1`, params: {} }, /unknown template name/],
-    ['ALTER OWNER as template name', { version: '0002', name: 'x', description: 'x', template: `ALTER TABLE public.users OWNER TO postgres`, params: {} }, /unknown template name/],
-    ['typed-param injection: quote/semicolon identifier', saStep({ table: 'users"; DROP TABLE users;--' }, { version: '0002' }), /TEMPLATE refusal/],
-    ['typed-param injection: schema-path identifier', saStep({ table: 'attacker.users' }, { version: '0002' }), /TEMPLATE refusal/],
-    ['typed-param injection: pg_ system prefix', saStep({ index: 'pg_evil' }, { version: '0002' }), /TEMPLATE refusal/],
-    ['typed-param injection: enum escape', saStep({ unique: 'concurrently' }, { version: '0002' }), /TEMPLATE refusal/],
-    ['typed-param injection: non-string literal', saStep({ index: 1 as never }, { version: '0002' }), /TEMPLATE refusal/],
-    ['typed-param injection: free-text expression', saStep({ expression: 'attacker.lower(phone)' }, { version: '0002' }), /TEMPLATE refusal/],
-    ['typed-param injection: free-text predicate', saStep({ predicate: 'true' }, { version: '0002' }), /TEMPLATE refusal/],
-    ['typed-param injection: extra param (schema drift)', saStep({ extra: 'x' }, { version: '0002' }), /TEMPLATE refusal/],
-    ['typed-param injection: missing param', { version: '0002', name: 'x', description: 'x', template: 'ddl.create-index', params: { index: 'x' } as never }, /TEMPLATE refusal/],
+    ['caller SQL as template name', { version: '0004', name: 'x', description: 'x', template: `CREATE OPERATOR public.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = f)`, params: {} }, /unknown template name/],
+    ['DO block as template name', { version: '0004', name: 'x', description: 'x', template: `DO $$ BEGIN RAISE NOTICE 'x'; END $$`, params: {} }, /unknown template name/],
+    ['mutating CTE as template name', { version: '0004', name: 'x', description: 'x', template: `WITH d AS (DELETE FROM public.users RETURNING *) SELECT 1`, params: {} }, /unknown template name/],
+    ['ALTER OWNER as template name', { version: '0004', name: 'x', description: 'x', template: `ALTER TABLE public.users OWNER TO postgres`, params: {} }, /unknown template name/],
+    ['typed-param injection: quote/semicolon identifier', saStep({ table: 'users"; DROP TABLE users;--' }, { version: '0004' }), /TEMPLATE refusal/],
+    ['typed-param injection: schema-path identifier', saStep({ table: 'attacker.users' }, { version: '0004' }), /TEMPLATE refusal/],
+    ['typed-param injection: pg_ system prefix', saStep({ index: 'pg_evil' }, { version: '0004' }), /TEMPLATE refusal/],
+    ['typed-param injection: enum escape', saStep({ unique: 'concurrently' }, { version: '0004' }), /TEMPLATE refusal/],
+    ['typed-param injection: non-string literal', saStep({ index: 1 as never }, { version: '0004' }), /TEMPLATE refusal/],
+    ['typed-param injection: free-text expression', saStep({ expression: 'attacker.lower(phone)' }, { version: '0004' }), /TEMPLATE refusal/],
+    ['typed-param injection: free-text predicate', saStep({ predicate: 'true' }, { version: '0004' }), /TEMPLATE refusal/],
+    ['typed-param injection: extra param (schema drift)', saStep({ extra: 'x' }, { version: '0004' }), /TEMPLATE refusal/],
+    ['typed-param injection: missing param', { version: '0004', name: 'x', description: 'x', template: 'ddl.create-index', params: { index: 'x' } as never }, /TEMPLATE refusal/],
   ];
   for (const [label, bad, re] of registryAttacks) {
     let refused = false; let observed = '';
@@ -319,8 +319,8 @@ if (phase === 'phase1') {
   }
   // Registry/artifact tamper: param edits move the step digest; render-source
   // edits move the template hash (hash-pinned registry, fail-closed).
-  const pinnedDigest = stepDigest(saStep({}, { version: '0002' }));
-  check('param tamper moves the step digest', stepDigest(saStep({ index: 'evil_idx' }, { version: '0002' })) !== pinnedDigest);
+  const pinnedDigest = stepDigest(saStep({}, { version: '0004' }));
+  check('param tamper moves the step digest', stepDigest(saStep({ index: 'evil_idx' }, { version: '0004' })) !== pinnedDigest);
   // R4 anchor A surface: ONE canonical REGISTRY_DIGEST over the frozen
   // blueprint is exported for the reviewer to record from reviewed source;
   // every v8 step digest derives from it (OBSERVED).
@@ -474,11 +474,11 @@ if (phase === 'phase1') {
     Number(codeObjs.rows[0]?.['f']) === 0 && Number(codeObjs.rows[0]?.['t']) === 0 && Number(codeObjs.rows[0]?.['p']) === 0, codeObjs.rows[0]);
   for (const label of ['create-index-concurrently', 'vacuum', 'alter-system', 'create-database', 'call', 'do', 'security-definer-function']) {
     let refused = false; let ntxObs = '';
-    try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, { version: '0002', name: 'x', description: 'x', template: `ddl.${label}`, params: {} }] }); } catch (e) { refused = true; ntxObs = String(e); }
+    try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, { version: '0004', name: 'x', description: 'x', template: `ddl.${label}`, params: {} }] }); } catch (e) { refused = true; ntxObs = String(e); }
     check(`conf: no template exists for non-tx class: ${label}`, refused && /unknown template name/.test(ntxObs), ntxObs.slice(0, 120));
   }
   let concRefused = false; let concObs = '';
-  try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, saStep({ unique: 'concurrently' }, { version: '0002' })] }); } catch (e) { concRefused = true; concObs = String(e); }
+  try { await runMigrations(mig, { deployment: 'staging', migrations: [...MIGRATIONS, saStep({ unique: 'concurrently' }, { version: '0004' })] }); } catch (e) { concRefused = true; concObs = String(e); }
   check('conf: enum escape toward CONCURRENTLY refused by the closed enum', concRefused && /TEMPLATE refusal - enum/.test(concObs), concObs.slice(0, 120));
 
   // (2)+(3)+(5) NAMED ATTACK: SECURITY DEFINER trigger function planted under
