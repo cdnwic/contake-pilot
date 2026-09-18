@@ -337,18 +337,22 @@ if (phase === 'phase1') {
     await mc.query(`CREATE FUNCTION public.evil_trigger() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN RAISE EXCEPTION 'pwned'; END $$`);
     await mc.query(`CREATE TRIGGER evil_t BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.evil_trigger()`);
     const mid = JSON.stringify(await catalogSnapshot(mc));
-    let diffCaught = false;
-    try { assertZeroCatalogDelta(JSON.parse(pre) as string[], JSON.parse(mid) as string[], 'attack'); } catch { diffCaught = true; }
-    check('conf: catalog diff catches planted SECURITY DEFINER trigger function in-tx', diffCaught);
+    let diffObserved = '';
+    try { assertZeroCatalogDelta(JSON.parse(pre) as string[], JSON.parse(mid) as string[], 'attack'); } catch (e) { diffObserved = String(e); }
+    console.error(`OBSERVED[secdef trigger plant]: ${diffObserved.slice(0, 260)}`);
+    check('conf: catalog diff catches planted SECURITY DEFINER trigger function in-tx', /CATALOG DELTA refusal/.test(diffObserved) && /evil_trigger/.test(diffObserved), diffObserved.slice(0, 200));
     await mc.query('ROLLBACK');
   } finally { mc.release(); }
   const post = JSON.stringify(await catalogSnapshot(mig));
   check('conf: post-rollback catalog equals pre-migration catalog EXACTLY (byte-for-byte)', post === pre);
   const run = new Pool({ host, port, user: 'conf_runtime', database: 'contake_conf' });
   run.on('error', () => { /* force-dropped idle client */ });
-  let fired = false;
-  try { await run.query(`INSERT INTO public.users(user_id, org_id, phone, data) VALUES ('atk-1','o','p','{}')`); } catch (e) { fired = /pwned/.test(String(e)); }
-  check('conf: planted trigger does NOT survive to fire under runtime-role INSERT', !fired);
+  let firedEffect = '';
+  let insertErr = '';
+  try { await run.query(`INSERT INTO public.users(user_id, org_id, phone, data) VALUES ('atk-1','o','p','{}')`); } catch (e) { insertErr = String(e); firedEffect = /pwned/.test(insertErr) ? insertErr : ''; }
+  const survived = await adminC.query(`SELECT count(*)::int AS n FROM public.users WHERE user_id = 'atk-1'`);
+  console.error(`OBSERVED[runtime insert after rollback]: err=${insertErr.slice(0, 120) || 'none'} rows=${JSON.stringify(survived.rows[0])}`);
+  check('conf: planted trigger does NOT survive to fire under runtime-role INSERT (OBSERVED: no pwned error, row state shown)', firedEffect === '', { insertErr: insertErr.slice(0, 120), rows: survived.rows[0] });
 
   // (4) Extension baseline: side-effect extensions cannot be created by the
   // migration role; the bootstrap gate refuses a database that has one.
@@ -358,9 +362,10 @@ if (phase === 'phase1') {
   let dblinkInstalled = true;
   try { await adminC.query(`CREATE EXTENSION dblink`); } catch { dblinkInstalled = false; }
   if (dblinkInstalled) {
-    let gateRefused = false;
-    try { await runMigrations(mig, { deployment: 'staging', appliedBy: 'conf-evidence' }); } catch (e) { gateRefused = /side-effect|extension/i.test(String(e)); }
-    check('conf: bootstrap gate refuses a database carrying dblink', gateRefused);
+    let gateObserved = '';
+    try { await runMigrations(mig, { deployment: 'staging', appliedBy: 'conf-evidence' }); } catch (e) { gateObserved = String(e); }
+    console.error(`OBSERVED[dblink baseline refusal]: ${gateObserved.slice(0, 220)}`);
+    check('conf: bootstrap gate refuses a database whose extension set drifted from the pinned baseline (dblink)', /EXTENSION BASELINE refusal/.test(gateObserved), gateObserved.slice(0, 200));
     await adminC.query(`DROP EXTENSION dblink`);
   } else {
     check('conf: dblink contrib package unavailable on disposable cluster (privilege refusal proven; gate covered by unit suite)', true);
@@ -379,10 +384,63 @@ if (phase === 'phase1') {
     await runMigrations(mig, { deployment: 'staging', appliedBy: 'conf-evidence', migrations: [...MIGRATIONS, greedy] });
   } catch (e) { seqRefused = /CATALOG DELTA refusal/.test(String(e)); }
   check('conf: artifact nextval on pre-existing sequence refused (catalog delta)', seqRefused);
-  const sv = await mig.query(`SELECT is_called AS ic FROM public.conf_seq`);
-  check('conf: sequence value ACTIVELY RESTORED after rollback (is_called=false)', sv.rows[0]?.['ic'] === false, sv.rows);
+  const sv = await mig.query(`SELECT last_value::text AS lv, is_called AS ic FROM public.conf_seq`);
+  console.error(`OBSERVED[restored sequence row]: ${JSON.stringify(sv.rows[0])}`);
+  check('conf: sequence value ACTIVELY RESTORED after rollback (OBSERVED row)', sv.rows[0]?.['ic'] === false, sv.rows);
+  // >2^53 exact-text sequence handling on REAL PG
+  const BIG = '9007199254740993';
+  await mig.query(`SELECT setval('public.conf_seq', $1::text::bigint, true)`, [BIG]);
+  const bigRow = await mig.query(`SELECT last_value::text AS lv FROM public.conf_seq`);
+  console.error(`OBSERVED[>2^53 sequence]: ${JSON.stringify(bigRow.rows[0])}`);
+  check('conf: >2^53 sequence value round-trips exactly as text', String(bigRow.rows[0]?.['lv']) === BIG, bigRow.rows[0]);
+  const bigSnap = await catalogSnapshot(mig);
+  check('conf: snapshot carries the >2^53 value as exact text', bigSnap.some(x => x.startsWith('seqval ') && x.includes(BIG)));
+  await mig.query(`SELECT setval('public.conf_seq', 1, false)`);
   const afterAll = JSON.stringify(await catalogSnapshot(mig));
   await mig.query(`DROP TABLE public.seq_t`); await mig.query(`DROP SEQUENCE public.conf_seq`);
+
+  // R2 §4: pre-existing-object alteration matrix on REAL PG (migrator role
+  // CAN perform these in-schema by privilege - the DIFF is the boundary).
+  await mig.query(`CREATE FUNCTION public.pre_exist() RETURNS int LANGUAGE sql AS 'SELECT 1'`);
+  const altBase = await catalogSnapshot(mig);
+  const alterations: [string, string, RegExp][] = [
+    ['OR REPLACE body swap', `CREATE OR REPLACE FUNCTION public.pre_exist() RETURNS int LANGUAGE sql AS 'SELECT 999'`, /pg_proc.*pre_exist/],
+    ['ALTER FUNCTION SET search_path', `ALTER FUNCTION public.pre_exist() SET search_path = attacker`, /pg_proc.*pre_exist/],
+    ['GRANT EXECUTE ON FUNCTION', `GRANT EXECUTE ON FUNCTION public.pre_exist() TO PUBLIC`, /pg_proc.*pre_exist/],
+    ['COMMENT ON function', `COMMENT ON FUNCTION public.pre_exist() IS 'x'`, /pg_description.*pre_exist/],
+    ['ALTER ROLE SET', `ALTER ROLE conf_migrator SET work_mem = '1GB'`, /pg_db_role_setting/],
+    ['default-ACL plant', `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO PUBLIC`, /pg_default_acl/],
+  ];
+  for (const [label, sql, artifact] of alterations) {
+    const mc2 = await mig.connect();
+    try {
+      await mc2.query('BEGIN');
+      const b2 = await catalogSnapshot(mc2);
+      await mc2.query(sql);
+      const a2 = await catalogSnapshot(mc2);
+      let observed = '';
+      try { assertZeroCatalogDelta(b2, a2, 'atk'); } catch (e) { observed = String(e); }
+      console.error(`OBSERVED[alteration ${label}]: ${observed.slice(0, 220)}`);
+      check(`conf: alteration caught - ${label} (OBSERVED artifact)`, /CATALOG DELTA refusal/.test(observed) && artifact.test(observed), observed.slice(0, 160));
+      await mc2.query('ROLLBACK');
+      const eq = JSON.stringify(await catalogSnapshot(mig)) === JSON.stringify(altBase);
+      check(`conf: post-rollback catalog EXACT after ${label}`, eq);
+    } finally { mc2.release(); }
+  }
+
+  // R2 §6 on REAL PG: the migration role's default privileges revoke PUBLIC
+  // function EXECUTE - a created function is uncallable by the runtime role.
+  await mig.query(`CREATE FUNCTION public.dp_check() RETURNS int LANGUAGE sql AS 'SELECT 42'`);
+  const dpAcl = await mig.query(`SELECT proacl::text AS acl FROM pg_proc WHERE proname = 'dp_check'`);
+  console.error(`OBSERVED[migration-role function ACL]: ${JSON.stringify(dpAcl.rows[0])}`);
+  check('conf: migration-role function has NO PUBLIC default EXECUTE (OBSERVED acl)', !String(dpAcl.rows[0]?.['acl'] ?? '').match(/(^\{|,)=/), dpAcl.rows[0]);
+  let callErr = '';
+  try { await run.query(`SELECT public.dp_check()`); } catch (e) { callErr = String(e); }
+  console.error(`OBSERVED[runtime role calls function]: ${callErr.slice(0, 160) || 'CALL SUCCEEDED (!)'}`);
+  check('conf: runtime role CANNOT call the migration-role function (OBSERVED error)', /permission denied/.test(callErr), callErr.slice(0, 160));
+  await mig.query(`DROP FUNCTION public.dp_check()`);
+  await mig.query(`DROP FUNCTION public.pre_exist()`);
+
   check('conf: catalog identical to pre-attack baseline after cleanup', JSON.stringify(await catalogSnapshot(mig)) === pre, { afterAll: afterAll.length });
   await run.end(); await mig.end(); await adminC.end();
   await admin.query(`DROP DATABASE contake_conf WITH (FORCE)`);

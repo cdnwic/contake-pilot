@@ -226,6 +226,54 @@ Existing Postgres deployments adopt the runner by one explicit
 run (no-op baseline), after which boots pass the gate. Rebuild path for
 staging = migrate + `seed:staging`; no local `pg_dump` bootstrap.
 
+## R2 canonical boundary standard (trust-head ruling R2, 2026-09-18)
+
+Structural correction inside the existing v1.5 scope (snapshot-diff retained
+under the bounded-universe contract):
+
+1. Canonical serialization: ONE jsonb_build_object per catalog row with
+   explicit per-catalog column lists; the diff compares a sorted multiset of
+   per-row sha256 hashes. Delimiter concatenation cannot exist under per-row
+   JSON. Identity keys are fully-qualified NAMES; OIDs are used only inside
+   one snapshot for joins.
+2. Statement-kind x catalog matrix (STATEMENT_CATALOG_MATRIX): every
+   gate-accepted statement kind maps to the catalogs it may write. Diff scope
+   = union(matrix writable catalogs) + the NEVER-TOUCH set, in which ANY
+   delta (add, drop, OR alteration of a pre-existing object) is a hard fail:
+   pg_proc (body, prokind, prolang, provolatile, resolved args, owner,
+   proacl, config), pg_trigger, pg_rewrite, pg_operator (operand types,
+   resolved oprcode), pg_opclass (opcintype/opcmethod), pg_cast
+   (castcontext/castmethod, INCLUDING castfunc=0 inout casts), pg_extension,
+   pg_event_trigger, pg_policy (polroles/polcmd/permissive), pg_default_acl,
+   pg_db_role_setting (database/role name-resolved, setconfig sorted jsonb),
+   pg_description for every securable class (COMMENT drift is security
+   drift - COMMENT is removed from the gate), ownership/ACL on pre-existing
+   objects, sequence values. Maintenance rule: adding a gate statement kind
+   REQUIRES a matrix + diff-scope update in the same change.
+3. Sequences: last_value/is_called exact text end to end (no JS Number -
+   >2^53 proven on unit + real PG); restoration restores both fields exactly
+   and its errors PROPAGATE. ERR-PROPAGATE invariant: any error in snapshot,
+   diff, or restore aborts + rolls back + hard-fails.
+4. Extensions: the fixed-name denylist is DELETED. The extension set
+   (name+version) is pinned to contake_db_identity.ext_baseline at bootstrap
+   TOFU and every later run must find it byte-identical (one-time adoption
+   path for pre-R2 deployments).
+5. Attack matrix (ruling §4): per-class plant-and-catch with OBSERVED
+   ARTIFACTS (the actual violation text naming the attacked object, the
+   raised trigger error, the sequence row) - pre-existing-object alterations
+   (OR REPLACE body swap, ALTER FUNCTION SET search_path, GRANT ON FUNCTION,
+   COMMENT ON, ALTER DATABASE/ROLE SET, policy mutation, default-ACL plant,
+   ownership change), in-transaction trigger ACTUALLY FIRED then rolled back
+   to non-existence, >2^53 sequence crossing, in-transaction AND post-commit
+   attempts. Unit suite + real-PG phase4 (36 checks, 33 observed artifacts).
+6. Defense in depth (ruling §6): the migration bootstrap issues ALTER
+   DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC for the
+   migration role (recorded in the identity row); the boot gate asserts this
+   default-privilege state on every boot and refuses to boot on tamper. A
+   surviving code object is uncallable by any role - the SECURITY INVOKER
+   trigger path dies with it (proven on real PG: runtime role gets
+   permission denied calling a migration-role function).
+
 ## CTL-DDL-CONFINEMENT addendum (trust-head ruling, 2026-09-18)
 
 Binding ruling conditions, mapped to controls (all proven on real Postgres 14

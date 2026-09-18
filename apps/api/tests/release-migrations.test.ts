@@ -28,7 +28,11 @@ const step = (version: string, name: string, sql: string, extra?: Partial<Migrat
 describe('declarative artifact gate (real-parser AST allowlist)', () => {
   it('accepts declarative DDL+DML', () => {
     expect(() => validateMigrationArtifact(`CREATE TABLE t(id int); CREATE UNIQUE INDEX i ON t(btrim(id::text)); INSERT INTO t VALUES (1);`)).not.toThrow();
-    expect(() => validateMigrationArtifact(`ALTER TABLE t ADD COLUMN x text; COMMENT ON TABLE t IS 'c'; DROP INDEX i; DELETE FROM t WHERE id = 1;`)).not.toThrow();
+    expect(() => validateMigrationArtifact(`ALTER TABLE t ADD COLUMN x text; DROP INDEX i; DELETE FROM t WHERE id = 1;`)).not.toThrow();
+    // R2: pg_description is NEVER-TOUCH (COMMENT drift is security drift), so
+    // COMMENT is removed from the gate entirely - it can never satisfy the diff.
+    expect(() => validateMigrationArtifact(`COMMENT ON TABLE t IS 'c'`)).toThrow(/ARTIFACT refusal/);
+    expect(() => validateMigrationArtifact(`COMMENT ON COLUMN t.id IS 'c'`)).toThrow(/ARTIFACT refusal/);
   });
   it('rejects transaction control by AST type, not spelling', () => {
     for (const bad of ['COMMIT', 'commit', 'BEGIN', 'START TRANSACTION', 'ROLLBACK', 'END', 'ABORT', 'PREPARE TRANSACTION \'x\'']) {
@@ -174,6 +178,81 @@ describe('declarative artifact gate (real-parser AST allowlist)', () => {
     await pg.close();
   });
 
+  it('R2 attack matrix: pre-existing-object alteration, in-tx trigger firing, >2^53 sequence - each with OBSERVED ARTIFACT', async () => {
+    const { pg, conn } = await freshDb();
+    await runMigrations(conn, { deployment: 'staging' });
+    // Pre-existing objects planted OUTSIDE any step (legitimate baseline state):
+    await conn.query(`CREATE FUNCTION public.legit() RETURNS int LANGUAGE sql AS 'SELECT 1'`);
+    await conn.query(`CREATE FUNCTION public.trg_fire() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''TRIGGER FIRED''; END'`);
+    await conn.query(`CREATE SEQUENCE public.big_seq`);
+    const baseline = await catalogSnapshot(conn);
+    const attacks: [string, string[], RegExp][] = [
+      ['OR REPLACE body swap on pre-existing function',
+        [`CREATE OR REPLACE FUNCTION public.legit() RETURNS int LANGUAGE sql AS 'SELECT 999'`], /pg_proc.*legit/],
+      ['ALTER FUNCTION SET search_path (config drift on pre-existing)',
+        [`ALTER FUNCTION public.legit() SET search_path = attacker`], /pg_proc.*legit/],
+      ['GRANT EXECUTE ON FUNCTION to PUBLIC',
+        [`GRANT EXECUTE ON FUNCTION public.legit() TO PUBLIC`], /pg_proc.*legit/],
+      ['COMMENT ON pre-existing function (description drift)',
+        [`COMMENT ON FUNCTION public.legit() IS 'backdoored'`], /pg_description.*legit/],
+      ['ALTER DATABASE SET (instance-level config drift)',
+        [`ALTER DATABASE postgres SET work_mem = '1GB'`], /pg_db_role_setting/],
+      ['ALTER ROLE SET (role-level config drift)',
+        [`ALTER ROLE CURRENT_USER SET statement_timeout = 0`], /pg_db_role_setting/],
+      ['policy role/command mutation on pre-existing policy',
+        [`CREATE POLICY pre_pol ON public.users USING (true)`, `ALTER POLICY pre_pol ON public.users TO PUBLIC USING (false)`], /pg_policy.*pre_pol/],
+      ['default-ACL plant',
+        [`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO PUBLIC`], /pg_default_acl/],
+      ['ownership change on pre-existing table',
+        [`CREATE ROLE r2_own_test`, `ALTER TABLE public.users OWNER TO r2_own_test`], /owner_rel.*users/],
+    ];
+    for (const [label, batch, artifact] of attacks) {
+      await conn.query('BEGIN');
+      const before = await catalogSnapshot(conn);
+      for (const q of batch) await conn.query(q);
+      const after = await catalogSnapshot(conn);
+      // OBSERVED ARTIFACT: the actual violation text naming the attacked object.
+      let observed = '';
+      try { assertZeroCatalogDelta(before, after, 'atk'); } catch (e) { observed = String(e); }
+      expect(observed, label).toMatch(/CATALOG DELTA refusal/);
+      expect(observed, `${label} - artifact must name the attacked object`).toMatch(artifact);
+      console.log(`OBSERVED[${label}]: ${observed.slice(0, 240)}`);
+      await conn.query('ROLLBACK');
+      expect(JSON.stringify(await catalogSnapshot(conn)), `${label} - post-rollback catalog EXACT`).toBe(JSON.stringify(baseline));
+    }
+
+    // In-transaction trigger ACTUALLY FIRES: create, INSERT, observe the
+    // effect (raised error text), then rollback and prove post-rollback
+    // non-existence. The observed artifact is the actual raised error.
+    await conn.query('BEGIN');
+    const bT = await catalogSnapshot(conn);
+    await conn.query(`CREATE TRIGGER fire_me BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.trg_fire()`);
+    const aT = await catalogSnapshot(conn);
+    let trigObserved = '';
+    try { assertZeroCatalogDelta(bT, aT, 'atk'); } catch (e) { trigObserved = String(e); }
+    expect(trigObserved).toMatch(/pg_trigger.*fire_me/);
+    let firedEffect = '';
+    try { await conn.query(`INSERT INTO public.users(user_id, org_id, phone, data) VALUES ('atk','o','p','{}')`); } catch (e) { firedEffect = String(e); }
+    console.log(`OBSERVED[trigger fires in-tx]: ${firedEffect.slice(0, 160)}`);
+    expect(firedEffect).toMatch(/TRIGGER FIRED/); // the trigger REALLY fired
+    await conn.query('ROLLBACK');
+    const postTrig = await conn.query(`SELECT count(*)::int AS n FROM pg_trigger WHERE tgname = 'fire_me' AND NOT tgisinternal`);
+    expect(Number(postTrig.rows[0]?.['n'])).toBe(0); // post-rollback non-existence
+    expect(JSON.stringify(await catalogSnapshot(conn))).toBe(JSON.stringify(baseline));
+
+    // >2^53 sequence: exact text end to end (JS Number would corrupt).
+    const BIG = '9007199254740993'; // 2^53 + 1
+    await conn.query(`SELECT setval('public.big_seq', $1::text::bigint, true)`, [BIG]);
+    const sv = await conn.query(`SELECT last_value::text AS lv, is_called AS ic FROM public.big_seq`);
+    expect(String(sv.rows[0]?.['lv']), 'sequence value crosses 2^53 exactly').toBe(BIG);
+    expect(sv.rows[0]?.['ic']).toBe(true);
+    const snap = await catalogSnapshot(conn);
+    const seqRow = snap.find(x => x.startsWith('seqval ') && x.includes('big_seq'));
+    console.log(`OBSERVED[>2^53 sequence row]: ${seqRow}`);
+    expect(seqRow, 'snapshot carries the exact bigint text').toContain(BIG);
+    await pg.close();
+  });
+
   it('CTL-DDL-CONFINEMENT condition 6: artifact nextval on a pre-existing sequence is refused AND actively restored', async () => {
     const { pg, conn } = await freshDb();
     await runMigrations(conn, { deployment: 'staging' });
@@ -185,6 +264,28 @@ describe('declarative artifact gate (real-parser AST allowlist)', () => {
     expect(Number(v.rows[0]?.['n'])).toBe(0);
     const sq = await conn.query(`SELECT is_called AS ic FROM public.demo_seq`);
     expect(sq.rows[0]?.['ic']).toBe(false); // actively restored, not merely detected
+    await pg.close();
+  });
+
+  it('R2 defense-in-depth: migration-role functions carry NO default PUBLIC EXECUTE; boot gate asserts the hardening', async () => {
+    const { pg, conn } = await freshDb();
+    await runMigrations(conn, { deployment: 'staging' });
+    await conn.query(`CREATE FUNCTION public.check_acl() RETURNS int LANGUAGE sql AS 'SELECT 1'`);
+    const f = await conn.query(`SELECT proacl::text AS acl FROM pg_proc WHERE proname = 'check_acl'`);
+    const acl = String(f.rows[0]?.['acl'] ?? '');
+    console.log(`OBSERVED[default function ACL]: ${acl === '' ? 'NULL (PUBLIC execute default!)' : acl}`);
+    expect(acl, 'default privileges revoke PUBLIC EXECUTE - no empty-grantee entries').not.toMatch(/(^\{|,)=/);
+    expect(acl).not.toBe(''); // NULL proacl would mean the PUBLIC-execute default
+    await assertSchemaCurrent(conn); // boot gate green with hardening in place
+    // Tamper: re-grant PUBLIC default execute -> boot gate must refuse.
+    await conn.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO PUBLIC`);
+    // The schema-scoped grant leaves the global revoke intact; remove the
+    // global revoke to simulate full tamper:
+    await conn.query(`ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO PUBLIC`);
+    let refused = '';
+    try { await assertSchemaCurrent(conn); } catch (e) { refused = String(e); }
+    console.log(`OBSERVED[boot refuses tampered default ACLs]: ${refused.slice(0, 200)}`);
+    expect(refused).toMatch(/DEFAULT PRIVILEGE refusal/);
     await pg.close();
   });
 

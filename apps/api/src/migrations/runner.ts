@@ -14,7 +14,7 @@
  *    parsed statements of the hashed text, one per driver call.
  *  - REAL-PARSER AST ALLOWLIST (not regex). Every artifact parses with a real
  *    PostgreSQL parser (pgsql-ast-parser); only declarative DDL+DML statement
- *    types are permitted (create/alter/drop table+index, comment, insert,
+ *    types are permitted (create/alter/drop table+index, insert,
  *    update, delete). Transaction control, SELECT/CALL/DO, session advisory
  *    functions and anything unparseable (SAVEPOINT/SET/LOCK syntax) are
  *    rejected at registration - quoting, schema-qualification and comment
@@ -76,7 +76,7 @@ export interface MigrationStep {
  *  reconciliation: DDL+DML only - no DO/CALL/SELECT/functions/tx-control). */
 const ARTIFACT_ALLOWLIST: ReadonlySet<string> = new Set([
   'create table', 'create index', 'alter table', 'drop table', 'drop index',
-  'comment', 'insert', 'update', 'delete',
+  'insert', 'update', 'delete',
 ]);
 
 /** SEMANTIC LAYER (TL architecture ruling + security closures, 2026-09-18 -
@@ -100,14 +100,6 @@ const ARTIFACT_ALLOWLIST: ReadonlySet<string> = new Set([
  *     serialization that actually runs. */
 const CONTROLLED_SCHEMA = 'public';
 const CATALOG_SCHEMA = 'pg_catalog';
-
-/** CTL-DDL-CONFINEMENT condition 4: extensions that give in-transaction code
- *  an external side-effect channel (remote writes, filesystem, untrusted
- *  languages) break rollback containment and are refused at the baseline. */
-const SIDE_EFFECT_EXTENSIONS: ReadonlySet<string> = new Set([
-  'dblink', 'postgres_fdw', 'file_fdw', 'plpythonu', 'plpython3u', 'plpython2u',
-  'plperlu', 'pltclu', 'pljava', 'plr', 'http', 'pg_cron', 'aws_s3',
-]);
 
 /** Exact-shape name node: {name: string} or {name, schema} and nothing else. */
 const isNameNode = (o: Record<string, unknown>): boolean => {
@@ -198,11 +190,6 @@ function canonicalizeStatement(st: Record<string, unknown>): void {
     }
     case 'drop table': for (const n of (st['names'] ?? []) as unknown[]) qualifyRelation(n, 'DROP TABLE'); break;
     case 'drop index': for (const n of (st['names'] ?? []) as unknown[]) qualifyRelation(n, 'DROP INDEX'); break;
-    case 'comment': {
-      const on = st['on'] as Record<string, unknown> | undefined;
-      if (on && (on['type'] === 'table' || on['type'] === 'column')) qualifyRelation(on['name'], 'COMMENT ON');
-      break;
-    }
     case 'insert': qualifyRelation(st['into'], 'INSERT INTO'); break;
     case 'update': qualifyRelation(st['table'], 'UPDATE'); break;
     case 'delete': qualifyRelation(st['from'], 'DELETE FROM'); break;
@@ -237,73 +224,177 @@ export function validateMigrationArtifact(sql: string): void {
  *  migration role. A step must produce ZERO delta; any delta rolls the step
  *  back, so no artifact can leave code/objects behind even through a parser
  *  blind spot. Extension-owned and catalog objects are excluded. */
+/** R2 canonical boundary: ONE JSON object per catalog row (jsonb_build_object,
+ *  EXPLICIT per-catalog column lists); compared as a sorted multiset of
+ *  per-row sha256 hashes in JS - delimiter concatenation cannot exist under
+ *  per-row JSON. Identity keys are fully-qualified NAMES, never bare OIDs;
+ *  OID resolution happens only within one snapshot for joins. */
 const CATALOG_SNAPSHOT_SQL = `
-SELECT id FROM (
-  -- ABSOLUTE code/security classes: any delta is a violation.
-  SELECT 'function:' || n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' ||
-         ':secdef=' || p.prosecdef AS id
+SELECT kind, body FROM (
+  SELECT 'pg_proc' AS kind, jsonb_build_object(
+    'name', n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
+    'secdef', p.prosecdef, 'prokind', p.prokind, 'lang', l.lanname, 'volatile', p.provolatile,
+    'args', pg_get_function_arguments(p.oid), 'owner', r.rolname,
+    'acl', coalesce(p.proacl::text, ''), 'config', coalesce(p.proconfig::text, ''), 'src', p.prosrc) AS body
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      JOIN pg_language l ON l.oid = p.prolang JOIN pg_roles r ON r.oid = p.proowner
    WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
      AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid)
   UNION ALL
-  SELECT 'operator:' || n.nspname || '.' || o.oprname
+  SELECT 'pg_operator', jsonb_build_object(
+    'name', n.nspname || '.' || o.oprname, 'left', o.oprleft::regtype::text, 'right', o.oprright::regtype::text,
+    'code', fn.nspname || '.' || fp.proname, 'result', o.oprresult::regtype::text, 'owner', r.rolname)
     FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace
+      JOIN pg_proc fp ON fp.oid = o.oprcode JOIN pg_namespace fn ON fn.oid = fp.pronamespace
+      JOIN pg_roles r ON r.oid = o.oprowner
    WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
   UNION ALL
-  SELECT 'opclass:' || n.nspname || '.' || c.opcname
+  SELECT 'pg_opclass', jsonb_build_object(
+    'name', n.nspname || '.' || c.opcname, 'intype', c.opcintype::regtype::text,
+    'method', a.amname, 'owner', r.rolname, 'default', c.opcdefault)
     FROM pg_opclass c JOIN pg_namespace n ON n.oid = c.opcnamespace
+      JOIN pg_am a ON a.oid = c.opcmethod JOIN pg_roles r ON r.oid = c.opcowner
    WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
   UNION ALL
-  SELECT 'cast:' || c.castsource::regclass::text || '->' || c.casttarget::regclass::text
+  SELECT 'pg_cast', jsonb_build_object(
+    'source', c.castsource::regtype::text, 'target', c.casttarget::regtype::text,
+    'func', CASE WHEN c.castfunc = 0 THEN '' ELSE (SELECT fn.nspname || '.' || fp.proname FROM pg_proc fp JOIN pg_namespace fn ON fn.oid = fp.pronamespace WHERE fp.oid = c.castfunc) END,
+    'context', c.castcontext, 'method', c.castmethod)
     FROM pg_cast c
-   WHERE c.castfunc <> 0
-     AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                      WHERE p.oid = c.castfunc AND n.nspname LIKE 'pg\\_%' ESCAPE '\\')
+   WHERE NOT EXISTS (SELECT 1 FROM pg_proc fp JOIN pg_namespace fn ON fn.oid = fp.pronamespace
+                      WHERE fp.oid = c.castfunc AND c.castfunc <> 0 AND fn.nspname LIKE 'pg\\_%' ESCAPE '\\')
   UNION ALL
-  SELECT 'trigger:' || t.tgrelid::regclass::text || '.' || t.tgname FROM pg_trigger t WHERE NOT t.tgisinternal
+  SELECT 'pg_trigger', jsonb_build_object(
+    'table', t.tgrelid::regclass::text, 'name', t.tgname,
+    'func', fn.nspname || '.' || fp.proname, 'type', t.tgtype, 'enabled', t.tgenabled)
+    FROM pg_trigger t JOIN pg_proc fp ON fp.oid = t.tgfoid JOIN pg_namespace fn ON fn.oid = fp.pronamespace
+   WHERE NOT t.tgisinternal
   UNION ALL
-  SELECT 'rule:' || r.ev_class::regclass::text || '.' || r.rulename FROM pg_rewrite r WHERE r.rulename <> '_RETURN'
+  SELECT 'pg_rewrite', jsonb_build_object(
+    'table', r.ev_class::regclass::text, 'name', r.rulename, 'action', r.ev_action::text, 'enabled', r.ev_enabled)
+    FROM pg_rewrite r WHERE r.rulename <> '_RETURN'
   UNION ALL
-  SELECT 'extension:' || e.extname FROM pg_extension e
+  SELECT 'pg_extension', jsonb_build_object(
+    'name', e.extname, 'version', e.extversion, 'schema', n.nspname, 'owner', r.rolname)
+    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace JOIN pg_roles r ON r.oid = e.extowner
   UNION ALL
-  SELECT 'event_trigger:' || et.evtname FROM pg_event_trigger et
+  SELECT 'pg_event_trigger', jsonb_build_object(
+    'name', et.evtname, 'event', et.evtevent, 'enabled', et.evtenabled,
+    'func', fn.nspname || '.' || fp.proname, 'owner', r.rolname)
+    FROM pg_event_trigger et JOIN pg_proc fp ON fp.oid = et.evtfoid JOIN pg_namespace fn ON fn.oid = fp.pronamespace
+      JOIN pg_roles r ON r.oid = et.evtowner
   UNION ALL
-  SELECT 'policy:' || pol.polrelid::regclass::text || '.' || pol.polname || ':' || coalesce(pol.polqual::text, '') || ':' || coalesce(pol.polwithcheck::text, '')
+  SELECT 'pg_policy', jsonb_build_object(
+    'table', pol.polrelid::regclass::text, 'name', pol.polname, 'permissive', pol.polpermissive,
+    'roles', (SELECT jsonb_agg(rol.rolname ORDER BY rol.rolname) FROM pg_roles rol WHERE rol.oid = ANY(pol.polroles)),
+    'cmd', pol.polcmd, 'qual', coalesce(pol.polqual::text, ''), 'check', coalesce(pol.polwithcheck::text, ''))
     FROM pg_policy pol
   UNION ALL
-  SELECT 'default_acl:' || d.defaclrole::regrole::text || ':' || d.defaclnamespace::regnamespace::text || ':' || d.defaclobjtype::text || ':' || coalesce(d.defaclacl::text, '')
-    FROM pg_default_acl d
+  SELECT 'pg_default_acl', jsonb_build_object(
+    'role', dr.rolname, 'schema', coalesce(n.nspname, ''), 'objtype', d.defaclobjtype, 'acl', coalesce(d.defaclacl::text, ''))
+    FROM pg_default_acl d JOIN pg_roles dr ON dr.oid = d.defaclrole LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
   UNION ALL
-  SELECT 'role_setting:' || s.setdatabase::regclass::text || ':' || s.setrole::regclass::text || ':' || coalesce(s.setconfig::text, '')
+  SELECT 'pg_db_role_setting', jsonb_build_object(
+    'database', coalesce(db.datname, 'ALL'),
+    'role', coalesce(rol.rolname, 'ALL'),
+    'config', coalesce((SELECT jsonb_agg(v ORDER BY v) FROM unnest(s.setconfig) AS v), '[]'::jsonb))
     FROM pg_db_role_setting s
+    LEFT JOIN pg_database db ON db.oid = s.setdatabase
+    LEFT JOIN pg_roles rol ON rol.oid = s.setrole
   UNION ALL
-  -- VALUE-CHANGE maps on PRE-EXISTING objects: ownership and ACL drift on
-  -- objects that existed before the step (new data objects are legal).
-  SELECT 'owner:rel:' || c.oid::text || ':' || c.relowner::regrole::text
+  -- pg_description for every securable class: COMMENT drift is security drift.
+  SELECT 'pg_description', jsonb_build_object(
+    'class', d.classoid::regclass::text,
+    'obj', coalesce(
+      CASE d.classoid
+        WHEN 'pg_class'::regclass THEN (SELECT cn.nspname || '.' || cc.relname || coalesce('.' || a.attname, '')
+          FROM pg_class cc JOIN pg_namespace cn ON cn.oid = cc.relnamespace LEFT JOIN pg_attribute a ON a.attrelid = cc.oid AND a.attnum = d.objsubid
+          WHERE cc.oid = d.objoid)
+        WHEN 'pg_proc'::regclass THEN (SELECT pn.nspname || '.' || pp.proname || '(' || pg_get_function_identity_arguments(pp.oid) || ')' FROM pg_proc pp JOIN pg_namespace pn ON pn.oid = pp.pronamespace WHERE pp.oid = d.objoid)
+        WHEN 'pg_namespace'::regclass THEN (SELECT nspname FROM pg_namespace WHERE oid = d.objoid)
+        WHEN 'pg_trigger'::regclass THEN (SELECT tgrelid::regclass::text || '.' || tgname FROM pg_trigger WHERE oid = d.objoid)
+        WHEN 'pg_policy'::regclass THEN (SELECT polrelid::regclass::text || '.' || polname FROM pg_policy WHERE oid = d.objoid)
+        WHEN 'pg_extension'::regclass THEN (SELECT extname FROM pg_extension WHERE oid = d.objoid)
+        WHEN 'pg_type'::regclass THEN (SELECT d.objoid::regtype::text)
+        WHEN 'pg_operator'::regclass THEN (SELECT onsp.nspname || '.' || oo.oprname FROM pg_operator oo JOIN pg_namespace onsp ON onsp.oid = oo.oprnamespace WHERE oo.oid = d.objoid)
+        WHEN 'pg_opclass'::regclass THEN (SELECT ocn.nspname || '.' || oc.opcname FROM pg_opclass oc JOIN pg_namespace ocn ON ocn.oid = oc.opcnamespace WHERE oc.oid = d.objoid)
+      END, d.classoid::regclass::text || ':' || d.objoid::text || ':' || d.objsubid::text),
+    'description', d.description)
+    FROM pg_description d
+   WHERE d.classoid IN ('pg_class'::regclass, 'pg_proc'::regclass, 'pg_namespace'::regclass, 'pg_trigger'::regclass,
+                       'pg_policy'::regclass, 'pg_extension'::regclass, 'pg_type'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass)
+     AND coalesce(
+      CASE d.classoid
+        WHEN 'pg_class'::regclass THEN (SELECT cn.nspname FROM pg_class cc JOIN pg_namespace cn ON cn.oid = cc.relnamespace WHERE cc.oid = d.objoid)
+        WHEN 'pg_proc'::regclass THEN (SELECT pn.nspname FROM pg_proc pp JOIN pg_namespace pn ON pn.oid = pp.pronamespace WHERE pp.oid = d.objoid)
+        WHEN 'pg_namespace'::regclass THEN (SELECT nspname FROM pg_namespace WHERE oid = d.objoid)
+        WHEN 'pg_operator'::regclass THEN (SELECT onsp.nspname FROM pg_operator oo JOIN pg_namespace onsp ON onsp.oid = oo.oprnamespace WHERE oo.oid = d.objoid)
+        WHEN 'pg_opclass'::regclass THEN (SELECT ocn.nspname FROM pg_opclass oc JOIN pg_namespace ocn ON ocn.oid = oc.opcnamespace WHERE oc.oid = d.objoid)
+      END, 'public') NOT LIKE 'pg\\_%' ESCAPE '\\'
+  UNION ALL
+  -- Value-maps on PRE-EXISTING objects (new data objects are legal):
+  -- ownership and ACL drift, keyed by fully-qualified NAME.
+  SELECT 'owner_rel', jsonb_build_object('name', n.nspname || '.' || c.relname, 'owner', r.rolname)
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_roles r ON r.oid = c.relowner
+   WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'owner_nsp', jsonb_build_object('name', n.nspname, 'owner', r.rolname)
+    FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner
+   WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'acl_rel', jsonb_build_object('name', n.nspname || '.' || c.relname, 'acl', coalesce(c.relacl::text, ''))
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
   UNION ALL
-  SELECT 'owner:nsp:' || n.oid::text || ':' || n.nspowner::regrole::text
-    FROM pg_namespace n WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
-  UNION ALL
-  SELECT 'acl:rel:' || c.oid::text || ':' || coalesce(c.relacl::text, '')
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  SELECT 'acl_nsp', jsonb_build_object('name', n.nspname, 'acl', coalesce(n.nspacl::text, ''))
+    FROM pg_namespace n
    WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
   UNION ALL
-  SELECT 'acl:nsp:' || n.oid::text || ':' || coalesce(n.nspacl::text, '')
-    FROM pg_namespace n WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
-  UNION ALL
-  -- Non-transactional state: sequence values NEVER roll back (condition 6).
-  -- Keyed by sequence name so a step-created sequence is excluded by the
-  -- new-object filter below; a value drift on a PRE-EXISTING sequence is caught.
-  SELECT 'seqval:' || seq.schemaname || '.' || seq.sequencename || ':' || coalesce(seq.last_value::text, 'unused')
+  -- Sequences: last_value and is_called EXACT TEXT end to end (no Number()).
+  SELECT 'seqval', jsonb_build_object('name', seq.schemaname || '.' || seq.sequencename,
+    'last_value', coalesce(seq.last_value::text, 'unused'), 'is_called', (seq.last_value IS NOT NULL))
     FROM pg_sequences seq
    WHERE seq.schemaname NOT LIKE 'pg\\_%' ESCAPE '\\' AND seq.schemaname <> 'information_schema'
-) objs ORDER BY 1`;
+) objs ORDER BY kind, body::text`;
 
+/** R2 statement-kind x catalog matrix (bounded-universe binding). Every
+ *  gate-accepted statement kind maps to the catalogs it may write. Diff scope
+ *  = union(matrix writable catalogs) + the NEVER-TOUCH set. Maintenance rule:
+ *  adding a gate statement kind REQUIRES updating this matrix in the same
+ *  change. Writable (data-object) classes accept NEW rows only; any change
+ *  to a PRE-EXISTING row (alteration or drop) is a hard fail. NEVER-TOUCH:
+ *  ANY delta (add, drop, or alteration) is a hard fail + rollback. */
+export const STATEMENT_CATALOG_MATRIX: Readonly<Record<string, readonly string[]>> = {
+  'create table': ['owner_rel', 'acl_rel'],
+  'create index': ['owner_rel', 'acl_rel'],
+  'drop table': [],
+  'drop index': [],
+  'alter table': ['owner_rel', 'acl_rel'],
+  'insert/update/delete/select': [],
+};
+const NEVER_TOUCH_KINDS: ReadonlySet<string> = new Set([
+  'pg_proc', 'pg_trigger', 'pg_rewrite', 'pg_operator', 'pg_opclass', 'pg_cast',
+  'pg_extension', 'pg_event_trigger', 'pg_policy', 'pg_default_acl',
+  'pg_db_role_setting', 'pg_description',
+]);
+const VALUE_MAP_KINDS: ReadonlySet<string> = new Set(['owner_rel', 'owner_nsp', 'acl_rel', 'acl_nsp', 'seqval']);
+
+export interface CatalogRow { kind: string; body: Record<string, unknown>; bodyText: string; hash: string }
+/** Canonical per-row JSON strings (kind + one jsonb object) - the unit tests
+ *  and evidence compare these; the diff engine hashes per row. */
 export async function catalogSnapshot(conn: Queryable): Promise<string[]> {
+  const rows = await catalogSnapshotRows(conn);
+  return rows.map(r => `${r.kind} ${r.bodyText}`).sort();
+}
+export async function catalogSnapshotRows(conn: Queryable): Promise<CatalogRow[]> {
+  // ERR-PROPAGATE: a snapshot error aborts the step (no catch anywhere).
   const r = await conn.query(CATALOG_SNAPSHOT_SQL);
-  return r.rows.map(row => String(row['id']));
+  return r.rows.map(row => {
+    const kind = String(row['kind']);
+    const bodyText = typeof row['body'] === 'string' ? String(row['body']) : JSON.stringify(row['body']);
+    const hash = createHash('sha256').update(`${kind}\n${bodyText}`).digest('hex');
+    return { kind, body: (typeof row['body'] === 'object' ? row['body'] : JSON.parse(bodyText)) as Record<string, unknown>, bodyText, hash };
+  });
 }
 
 /** CTL-DDL-CONFINEMENT condition 6: sequence values are NON-TRANSACTIONAL -
@@ -331,7 +422,8 @@ async function restoreSequenceValues(conn: Queryable, before: Map<string, SeqVal
     const nv = now.get(name);
     if (nv && (nv.lastValue !== bv.lastValue || nv.isCalled !== bv.isCalled)) {
       const [sch, seq] = name.split('.') as [string, string];
-      await conn.query(`SELECT pg_catalog.setval('"${sch}"."${seq}"', $1, $2)`, [Number(bv.lastValue), bv.isCalled]);
+      // Exact text: the bigint travels as a string parameter, never a JS number.
+      await conn.query(`SELECT pg_catalog.setval('"${sch}"."${seq}"', $1::text::bigint, $2)`, [bv.lastValue, bv.isCalled]);
       restored.push(name);
     }
   }
@@ -343,29 +435,57 @@ async function restoreSequenceValues(conn: Queryable, before: Map<string, SeqVal
  *  classes (owner:/acl:/seqval:): only a VALUE change on an object present in
  *  BOTH snapshots is a violation; entries appearing/disappearing with
  *  created/dropped data objects are legal declarative DDL. */
-const ABSOLUTE_PREFIX = /^(function|operator|opclass|cast|trigger|rule|extension|event_trigger|policy|default_acl|role_setting):/;
-const valueKey = (id: string): string => id.slice(0, id.lastIndexOf(':'));
 
-export function assertZeroCatalogDelta(before: string[], after: string[], version: string): void {
+/** R2 diff rule: NEVER-TOUCH kinds require an EXACT sorted-multiset match of
+ *  per-row hashes (any add, drop, OR alteration of a pre-existing object is
+ *  a hard fail). Value-map kinds (ownership/ACL/sequence values): rows whose
+ *  identity NAME existed before must be byte-identical (alteration or drop =
+ *  fail); brand-new names (data objects the step created) are legal. */
+export function assertZeroCatalogDeltaRows(before: CatalogRow[], after: CatalogRow[], version: string): void {
   const violations: string[] = [];
-  const bAbs = new Set(before.filter(x => ABSOLUTE_PREFIX.test(x)));
-  const aAbs = new Set(after.filter(x => ABSOLUTE_PREFIX.test(x)));
-  for (const x of after) if (ABSOLUTE_PREFIX.test(x) && !bAbs.has(x)) violations.push(`added ${x}`);
-  for (const x of before) if (ABSOLUTE_PREFIX.test(x) && !aAbs.has(x)) violations.push(`removed ${x}`);
-  const bVal = new Map(before.filter(x => !ABSOLUTE_PREFIX.test(x)).map(x => [valueKey(x), x]));
-  const aVal = new Map(after.filter(x => !ABSOLUTE_PREFIX.test(x)).map(x => [valueKey(x), x]));
+  const count = (rows: CatalogRow[]) => {
+    const m = new Map<string, number>();
+    for (const r of rows) m.set(r.hash, (m.get(r.hash) ?? 0) + 1);
+    return m;
+  };
+  const bNever = count(before.filter(r => NEVER_TOUCH_KINDS.has(r.kind)));
+  const aNever = count(after.filter(r => NEVER_TOUCH_KINDS.has(r.kind)));
+  const render = (rows: CatalogRow[], hash: string) => rows.find(r => r.hash === hash);
+  for (const [h, n] of aNever) {
+    const got = bNever.get(h) ?? 0;
+    if (n > got) violations.push(`added ${render(after, h)!.kind} ${JSON.stringify(render(after, h)!.body)}`);
+  }
+  for (const [h, n] of bNever) {
+    const got = aNever.get(h) ?? 0;
+    if (n > got) violations.push(`removed-or-altered ${render(before, h)!.kind} ${JSON.stringify(render(before, h)!.body)}`);
+  }
+  const keyOf = (r: CatalogRow) => `${r.kind}:${String(r.body['name'])}`;
+  const bVal = new Map(before.filter(r => VALUE_MAP_KINDS.has(r.kind)).map(r => [keyOf(r), r]));
+  const aVal = new Map(after.filter(r => VALUE_MAP_KINDS.has(r.kind)).map(r => [keyOf(r), r]));
   for (const [k, bv] of bVal) {
     const av = aVal.get(k);
-    if (av !== undefined && av !== bv) violations.push(`changed ${bv} -> ${av}`);
+    if (!av) violations.push(`dropped ${bv.kind} ${JSON.stringify(bv.body)}`);
+    else if (av.hash !== bv.hash) violations.push(`altered ${bv.kind} ${JSON.stringify(bv.body)} -> ${JSON.stringify(av.body)}`);
   }
   if (violations.length > 0) {
     throw new Error(
       `release-migrations: CATALOG DELTA refusal - step '${version}' changed the database code/privilege/ownership ` +
-      `surface inside its transaction (${violations.join('; ')}). CTL-DDL-CONFINEMENT: zero function/operator/opclass/` +
-      `cast/trigger/rule/extension/event-trigger/policy/default-ACL/role-setting deltas and zero ownership/ACL/` +
-      `sequence-value drift on pre-existing objects are permitted - rolling back BEFORE COMMIT (fail-closed)`,
+      `surface inside its transaction (${violations.join('; ')}). R2 canonical boundary: the NEVER-TOUCH set ` +
+      `(pg_proc/trigger/rewrite/operator/opclass/cast/extension/event-trigger/policy/default-acl/db-role-setting/` +
+      `description) permits NO delta, and ownership/ACL/sequence values on pre-existing objects permit none either - ` +
+      `rolling back BEFORE COMMIT (fail-closed)`,
     );
   }
+}
+/** Back-compat wrapper used by tests/evidence written against text snapshots. */
+export function assertZeroCatalogDelta(before: string[], after: string[], version: string): void {
+  const parse = (rows: string[]): CatalogRow[] => rows.map(t => {
+    const sp = t.indexOf(' ');
+    const kind = t.slice(0, sp); const bodyText = t.slice(sp + 1);
+    return { kind, body: JSON.parse(bodyText) as Record<string, unknown>, bodyText,
+             hash: createHash('sha256').update(`${kind}\n${bodyText}`).digest('hex') };
+  });
+  assertZeroCatalogDeltaRows(parse(before), parse(after), version);
 }
 
 /** STRICT guard-object validation (independent security, 2026-09-18): exact
@@ -503,8 +623,12 @@ CREATE TABLE IF NOT EXISTS public.contake_db_identity(
   id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   deployment_label text NOT NULL,
   instance_id text NOT NULL,
+  ext_baseline jsonb,
+  migration_role text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE public.contake_db_identity ADD COLUMN IF NOT EXISTS ext_baseline jsonb;
+ALTER TABLE public.contake_db_identity ADD COLUMN IF NOT EXISTS migration_role text;
 `;
 
 export interface DbIdentity { deploymentLabel: string; instanceId: string }
@@ -622,17 +746,12 @@ export async function runMigrations(
     // the whole run - unqualified built-ins resolve to pg_catalog only and no
     // schema can be shadowed in. Re-pinned per step below.
     await client.query(`SET search_path = ''`);
-    // CTL-DDL-CONFINEMENT condition 4: rollback containment fails if an
-    // installed extension gives an in-transaction object an EXTERNAL side
-    // effect channel. The extension baseline must be free of them.
-    const ext = await client.query(`SELECT extname FROM pg_extension`);
-    const bad = ext.rows.map(r => String(r['extname'])).filter(x => SIDE_EFFECT_EXTENSIONS.has(x));
-    if (bad.length > 0) {
-      throw new Error(
-        `release-migrations: EXTENSION BASELINE refusal - external-side-effect extension(s) installed: ${bad.join(', ')}. ` +
-        `Detect-and-rollback cannot contain out-of-transaction effects (dblink/fdw/plpython/...); remove them before running migrations (fail-closed)`,
-      );
-    }
+    // R2: the fixed-name denylist is DELETED. Baseline equality only: the
+    // extension set is pinned (name+version) at bootstrap TOFU into the
+    // identity row and every later run must find it byte-identical. The
+    // per-step NEVER-TOUCH diff separately forbids any in-run change.
+    const extNow = await client.query(`SELECT jsonb_agg(jsonb_build_object('name', extname, 'version', extversion) ORDER BY extname) AS s FROM pg_extension`);
+    const currentExt = JSON.stringify(extNow.rows[0]?.['s'] ?? []);
     await client.query(`SELECT pg_catalog.pg_advisory_lock(${RUNNER_LOCK_KEY})`);
     try {
       await client.query('BEGIN');
@@ -646,12 +765,31 @@ export async function runMigrations(
           identity = { deploymentLabel: opts.deployment, instanceId: randomBytes(8).toString('hex') };
           stampedNow = true;
           await client.query(
-            `INSERT INTO public.contake_db_identity(id, deployment_label, instance_id) VALUES(1, $1, $2)`,
-            [identity.deploymentLabel, identity.instanceId],
+            `INSERT INTO public.contake_db_identity(id, deployment_label, instance_id, ext_baseline) VALUES(1, $1, $2, $3::jsonb)`,
+            [identity.deploymentLabel, identity.instanceId, currentExt],
           );
         } else {
           identity = pre.identity!;
+          const base = await client.query(`SELECT ext_baseline AS b FROM public.contake_db_identity WHERE id = 1`);
+          const pinned = base.rows[0]?.['b'];
+          if (pinned === null || pinned === undefined) {
+            // One-time adoption for pre-R2 deployments: pin what is there.
+            await client.query(`UPDATE public.contake_db_identity SET ext_baseline = $1::jsonb WHERE id = 1`, [currentExt]);
+          } else if (JSON.stringify(pinned) !== currentExt) {
+            throw new Error(
+              `release-migrations: EXTENSION BASELINE refusal - installed extension set differs from the pinned ` +
+              `bootstrap baseline (pinned ${JSON.stringify(pinned)} vs current ${currentExt}) - ` +
+              `extensions change out of band only via a reviewed re-pin (fail-closed)`,
+            );
+          }
         }
+        // R2 defense-in-depth (ruling §6): any code object the migration role
+        // somehow leaves behind must be uncallable - REVOKE EXECUTE ON
+        // FUNCTIONS from PUBLIC by DEFAULT, granted to no one. The SECURITY
+        // INVOKER trigger path dies with it. Idempotent and runner-owned; the
+        // boot gate asserts this default-privilege state on every boot.
+        await client.query(`ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`);
+        await client.query(`UPDATE public.contake_db_identity SET migration_role = CURRENT_USER WHERE id = 1`);
         applied = await readAppliedRows(client);
         verifyHistoryPrefix(applied, migrations);
         await client.query('COMMIT');
@@ -684,14 +822,14 @@ export async function runMigrations(
               );
             }
           }
-          const catalogBefore = await catalogSnapshot(client);
+          const catalogBefore = await catalogSnapshotRows(client);
           sequencesBefore = await sequenceValues(client);
           for (const stmt of artifactStatements(m.sql)) {
             await client.query(`SELECT pg_catalog.set_config('search_path', '', true)`);
             await client.query(stmt);
           }
           // Zero function/operator/cast/trigger/rule delta across the step.
-          assertZeroCatalogDelta(catalogBefore, await catalogSnapshot(client), m.version);
+          assertZeroCatalogDeltaRows(catalogBefore, await catalogSnapshotRows(client), m.version);
           // The whole-run session advisory lock must still be held (no
           // smuggled unlock): session-state assertion, not a name filter.
           const held = await client.query(
@@ -717,7 +855,8 @@ export async function runMigrations(
           await client.query('ROLLBACK').catch(() => undefined);
           // Condition 6: rollback cannot restore sequence state - do it
           // actively, then hard-fail with the original error retained.
-          const restored = sequencesBefore ? await restoreSequenceValues(client, sequencesBefore).catch(() => [] as string[]) : [];
+          // ERR-PROPAGATE: a restore failure is itself a hard failure (no swallow).
+          const restored = sequencesBefore ? await restoreSequenceValues(client, sequencesBefore) : [];
           if (restored.length > 0 && e instanceof Error) {
             e.message += ` [non-transactional sequence state actively restored: ${restored.join(', ')}]`;
           }
@@ -789,6 +928,34 @@ export async function assertSchemaCurrent(
     verifyHistoryPrefix(applied, expected);
   } catch (e) {
     throw new Error(`release-migrations: ${(e as Error).message} - refusing to boot (fail-closed)`);
+  }
+  // R2 ruling §6: the boot gate asserts the migration role's default-privilege
+  // hardening is in place - PUBLIC must hold NO default EXECUTE on functions
+  // the migration role creates (a surviving code object must be uncallable).
+  {
+    const dp = await conn.query(
+      `SELECT r.rolname AS role, d.defaclacl::text AS acl
+         FROM pg_default_acl d JOIN pg_roles r ON r.oid = d.defaclrole
+        WHERE d.defaclobjtype = 'f' AND d.defaclnamespace = 0
+          AND r.rolname = (SELECT migration_role FROM public.contake_db_identity WHERE id = 1)`,
+    );
+    const roleRow = await conn.query(`SELECT migration_role AS m FROM public.contake_db_identity WHERE id = 1`);
+    const migRole = roleRow.rows[0]?.['m'];
+    if (!migRole) {
+      throw new Error(
+        'release-migrations: no migration role recorded - this database predates the R2 default-privilege hardening. ' +
+        'Run the release-migration job once to adopt it - refusing to boot (fail-closed)',
+      );
+    }
+    const row = dp.rows[0];
+    const acl = String(row?.['acl'] ?? '');
+    if (!row || /(^\{|,)=/.test(acl)) {
+      throw new Error(
+        `release-migrations: DEFAULT PRIVILEGE refusal - migration role '${migRole}' lacks the PUBLIC function-EXECUTE ` +
+        `revocation (observed default ACL: ${acl || 'none'}) - a persisting code object could be callable by any role. ` +
+        `Run the release-migration job to re-apply hardening - refusing to boot (fail-closed)`,
+      );
+    }
   }
   if (opts?.deployment !== undefined || opts?.instanceId !== undefined) {
     const identity = await readDbIdentity(conn);
