@@ -673,10 +673,13 @@ if (phase === 'phase1') {
   check('wrong-ack run applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
 
   const staleAck = pf.requiredAck;
-  await ins('u-late', '+972555000999');
+  // The ack binds the canonical inconsistency LISTS (+ target + deployment):
+  // the state change must alter a LIST to invalidate it. A blank phone enters
+  // blankPhoneUsers - the minted digest no longer matches the recomputed one.
+  await ins('u-late', '');
   const stale = cli(['--database-url', url, '--deployment', 'staging', '--ack', staleAck]);
   console.error(`OBSERVED[cli stale-ack]: status=${stale.status}`);
-  check('REAL CLI refuses a STALE ack (state changed after it was minted; runner recomputes under lock)', stale.status !== 0 && stale.stderr.includes('OPERATOR GATE refusal'), { status: stale.status });
+  check('REAL CLI refuses a STALE ack (list state changed after it was minted; runner recomputes under lock)', stale.status !== 0 && stale.stderr.includes('OPERATOR GATE refusal'), { status: stale.status });
   await tofu.query(`DELETE FROM users WHERE user_id = 'u-late'`);
 
   await admin.query(`DROP DATABASE IF EXISTS contake_tofu2 WITH (FORCE)`);
@@ -711,11 +714,16 @@ if (phase === 'phase1') {
   check('tofu: login-by-phone can never match a NULL phone', Number(noMatch.rows[0]?.['n']) === 0);
 
   // 4) the acknowledged report + digest PERSISTED as migration evidence.
-  const ev = await tofu.query(`SELECT version, list_digest, target FROM public.schema_migration_evidence ORDER BY version`);
+  const ev = await tofu.query(`SELECT version, list_digest, target, report FROM public.schema_migration_evidence ORDER BY version`);
+  // 0002 persists the ACKED digest (pre-execution lists); 0003 persists its
+  // OWN in-transaction recompute (post-normalization lists) - both carry the
+  // same operator ack string in their report.
   check('acknowledged report/digest persisted with the migration evidence (0002 + 0003)',
     JSON.stringify(ev.rows.map(x => String(x['version']))) === '["0002","0003"]'
-    && ev.rows.every(x => String(x['list_digest']) === pf.listDigest)
-    && ev.rows.every(x => String(x['target']) === 'contake_tofu'), ev.rows);
+    && String(ev.rows[0]!['list_digest']) === pf.listDigest
+    && String(ev.rows[1]!['list_digest']) !== pf.listDigest
+    && ev.rows.every(x => String(x['target']) === 'contake_tofu')
+    && ev.rows.every(x => String((x['report'] as { ack?: string }).ack) === pf.requiredAck), ev.rows.map(x => ({ version: x['version'], list_digest: String(x['list_digest']).slice(0, 16), target: x['target'] })));
 
   // 5) a REAL cross-tenant phone collision still blocks loudly WITH a valid ack
   //    (the ack is a precondition, never an override).

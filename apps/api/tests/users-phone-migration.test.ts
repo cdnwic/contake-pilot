@@ -260,6 +260,42 @@ describe('SA2 operator gate (runner-enforced, recomputed under lock)', () => {
       expect(r.rows.map(x => x['version'])).toEqual(['0001']);
     } finally { await raw.close(); }
   });
+  it('the ack covers the attended 0002+0003 SEQUENCE: blank phones move the recomputed lists after 0002, 0003 continues in the same run', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      await seedClean(db);
+      await db.query(`INSERT INTO public.users(user_id, phone, data) VALUES ('u-blank', '', '{}')`);
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      expect(pf.blankPhoneUsers.length).toBe(1);
+      const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) });
+      expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
+      // the recomputed post-0002 lists differ from the acked ones; evidence
+      // records the recomputed digest per step.
+      const ev = await db.query(`SELECT version, list_digest FROM public.schema_migration_evidence ORDER BY version`);
+      expect(ev.rows.length).toBe(2);
+      expect(ev.rows[0]!['list_digest']).not.toBe(ev.rows[1]!['list_digest']);
+    } finally { await raw.close(); }
+  });
+  it('the accepted ack does NOT leak across runs: a later gated step demands a FRESH ack', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      const ack = operatorAckFor(pf);
+      const late: typeof MIGRATIONS[number] = {
+        version: '0004', name: 'later-gated', description: 'later gated step', template: 'ddl.create-index',
+        params: { index: 'users_phone_org_idx', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
+        requiresOperatorAck: true,
+      };
+      await runMigrations(db, { deployment: STAGING, operatorAck: ack });
+      // a NEW run presenting the OLD ack for a NEW gated step: the preflight
+      // recompute must match - the old ack covers nothing new.
+      await expect(runMigrations(db, { deployment: STAGING, migrations: [...MIGRATIONS, late], operatorAck: 'ack:' + '0'.repeat(64) }))
+        .rejects.toThrow('OPERATOR GATE refusal');
+      const pfNow = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      const ok = await runMigrations(db, { deployment: STAGING, migrations: [...MIGRATIONS, late], operatorAck: operatorAckFor(pfNow) });
+      expect(ok.appliedNow).toEqual(['0004']);
+    } finally { await raw.close(); }
+  });
   it("test deployments stay gate-exempt (hermetic synthetic lanes)", async () => {
     const raw = new PGlite(); const db = pgliteConnectable(raw);
     try {

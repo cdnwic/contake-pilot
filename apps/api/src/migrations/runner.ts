@@ -1060,6 +1060,12 @@ export async function runMigrations(
   let stampedNow = false;
   let applied: AppliedMigrationRow[];
   const appliedNow: string[] = [];
+  /** SA2: an ack accepted by an earlier gated step IN THIS RUN covers the
+   *  later gated steps of the same attended sequence (0002 normalizes the
+   *  rows, which legitimately moves the recomputed lists for 0003). The
+   *  recompute still runs; the continuation match holds only inside this
+   *  locked run - a replayed ack in a LATER run matches nothing. */
+  let gateAcceptedThisRun: string | undefined;
   try {
     // TL semantic layer: pin the migration session's search_path EMPTY for
     // the whole run - unqualified built-ins resolve to pg_catalog only and no
@@ -1190,13 +1196,14 @@ export async function runMigrations(
           if (m.requiresOperatorAck === true && opts.deployment !== 'test' && opts.deployment !== 'test-harness') {
             const pf = await computeUsersPhonePreflight(client, { deployment: opts.deployment });
             const expected = operatorAckFor(pf);
-            if (opts.operatorAck !== expected) {
+            if (opts.operatorAck !== expected && (gateAcceptedThisRun === undefined || opts.operatorAck !== gateAcceptedThisRun)) {
               throw new Error(
                 `release-migrations: OPERATOR GATE refusal - step '${m.version}' mutates credential-identity row data and ` +
                 `requires the attended-TOFU ack for THIS target and CURRENT state (target ${pf.target}, deployment ${opts.deployment}, ` +
                 `listDigest ${pf.listDigest.slice(0, 16)}...). Supplied ack is absent/wrong/stale/replayed - refusing BEFORE any write (fail-closed, rolling back).`,
               );
             }
+            if (opts.operatorAck === expected) gateAcceptedThisRun = opts.operatorAck;
             // Persist the acknowledged report + digest with the migration's
             // evidence record (rolls back with the step on any failure).
             await client.query(
