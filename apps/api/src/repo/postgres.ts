@@ -92,8 +92,10 @@ CREATE INDEX IF NOT EXISTS channels_address ON channels(address);
 CREATE UNIQUE INDEX IF NOT EXISTS reports_client_report_id_unique ON reports(client_report_id);
 -- users_phone_unique is intentionally NOT created at bootstrap (QA 2026-09-18,
 -- preservation-first): a legacy deployment may hold colliding/padded phones;
--- the unique index is created ONLY by the approved migration tool
--- (services/phone-migration.ts: preflight -> backup -> normalize -> index).
+-- the unique index is created ONLY by the reviewed forward migration
+-- (services/phone-migration.ts: preflight -> normalize -> index, code-review
+-- only). Snapshot/backup/restore belongs to the separate infra track
+-- (architecture separation 2026-09-18), not to this gate.
 CREATE INDEX IF NOT EXISTS notification_jobs_idem ON notification_jobs(idempotency_key);
 CREATE INDEX IF NOT EXISTS audit_log_org_id ON audit_log(org_id);
 CREATE INDEX IF NOT EXISTS change_requests_event_id ON change_requests(event_id);

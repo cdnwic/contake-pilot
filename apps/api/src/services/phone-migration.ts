@@ -1,4 +1,8 @@
-/** users-phone duplicate preflight + reversible migration (QA 21:06 stop-ship,
+/** users-phone duplicate preflight + FORWARD migration (QA 21:06 stop-ship,
+ *  architecture separation 2026-09-18: the bespoke backup/restore CLI is
+ *  DECOUPLED from the Super Admin gate - it lives on the separate infra
+ *  track; this module is preflight + normalize + canonical index +
+ *  locked maintenance migration ONLY. Full history preserved in git).
  *  v2 2026-09-18 after QA/security review): for deployments whose users data
  *  predates the users_phone_unique partial unique index on btrim(phone).
  *  The index is NOT created at bootstrap (preservation-first): it is created
@@ -148,30 +152,6 @@ const norm = (v: string | null): string | null => {
 };
 const hashData = (data: unknown): string => createHash('sha256').update(JSON.stringify(data)).digest('hex');
 
-/** Deterministic canonical JSON: object keys sorted recursively, so digests
- *  are stable across JSONB round-trips (jsonb reorders keys). */
-const canonical = (v: unknown): string => {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
-  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
-  const o = v as Record<string, unknown>;
-  return `{${Object.keys(o).sort().map(k => `${JSON.stringify(k)}:${canonical(o[k])}`).join(',')}}`;
-};
-const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex');
-
-/** sha256 over the CANONICAL full row: user_id, org_id, email, phone, data. */
-export const rowDigest = (r: { user_id: string; org_id: string; email: string | null; phone: string | null; data: unknown }): string =>
-  sha256(canonical({ user_id: r.user_id, org_id: r.org_id, email: r.email, phone: r.phone, data: r.data }));
-
-/** sha256 binding the header (type/version/createdAt/rowCount/index state)
- *  AND the ordered row digest set: any header, order, or membership change
- *  without a recomputed manifest is detected. */
-export const manifestDigest = (
-  h: { type: string; version: number; createdAt: string; rowCount: number; usersPhoneUniqueIndex: { existed: boolean; definition: string | null } },
-  orderedRowDigests: string[],
-): string => sha256(canonical({
-  type: h.type, version: h.version, createdAt: h.createdAt, rowCount: h.rowCount,
-  usersPhoneUniqueIndex: h.usersPhoneUniqueIndex, rowDigests: orderedRowDigests,
-}));
 
 /** THE ONLY index this tool will ever create. Stored artifact SQL is NEVER
  *  executed (security 2026-09-18): restore recreates this exact statement. */
@@ -185,167 +165,6 @@ const CANONICAL_INDEX_NORMALIZED = normalizeIndexDef(CANONICAL_INDEX_SQL);
 /** Advisory lock key serializing concurrent migration runs. */
 export const MIGRATION_LOCK_KEY = 7263849598301;
 
-/** External MAC credentials for artifact authentication. The KEY ITSELF
- *  comes ONLY from managed secrets (vault / secret-manager env): never
- *  committed, never passed via argv, never stored inside the artifact.
- *  keyId identifies the key VERSION (rotation); env binds the artifact to
- *  one environment/domain (cross-env replay is refused). */
-export interface ArtifactAuth {
-  /** Canonical form ONLY: exactly 64 lowercase hex chars (32 bytes). Buffers
-   *  and every other representation are REJECTED, so the decoded-byte
-   *  weakness checks below are the single code path for every caller. */
-  key: string;
-  keyId: string;
-  env: string;
-}
-
-/** Canonical MAC key form (QA 2026-09-18 v6): EXACTLY 64 lowercase hex
- *  chars decoding to 32 bytes. Weak/predictable/repeated/known values are
- *  REJECTED: repeated single bytes, repeated 2/4/8/16-byte blocks,
- *  ascending/descending byte runs, and a documented known-weak list.
- *  The key is EXTERNAL (managed secrets) and NEVER logged - errors here
- *  deliberately describe the CLASS of weakness, never the value. */
-const KNOWN_WEAK_KEYS = new Set([
-  '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8', // sha256('password')
-  'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', // sha256('')
-  '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f', // documented example pattern
-]);
-export const parseBackupMacKey = (key: string): Buffer => {
-  if (!/^[0-9a-f]{64}$/.test(key)) throw new Error('MAC key must be canonical: exactly 64 lowercase hex characters (32 bytes), from the managed secret store');
-  const bytes = Buffer.from(key, 'hex');
-  const allEqual = bytes.every(b => b === bytes[0]);
-  if (allEqual) throw new Error('MAC key rejected: repeated single byte (weak/predictable)');
-  for (const block of [16, 8, 4, 2]) {
-    const first = bytes.subarray(0, block).toString('hex');
-    let repeated = true;
-    for (let off = block; off < 32; off += block) {
-      if (bytes.subarray(off, off + block).toString('hex') !== first) { repeated = false; break; }
-    }
-    if (repeated) throw new Error(`MAC key rejected: repeated ${block}-byte block (weak/predictable)`);
-  }
-  const delta = ((bytes[1]! - bytes[0]!) + 256) % 256;
-  if (delta !== 0) {
-    let arithmetic = true;
-    for (let i = 1; i < 32; i++) {
-      if (bytes[i] !== (bytes[i - 1]! + delta) % 256) { arithmetic = false; break; }
-    }
-    if (arithmetic) throw new Error('MAC key rejected: sequential byte run (weak/predictable)');
-  }
-  if (KNOWN_WEAK_KEYS.has(key)) throw new Error('MAC key rejected: known-weak published value');
-  return bytes;
-};
-
-/** Bounded canonical key version id: 1-32 chars, lowercase alnum + inner
- *  dashes (rotation labels like bkp-2026-09-v1). */
-export const parseBackupKeyId = (keyId: string): string => {
-  if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(keyId)) {
-    throw new Error('MAC keyId rejected: must be 1-32 chars, lowercase alnum with inner dashes (bounded canonical form)');
-  }
-  return keyId;
-};
-
-/** Environment/domain binding (QA+security 2026-09-18 v6): a UNIQUE
- *  deployment/database ID, NOT a generic label like "production" - one ID
- *  per deployed database, never shared, with a DISTINCT managed MAC key
- *  and keyId per deployment. Bounded canonical form: 2-64 chars,
- *  lowercase alnum with inner dashes (e.g. contake-prod-pg-01). */
-export const parseBackupEnv = (env: string): string => {
-  if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])$/.test(env) || env === 'production' || env === 'staging' || env === 'development' || env === 'test') {
-    throw new Error('MAC env rejected: must be a UNIQUE deployment/database ID (bounded canonical: 2-64 lowercase alnum + inner dashes; generic labels like "production" are refused) - one ID + one managed key/keyId per deployed database, never shared');
-  }
-  return env;
-};
-
-/** Generate a fresh canonical key (crypto-strong). Used by the keygen
- *  script; the value is shown to the operator ONCE and never logged by
- *  any migration path. */
-
-/** Generate a fresh canonical key (crypto-strong). Used by the keygen
- *  script; the value is shown to the operator ONCE and never logged by
- *  any migration path. */
-export const generateBackupMacKey = (): string => randomBytes(32).toString('hex');
-
-export const requireAuth = (auth: ArtifactAuth | undefined): ArtifactAuth => {
-  if (!auth || auth.key === undefined || auth.key === null) {
-    throw new Error('artifact auth: external MAC key, keyId and env are REQUIRED (key from managed secrets only - never committed, never argv, never stored in the artifact)');
-  }
-  if (typeof auth.key !== 'string') {
-    throw new Error('artifact auth: MAC key must be the canonical STRING form (64 lowercase hex); Buffer/other representations are rejected so all callers share one decoded-byte weakness check');
-  }
-  parseBackupMacKey(auth.key); // canonical + strength (throws weak)
-  parseBackupKeyId(auth.keyId);
-  parseBackupEnv(auth.env);
-  return auth;
-};
-
-/** Authoritative ACTUAL-DB binding (QA+security 2026-09-18 v8): an
- *  approved tuple binds ONE deployment ID to the ONE actual database
- *  identity (resolved live from the connection under lock) plus its
- *  approved key versions. Ambiguous config (the same env ID bound to
- *  more than one database) and shared config (the same database bound
- *  to more than one env ID) are REJECTED at config-validation time. */
-export interface DeploymentTuple { env: string; db: string; keyIds: string[] }
-
-/** Stable identity of the RESOLVED connection, retrieved under lock:
- *  current_database() + server endpoint (local sockets resolve 'local'). */
-export const resolveDbIdentity = async (c: { query: Connectable['query'] }): Promise<string> => {
-  const r = await c.query(`SELECT current_database() AS db, COALESCE(host(inet_server_addr()), 'local') AS host, COALESCE(inet_server_port()::text, 'local') AS port`);
-  const row = r.rows[0] as { db: string; host: string; port: string };
-  return `${row.db}@${row.host}:${row.port}`;
-};
-
-export const parseDeploymentTuples = (raw: unknown): DeploymentTuple[] => {
-  if (!Array.isArray(raw) || raw.length === 0) {
-    throw new Error('deployment tuples: authoritative config is EMPTY - provision approved (deployment ID, actual database identity, key versions) tuples from the managed secret store');
-  }
-  const tuples = raw.map((t, i) => {
-    const o = t as Record<string, unknown>;
-    if (typeof o?.['env'] !== 'string' || typeof o?.['db'] !== 'string' || !Array.isArray(o?.['keyIds']) || (o['keyIds'] as unknown[]).length === 0) {
-      throw new Error(`deployment tuples: entry ${i + 1} malformed (need {env, db, keyIds[]})`);
-    }
-    parseBackupEnv(o['env']);
-    if (!/^[A-Za-z0-9._-]+@[A-Za-z0-9:._/-]+$/.test(o['db'])) { // opaque identity; IPv6 hosts carry colons
-      throw new Error(`deployment tuples: entry ${i + 1} db identity is not the canonical <database>@<host>:<port> form`);
-    }
-    (o['keyIds'] as unknown[]).forEach(k => { if (typeof k !== 'string') throw new Error(`deployment tuples: entry ${i + 1} keyIds must be strings`); parseBackupKeyId(k as string); });
-    return { env: o['env'], db: o['db'], keyIds: [...(o['keyIds'] as string[])] };
-  });
-  const envs = tuples.map(t => t.env);
-  if (new Set(envs).size !== envs.length) {
-    throw new Error('deployment tuples: AMBIGUOUS config - the same deployment ID is bound more than once; exactly ONE actual database per deployment ID is allowed');
-  }
-  const dbs = tuples.map(t => t.db);
-  if (new Set(dbs).size !== dbs.length) {
-    throw new Error('deployment tuples: SHARED config - the same database identity is bound to more than one deployment ID; database identities are never shared');
-  }
-  return tuples;
-};
-
-/** Gate executed UNDER LOCK against the LIVE resolved identity. */
-export const assertDeploymentAllowed = (auth: ArtifactAuth, dbIdentity: string, tuples: readonly DeploymentTuple[]): void => {
-  const t = tuples.find(x => x.env === auth.env);
-  if (!t) throw new Error(`artifact auth: deployment ID "${auth.env}" has NO authoritative approved tuple - refused`);
-  if (t.db !== dbIdentity) {
-    throw new Error(`artifact auth: the RESOLVED database identity does NOT match the authoritative binding for deployment "${auth.env}" (cross-database replay/ambiguous target) - refused`);
-  }
-  if (!t.keyIds.includes(auth.keyId)) {
-    throw new Error(`artifact auth: key version "${auth.keyId}" is NOT approved for the authoritative deployment/database tuple - refused`);
-  }
-};
-
-/** requireAuth + required authoritative tuples (v8): artifact operations
- *  are impossible without both. */
-export const requireDeploymentTuples = (allowed: readonly DeploymentTuple[] | undefined): readonly DeploymentTuple[] => {
-  if (!allowed || allowed.length === 0) {
-    throw new Error('artifact auth: authoritative deployment tuples are REQUIRED (approved env ID + actual database identity + key versions from the managed secret store)');
-  }
-  return allowed;
-};
-
-/** HMAC-SHA256 over the FULL canonical artifact content: the header
- *  without its MAC field plus every row line, in order. */
-export const artifactMac = (key: string, headerSansMac: Record<string, unknown>, rows: Record<string, unknown>[]): string =>
-  createHmac('sha256', key).update(canonical({ header: headerSansMac, rows })).digest('hex');
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 const bool = (v: unknown): boolean => v === true;
 
@@ -410,6 +229,12 @@ export async function preflightUsersPhone(conn: Connectable, now: () => Date = (
   };
 }
 
+const indexState = async (c: { query: Connectable['query'] }): Promise<{ existed: boolean; definition: string | null }> => {
+  const r = await c.query(`SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'users_phone_unique'`);
+  const def = r.rows[0]?.['indexdef'] as string | undefined;
+  return { existed: def !== undefined, definition: def ?? null };
+};
+
 /** Run fn inside ONE real transaction on a leased connection
  *  (Connectable.connect(): node-pg checks out a single client; PGlite's
  *  adapter serializes the lease behind its single-connection mutex), so
@@ -427,229 +252,6 @@ export async function withTx<T>(conn: Connectable, fn: (c: { query: Connectable[
   } finally {
     client.release();
   }
-}
-
-export interface BackupRow { user_id: string; org_id: string; email: string | null; phone: string | null; data: unknown; }
-export interface BackupHeader {
-  type: 'users-phone-backup-header';
-  version: 2;
-  createdAt: string;
-  rowCount: number;
-  /** Index state at backup time. `definition` is EVIDENCE ONLY - never
-   *  executed; restore recreates CANONICAL_INDEX_SQL and refuses artifacts
-   *  whose evidence is not the canonical shape (closed schema). */
-  usersPhoneUniqueIndex: { existed: boolean; definition: string | null };
-  /** sha256 manifest binding header + index state + ordered row digests. */
-  manifestSha256: string;
-  /** Unique per-backup identifier (freshness/replay evidence), bound into
-   *  the MAC as part of the header. */
-  backupId: string;
-  /** Key VERSION id (rotation) - not the key itself. */
-  keyId: string;
-  /** Environment/domain binding (cross-env replay refused). */
-  env: string;
-  /** HMAC-SHA256 over the full canonical artifact (external key). */
-  macSha256: string;
-}
-
-const indexState = async (c: { query: Connectable['query'] }): Promise<{ existed: boolean; definition: string | null }> => {
-  const r = await c.query(`SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'users_phone_unique'`);
-  const def = r.rows[0]?.['indexdef'] as string | undefined;
-  return { existed: def !== undefined, definition: def ?? null };
-};
-
-/** Full AUTHENTICATED backup on ONE leased connection: BEGIN ISOLATION
- *  LEVEL REPEATABLE READ, then the ONE documented lock order (advisory
- *  FIRST, then LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE) so rows +
- *  index state are a consistent snapshot and concurrent row/schema
- *  mutation BLOCKS for the backup's duration. Emits a v2 header (row
- *  count, index state as existence + evidence, manifest, keyId, env, MAC)
- *  then every users row as JSONL with a canonical full-row digest. */
-export async function backupUsers(conn: Connectable, sink: (line: string) => void, opts: { now?: () => Date; auth: ArtifactAuth; allowed?: readonly DeploymentTuple[] }): Promise<number> {
-  const auth = requireAuth(opts.auth);
-  const allowed = requireDeploymentTuples(opts.allowed);
-  const now = opts.now ?? (() => new Date());
-  return withTx(conn, async c => {
-    await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`); // 1st: advisory
-    // authoritative ACTUAL-DB binding UNDER LOCK (v8): identity resolved
-    // live from THIS connection before any data is read or mutated
-    assertDeploymentAllowed(auth, await resolveDbIdentity(c), allowed);
-    await c.query(`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`); // 2nd: table (blocks row AND schema mutation)
-    const r = await c.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
-    const rows = r.rows as unknown as BackupRow[];
-    const digests = rows.map(rowDigest);
-    const base = {
-      type: 'users-phone-backup-header' as const, version: 2 as const, createdAt: now().toISOString(),
-      rowCount: rows.length, usersPhoneUniqueIndex: await indexState(c),
-    };
-    const headerSansMac = { ...base, manifestSha256: manifestDigest(base, digests), backupId: `bkp-${randomBytes(16).toString('hex')}`, keyId: auth.keyId, env: auth.env };
-    const rowLines = rows.map((row, i) => ({ ...row, rowSha256: digests[i]! }));
-    const header: BackupHeader = { ...headerSansMac, macSha256: artifactMac(auth.key, headerSansMac, rowLines) };
-    sink(JSON.stringify(header));
-    for (const rl of rowLines) sink(JSON.stringify(rl));
-    return rows.length;
-  }, 'BEGIN ISOLATION LEVEL REPEATABLE READ');
-}
-
-interface ValidatedArtifact {
-  header: BackupHeader;
-  rows: (BackupRow & { rowSha256: string })[];
-}
-
-/** Validate the FULL backup artifact BEFORE any mutation (security
- *  2026-09-18): header type/version, rowCount == actual rows, unique user
- *  ids, required fields, and every row's sha256 against its data. ANY
- *  violation refuses the restore - nothing is ever written. */
-export function validateBackupArtifact(lines: string[], auth: ArtifactAuth): ValidatedArtifact {
-  const parsed = lines.filter(l => l.trim() !== '').map((l, i) => {
-    try { return JSON.parse(l) as Record<string, unknown>; }
-    catch { throw new Error(`restore: line ${i + 1} is not valid JSON`); }
-  });
-  const header = parsed[0] as unknown as BackupHeader | undefined;
-  if (!header || header.type !== 'users-phone-backup-header') throw new Error('restore: first line is not a users-phone backup header');
-  if (header.version !== 2) throw new Error(`restore: unsupported backup version ${String(header.version)}`);
-  // AUTHENTICATION FIRST (QA/security 2026-09-18): unsigned artifacts,
-  // key-version mismatches, cross-environment replays and any
-  // rehashed-but-unkeyed substitution are refused before anything else.
-  if (typeof header.keyId !== 'string' || typeof header.env !== 'string' ||
-      typeof header.macSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(header.macSha256)) {
-    throw new Error('restore: unsigned artifact (missing keyId/env/macSha256) - refused');
-  }
-  // backupId is a canonical >=128-bit random identity (security v8),
-  // STRICT PRINTABLE form - control/ESC/newline/bidi bytes never pass.
-  if (typeof header.backupId !== 'string' || !/^bkp-[0-9a-f]{32}$/.test(header.backupId)) {
-    throw new Error('restore: backupId missing/invalid (canonical 128-bit identity required; freshness/replay evidence) - refused');
-  }
-  // Strict printable canonical keyId/env on the ARTIFACT values too
-  // (QA v8): validated before any comparison and NEVER echoed raw.
-  try { parseBackupKeyId(header.keyId); parseBackupEnv(header.env); }
-  catch { throw new Error('restore: artifact keyId/env are not strict printable canonical identifiers - refused'); }
-  // createdAt must be a FINITE CANONICAL timestamp (exact ISO-8601 UTC
-  // round-trip): freshness evidence the operator gate can rely on.
-  if (typeof header.createdAt !== 'string' ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(header.createdAt) ||
-      !Number.isFinite(Date.parse(header.createdAt)) ||
-      new Date(header.createdAt).toISOString() !== header.createdAt) {
-    throw new Error('restore: createdAt is not a finite canonical timestamp (freshness evidence untrustworthy) - refused');
-  }
-  requireAuth(auth);
-  if (header.keyId !== auth.keyId) throw new Error('restore: key version mismatch (artifact keyId does not match the provided key version)');
-  if (header.env !== auth.env) throw new Error('restore: cross-environment replay refused (artifact env does not match the provided deployment ID)');
-  const rowsForMac = parsed.slice(1) as Record<string, unknown>[];
-  const { macSha256, ...headerSansMac } = header as unknown as Record<string, unknown> & { macSha256: string };
-  const expected = artifactMac(auth.key, headerSansMac, rowsForMac);
-  const macA = Buffer.from(expected, 'utf8'); const macB = Buffer.from(macSha256, 'utf8');
-  if (macA.length !== macB.length || !timingSafeEqual(macA, macB)) throw new Error('restore: artifact MAC mismatch - wrong key or tampered artifact');
-  if (typeof header.rowCount !== 'number' || header.rowCount < 0) throw new Error('restore: header rowCount missing/invalid');
-  if (typeof header.usersPhoneUniqueIndex?.existed !== 'boolean') throw new Error('restore: header index state missing/invalid');
-  if (header.usersPhoneUniqueIndex.existed && typeof header.usersPhoneUniqueIndex.definition !== 'string') {
-    throw new Error('restore: header index evidence definition missing for an existed=true backup');
-  }
-  if (header.usersPhoneUniqueIndex.existed &&
-      normalizeIndexDef(header.usersPhoneUniqueIndex.definition as string) !== CANONICAL_INDEX_NORMALIZED) {
-    throw new Error('restore: non-canonical index definition in artifact (appended SQL / different expression, predicate, table, or schema) - closed schema refuses unknown index shapes; artifact SQL is NEVER executed');
-  }
-  if (typeof (header as { manifestSha256?: unknown }).manifestSha256 !== 'string' ||
-      !/^[0-9a-f]{64}$/.test((header as { manifestSha256?: string }).manifestSha256!)) {
-    throw new Error('restore: header manifestSha256 missing/invalid');
-  }
-  const rows = parsed.slice(1) as unknown as (BackupRow & { rowSha256?: string })[];
-  if (rows.length !== header.rowCount) {
-    throw new Error(`restore: header rowCount ${header.rowCount} != actual rows ${rows.length} (truncated or tampered artifact)`);
-  }
-  const seen = new Set<string>();
-  for (const [i, row] of rows.entries()) {
-    if (typeof row.user_id !== 'string' || row.user_id === '') throw new Error(`restore: row ${i + 1} missing user_id`);
-    if (seen.has(row.user_id)) throw new Error(`restore: duplicate user_id "${row.user_id}" in artifact`);
-    seen.add(row.user_id);
-    if (typeof row.org_id !== 'string' || row.org_id === '') throw new Error(`restore: row ${i + 1} (${row.user_id}) missing org_id`);
-    if (row.email !== null && typeof row.email !== 'string') throw new Error(`restore: row ${i + 1} (${row.user_id}) email must be string|null`);
-    if (row.phone !== null && typeof row.phone !== 'string') throw new Error(`restore: row ${i + 1} (${row.user_id}) phone must be string|null`);
-    if (typeof row.data !== 'object' || row.data === null) throw new Error(`restore: row ${i + 1} (${row.user_id}) missing data object`);
-    if (typeof row.rowSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(row.rowSha256)) throw new Error(`restore: row ${i + 1} (${row.user_id}) missing rowSha256`);
-    if (rowDigest(row as BackupRow) !== row.rowSha256) throw new Error(`restore: row ${i + 1} (${row.user_id}) row digest mismatch - tampered or corrupt artifact (canonical full-row digest over user_id/org_id/email/phone/data)`);
-  }
-  const { manifestSha256, ...base } = header;
-  if (manifestDigest(base, rows.map(r => (r as unknown as { rowSha256: string }).rowSha256)) !== manifestSha256) {
-    throw new Error('restore: manifest digest mismatch - header, index state, row order, or row set tampered');
-  }
-  return { header, rows: rows as unknown as (BackupRow & { rowSha256: string })[] };
-}
-
-export interface RestoreResult {
-  restoredRows: number;
-  /** FULL-RESTORE contract: rows present in the database but NOT in the
-   *  artifact are post-backup creations - removed EXPLICITLY and reported. */
-  removedPostBackupRows: string[];
-  indexRestored: boolean;
-  verified: true;
-}
-
-/** FULL RESTORE (security 2026-09-18): validates the whole artifact BEFORE
- *  any mutation, then performs schema + rows + post-backup row policy +
- *  exact index definition + final verification in ONE transaction; ANY
- *  mismatch rolls back everything.
- *  - backup had no index: the current index is dropped INSIDE the
- *    transaction BEFORE rows are written, so colliding artifact rows load.
- *  - backup had an index: dropped, then recreated from the EXACT stored
- *    definition after rows are in place.
- *  - final verification inside the tx: exact row count, exact id set, and
- *    per-row org_id/email/phone/data-sha256 against the artifact, plus the
- *    index definition/absence. */
-export async function restoreUsers(conn: Connectable, lines: string[], auth: ArtifactAuth, opts?: { allowed?: readonly DeploymentTuple[] }): Promise<RestoreResult> {
-  const { header, rows } = validateBackupArtifact(lines, auth); // BEFORE any mutation
-  const allowed = requireDeploymentTuples(opts?.allowed);
-  const artifactIds = new Set(rows.map(r => r.user_id));
-  return withTx(conn, async c => {
-    // ONE documented lock order (security 2026-09-18): advisory FIRST...
-    await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`);
-    // authoritative ACTUAL-DB binding UNDER LOCK (v8) before any mutation
-    assertDeploymentAllowed(requireAuth(auth), await resolveDbIdentity(c), allowed);
-    // ...then the table lock: real write exclusion (blocks app writers)
-    await c.query(`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`);
-    // schema first: make the target state reachable
-    await c.query(`DROP INDEX IF EXISTS users_phone_unique`); // before colliding rows load
-    for (const row of rows) {
-      await c.query(
-        `INSERT INTO users(user_id, org_id, email, phone, data) VALUES($1,$2,$3,$4,$5)
-         ON CONFLICT (user_id) DO UPDATE SET org_id=$2, email=$3, phone=$4, data=$5`,
-        [row.user_id, row.org_id, row.email, row.phone, JSON.stringify(row.data)]);
-    }
-    // explicit post-backup row policy (full restore): remove + report
-    const cur = await c.query(`SELECT user_id FROM users`);
-    const extra = (cur.rows as { user_id: string }[]).map(x => x.user_id).filter(id => !artifactIds.has(id));
-    for (const id of extra) {
-      await c.query(`DELETE FROM users WHERE user_id=$1`, [id]);
-    }
-    // index recreate: ONLY the hardcoded canonical statement - artifact
-    // SQL is NEVER executed (security 2026-09-18)
-    if (header.usersPhoneUniqueIndex.existed) {
-      await c.query(CANONICAL_INDEX_SQL);
-    }
-    // ---- final verification INSIDE the transaction ----
-    const all = await c.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
-    const dbRows = all.rows as unknown as BackupRow[];
-    if (dbRows.length !== rows.length) throw new Error(`restore verify: count ${dbRows.length} != artifact ${rows.length}`);
-    const byId = new Map(rows.map(r => [r.user_id, r] as const));
-    for (const d of dbRows) {
-      const a = byId.get(d.user_id);
-      if (!a) throw new Error(`restore verify: unexpected id ${d.user_id}`);
-      if (d.org_id !== a.org_id || d.email !== a.email || d.phone !== a.phone) {
-        throw new Error(`restore verify: column mismatch for ${d.user_id}`);
-      }
-      if (rowDigest(d) !== a.rowSha256) throw new Error(`restore verify: full-row digest mismatch for ${d.user_id}`);
-    }
-    const idx = await indexState(c);
-    if (header.usersPhoneUniqueIndex.existed) {
-      if (!idx.existed) throw new Error('restore verify: index missing after recreate');
-      if (normalizeIndexDef(idx.definition as string) !== CANONICAL_INDEX_NORMALIZED) {
-        throw new Error(`restore verify: live index definition is not the canonical shape (got ${idx.definition ?? 'null'})`);
-      }
-    } else if (idx.existed) {
-      throw new Error('restore verify: index present after verified drop');
-    }
-    return { restoredRows: rows.length, removedPostBackupRows: extra.sort(), indexRestored: header.usersPhoneUniqueIndex.existed, verified: true as const };
-  });
 }
 
 export type NormalizeResult =
@@ -717,14 +319,9 @@ export type MaintenanceResult =
  *  creation, final preflight - so no concurrent writer can slip a collision
  *  between the check and the index. ANY blocking state or failure rolls
  *  back EVERYTHING (rows and schema unchanged). */
-export async function migrateUsersPhone(conn: Connectable, opts?: { auth?: ArtifactAuth; allowed?: readonly DeploymentTuple[] }): Promise<MaintenanceResult> {
+export async function migrateUsersPhone(conn: Connectable): Promise<MaintenanceResult> {
   return withTx(conn, async c => {
     await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`); // 'users-phone-migration'
-    // when credentials are provided, the authoritative ACTUAL-DB binding
-    // is enforced UNDER LOCK before any mutation (v8)
-    if (opts?.auth !== undefined) {
-      assertDeploymentAllowed(requireAuth(opts.auth), await resolveDbIdentity(c), requireDeploymentTuples(opts.allowed));
-    }
     // REAL write exclusion (security 2026-09-18): blocks application
     // INSERT/UPDATE/DELETE (ROW EXCLUSIVE) for the whole transaction, so no
     // writer can slip a collision between preflight and index creation.
