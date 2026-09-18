@@ -182,8 +182,8 @@ export interface BackupHeader {
   usersPhoneUniqueIndex: { existed: boolean; definition: string | null };
 }
 
-const indexState = async (conn: Connectable): Promise<{ existed: boolean; definition: string | null }> => {
-  const r = await conn.query(`SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'users_phone_unique'`);
+const indexState = async (c: { query: Connectable['query'] }): Promise<{ existed: boolean; definition: string | null }> => {
+  const r = await c.query(`SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'users_phone_unique'`);
   const def = r.rows[0]?.['indexdef'] as string | undefined;
   return { existed: def !== undefined, definition: def ?? null };
 };
@@ -202,42 +202,142 @@ export async function backupUsers(conn: Connectable, sink: (line: string) => voi
   return rows.length;
 }
 
-/** Restore rows (one transaction) AND the backed-up index state, then VERIFY
- *  the final state against the header (verified reversal, fail loud). */
-export async function restoreUsers(conn: Connectable, lines: string[]): Promise<{
+interface ValidatedArtifact {
+  header: BackupHeader;
+  rows: (BackupRow & { sha256: string })[];
+}
+
+/** Validate the FULL backup artifact BEFORE any mutation (security
+ *  2026-09-18): header type/version, rowCount == actual rows, unique user
+ *  ids, required fields, and every row's sha256 against its data. ANY
+ *  violation refuses the restore - nothing is ever written. */
+export function validateBackupArtifact(lines: string[]): ValidatedArtifact {
+  const parsed = lines.filter(l => l.trim() !== '').map((l, i) => {
+    try { return JSON.parse(l) as Record<string, unknown>; }
+    catch { throw new Error(`restore: line ${i + 1} is not valid JSON`); }
+  });
+  const header = parsed[0] as unknown as BackupHeader | undefined;
+  if (!header || header.type !== 'users-phone-backup-header') throw new Error('restore: first line is not a users-phone backup header');
+  if (header.version !== 1) throw new Error(`restore: unsupported backup version ${String(header.version)}`);
+  if (typeof header.rowCount !== 'number' || header.rowCount < 0) throw new Error('restore: header rowCount missing/invalid');
+  if (typeof header.usersPhoneUniqueIndex?.existed !== 'boolean') throw new Error('restore: header index state missing/invalid');
+  if (header.usersPhoneUniqueIndex.existed && (typeof header.usersPhoneUniqueIndex.definition !== 'string' || !/^CREATE UNIQUE INDEX users_phone_unique ON /i.test(header.usersPhoneUniqueIndex.definition))) {
+    throw new Error('restore: header index definition missing/invalid for an existed=true backup');
+  }
+  const rows = parsed.slice(1) as unknown as (BackupRow & { sha256?: string })[];
+  if (rows.length !== header.rowCount) {
+    throw new Error(`restore: header rowCount ${header.rowCount} != actual rows ${rows.length} (truncated or tampered artifact)`);
+  }
+  const seen = new Set<string>();
+  for (const [i, row] of rows.entries()) {
+    if (typeof row.user_id !== 'string' || row.user_id === '') throw new Error(`restore: row ${i + 1} missing user_id`);
+    if (seen.has(row.user_id)) throw new Error(`restore: duplicate user_id "${row.user_id}" in artifact`);
+    seen.add(row.user_id);
+    if (typeof row.org_id !== 'string' || row.org_id === '') throw new Error(`restore: row ${i + 1} (${row.user_id}) missing org_id`);
+    if (row.email !== null && typeof row.email !== 'string') throw new Error(`restore: row ${i + 1} (${row.user_id}) email must be string|null`);
+    if (row.phone !== null && typeof row.phone !== 'string') throw new Error(`restore: row ${i + 1} (${row.user_id}) phone must be string|null`);
+    if (typeof row.data !== 'object' || row.data === null) throw new Error(`restore: row ${i + 1} (${row.user_id}) missing data object`);
+    if (typeof row.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(row.sha256)) throw new Error(`restore: row ${i + 1} (${row.user_id}) missing sha256`);
+    if (hashData(row.data) !== row.sha256) throw new Error(`restore: row ${i + 1} (${row.user_id}) sha256 mismatch - tampered or corrupt artifact`);
+  }
+  return { header, rows: rows as (BackupRow & { sha256: string })[] };
+}
+
+export interface RestoreResult {
   restoredRows: number;
+  /** FULL-RESTORE contract: rows present in the database but NOT in the
+   *  artifact are post-backup creations - removed EXPLICITLY and reported. */
+  removedPostBackupRows: string[];
   indexRestored: boolean;
-  verified: boolean;
-}> {
-  const parsed = lines.filter(l => l.trim() !== '').map(l => JSON.parse(l) as Record<string, unknown>);
-  const header = parsed[0] as unknown as BackupHeader;
-  if (header?.type !== 'users-phone-backup-header') throw new Error('restore: first line is not a users-phone backup header');
-  const rows = parsed.slice(1) as unknown as BackupRow[];
-  await withTx(conn, async c => {
+  verified: true;
+}
+
+/** FULL RESTORE (security 2026-09-18): validates the whole artifact BEFORE
+ *  any mutation, then performs schema + rows + post-backup row policy +
+ *  exact index definition + final verification in ONE transaction; ANY
+ *  mismatch rolls back everything.
+ *  - backup had no index: the current index is dropped INSIDE the
+ *    transaction BEFORE rows are written, so colliding artifact rows load.
+ *  - backup had an index: dropped, then recreated from the EXACT stored
+ *    definition after rows are in place.
+ *  - final verification inside the tx: exact row count, exact id set, and
+ *    per-row org_id/email/phone/data-sha256 against the artifact, plus the
+ *    index definition/absence. */
+export async function restoreUsers(conn: Connectable, lines: string[]): Promise<RestoreResult> {
+  const { header, rows } = validateBackupArtifact(lines); // BEFORE any mutation
+  const artifactIds = new Set(rows.map(r => r.user_id));
+  return withTx(conn, async c => {
+    // schema first: make the target state reachable
+    if (!header.usersPhoneUniqueIndex.existed) {
+      await c.query(`DROP INDEX IF EXISTS users_phone_unique`); // before colliding rows load
+    } else {
+      await c.query(`DROP INDEX IF EXISTS users_phone_unique`);
+    }
     for (const row of rows) {
       await c.query(
         `INSERT INTO users(user_id, org_id, email, phone, data) VALUES($1,$2,$3,$4,$5)
          ON CONFLICT (user_id) DO UPDATE SET org_id=$2, email=$3, phone=$4, data=$5`,
         [row.user_id, row.org_id, row.email, row.phone, JSON.stringify(row.data)]);
     }
+    // explicit post-backup row policy (full restore): remove + report
+    const cur = await c.query(`SELECT user_id FROM users`);
+    const extra = (cur.rows as { user_id: string }[]).map(x => x.user_id).filter(id => !artifactIds.has(id));
+    for (const id of extra) {
+      await c.query(`DELETE FROM users WHERE user_id=$1`, [id]);
+    }
+    // exact index definition
+    if (header.usersPhoneUniqueIndex.existed) {
+      await c.query(header.usersPhoneUniqueIndex.definition as string); // verbatim stored definition
+    }
+    // ---- final verification INSIDE the transaction ----
+    const all = await c.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
+    const dbRows = all.rows as unknown as BackupRow[];
+    if (dbRows.length !== rows.length) throw new Error(`restore verify: count ${dbRows.length} != artifact ${rows.length}`);
+    const byId = new Map(rows.map(r => [r.user_id, r] as const));
+    for (const d of dbRows) {
+      const a = byId.get(d.user_id);
+      if (!a) throw new Error(`restore verify: unexpected id ${d.user_id}`);
+      if (d.org_id !== a.org_id || d.email !== a.email || d.phone !== a.phone) {
+        throw new Error(`restore verify: column mismatch for ${d.user_id}`);
+      }
+      if (hashData(d.data) !== a.sha256) throw new Error(`restore verify: data hash mismatch for ${d.user_id}`);
+    }
+    const idx = await indexState(c);
+    if (header.usersPhoneUniqueIndex.existed) {
+      if (!idx.existed) throw new Error('restore verify: index missing after recreate');
+      if (idx.definition !== header.usersPhoneUniqueIndex.definition) {
+        throw new Error(`restore verify: index definition mismatch (got ${idx.definition ?? 'null'})`);
+      }
+    } else if (idx.existed) {
+      throw new Error('restore verify: index present after verified drop');
+    }
+    return { restoredRows: rows.length, removedPostBackupRows: extra.sort(), indexRestored: header.usersPhoneUniqueIndex.existed, verified: true as const };
   });
-  // reverse schema/index state: recreate if it existed, verified drop if not
-  let indexRestored = false;
-  if (header.usersPhoneUniqueIndex.existed) {
-    await conn.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
-    indexRestored = true;
-  } else {
-    await conn.query(`DROP INDEX IF EXISTS users_phone_unique`);
-  }
-  const after = await indexState(conn);
-  const verified = after.existed === header.usersPhoneUniqueIndex.existed;
-  if (!verified) throw new Error(`restore: index state mismatch (wanted existed=${header.usersPhoneUniqueIndex.existed}, got ${after.existed})`);
-  return { restoredRows: rows.length, indexRestored, verified };
 }
 
 export type NormalizeResult =
   | { normalized: number; userIds: string[] }
   | { aborted: true; reason: string; preflight: PreflightReport };
+
+const normalizeRowsTx = async (c: { query: Connectable['query'] }): Promise<string[]> => {
+  const r = await c.query(
+    `SELECT user_id FROM users
+     WHERE (phone IS NOT NULL AND phone <> btrim(phone))
+        OR ((data->>'phone') IS NOT NULL AND (data->>'phone') <> btrim(data->>'phone'))
+     ORDER BY user_id`);
+  const ids = (r.rows as { user_id: string }[]).map(x => x.user_id);
+  for (const userId of ids) {
+    await c.query(
+      `UPDATE users SET
+         phone = CASE WHEN phone IS NULL THEN NULL ELSE btrim(phone) END,
+         data = CASE WHEN (data->>'phone') IS NOT NULL
+                     THEN jsonb_set(data, '{phone}', to_jsonb(btrim(data->>'phone')), false)
+                     ELSE data END
+       WHERE user_id=$1`,
+      [userId]);
+  }
+  return ids;
+};
 
 /** Normalize column AND embedded JSON phone, each to its OWN trimmed value,
  *  in ONE real transaction. Refuses to run (loud) when the preflight is
@@ -247,25 +347,7 @@ export async function normalizeUsersPhones(conn: Connectable): Promise<Normalize
   if (preflight.blocking) {
     return { aborted: true, reason: preflight.blockingReasons.join('; '), preflight };
   }
-  const r = await conn.query(
-    `SELECT user_id FROM users
-     WHERE (phone IS NOT NULL AND phone <> btrim(phone))
-        OR ((data->>'phone') IS NOT NULL AND (data->>'phone') <> btrim(data->>'phone'))
-     ORDER BY user_id`);
-  const ids = (r.rows as { user_id: string }[]).map(x => x.user_id);
-  if (ids.length === 0) return { normalized: 0, userIds: [] };
-  await withTx(conn, async c => {
-    for (const userId of ids) {
-      await c.query(
-        `UPDATE users SET
-           phone = CASE WHEN phone IS NULL THEN NULL ELSE btrim(phone) END,
-           data = CASE WHEN (data->>'phone') IS NOT NULL
-                       THEN jsonb_set(data, '{phone}', to_jsonb(btrim(data->>'phone')), false)
-                       ELSE data END
-         WHERE user_id=$1`,
-        [userId]);
-    }
-  });
+  const ids = await withTx(conn, normalizeRowsTx);
   return { normalized: ids.length, userIds: ids };
 }
 
@@ -286,4 +368,31 @@ export async function createUsersPhoneIndex(conn: Connectable): Promise<CreateIn
 /** Index presence probe (diagnostics/tests/verification). */
 export async function usersPhoneIndexExists(conn: Connectable): Promise<boolean> {
   return (await indexState(conn)).existed;
+}
+
+export type MaintenanceResult =
+  | { migrated: true; normalized: number; finalPreflight: PreflightReport }
+  | { migrated: false; reason: string; preflight: PreflightReport };
+
+/** LOCKED maintenance transaction (security 2026-09-18): ONE transaction
+ *  holding a Postgres advisory lock over the WHOLE migration - preflight
+ *  under lock, normalize, preflight RERUN under the same lock, index
+ *  creation, final preflight - so no concurrent writer can slip a collision
+ *  between the check and the index. ANY blocking state or failure rolls
+ *  back EVERYTHING (rows and schema unchanged). */
+export async function migrateUsersPhone(conn: Connectable): Promise<MaintenanceResult> {
+  return withTx(conn, async c => {
+    await c.query(`SELECT pg_advisory_xact_lock(7263849598301)`); // 'users-phone-migration'
+    const pre = await preflightUsersPhone(c as Connectable);
+    if (pre.blocking) return { migrated: false as const, reason: pre.blockingReasons.join('; '), preflight: pre };
+    const ids = await normalizeRowsTx(c);
+    const mid = await preflightUsersPhone(c as Connectable); // rerun under the same lock
+    if (mid.blocking) throw new Error(`maintenance: preflight became blocking mid-transaction: ${mid.blockingReasons.join('; ')}`);
+    await c.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
+    const fin = await preflightUsersPhone(c as Connectable);
+    if (fin.blocking) throw new Error('maintenance: final preflight blocking');
+    const idx = await indexState(c);
+    if (!idx.existed) throw new Error('maintenance: index missing after creation');
+    return { migrated: true as const, normalized: ids.length, finalPreflight: fin };
+  });
 }

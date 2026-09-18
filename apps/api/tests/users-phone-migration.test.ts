@@ -15,7 +15,7 @@ import { makeTestRepo, REPO_IMPL } from './helpers/repo.js';
 import type { GraphRepository } from '../src/repo/graph-repository.js';
 import type { Connectable } from '../src/repo/postgres.js';
 import {
-  backupUsers, createUsersPhoneIndex, normalizeUsersPhones, preflightUsersPhone, restoreUsers, usersPhoneIndexExists,
+  backupUsers, createUsersPhoneIndex, migrateUsersPhone, normalizeUsersPhones, preflightUsersPhone, restoreUsers, usersPhoneIndexExists,
 } from '../src/services/phone-migration.js';
 
 const pgOnly = REPO_IMPL === 'memory' ? describe.skip : describe;
@@ -229,3 +229,106 @@ pgOnly('backup / restore reversal', () => {
   });
 });
 void repo;
+
+pgOnly('restore artifact validation + full-restore contract (security 2026-09-18)', () => {
+  const backupNow = async (): Promise<string[]> => {
+    const lines: string[] = [];
+    await backupUsers(conn, l => lines.push(l));
+    return lines;
+  };
+
+  it('corrupt row sha256: restore REFUSES before any mutation; table and index state unchanged', async () => {
+    await insertLegacy(conn, 'u-c1', 'org-1', ' +15550101001 ', '+15550101001');
+    const lines = await backupNow();
+    const tampered = lines.map((l, i) => {
+      if (i === 0) return l;
+      const row = JSON.parse(l);
+      if (row.user_id === 'u-c1') row.data = { ...row.data, name: 'tampered' }; // hash now stale
+      return JSON.stringify(row);
+    });
+    await expect(restoreUsers(conn, tampered)).rejects.toThrow(/sha256 mismatch/);
+    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-c1'`)).rows[0]!['phone']).toBe(' +15550101001 ');
+    expect((await conn.query(`SELECT data->>'name' AS n FROM users WHERE user_id='u-c1'`)).rows[0]!['n']).toBe('u-c1');
+  });
+
+  it('truncated artifact (rowCount mismatch) and duplicate ids: refused before mutation', async () => {
+    await insertLegacy(conn, 'u-t1', 'org-1', '+15550101011', '+15550101011');
+    const lines = await backupNow();
+    await expect(restoreUsers(conn, lines.slice(0, -1))).rejects.toThrow(/rowCount|truncated/);
+    const dup = [...lines, lines[1]!]; // duplicate a row line
+    // rowCount now matches? no: rowCount smaller than lines -> still mismatch OR duplicate id
+    await expect(restoreUsers(conn, dup)).rejects.toThrow(/rowCount|duplicate user_id/);
+    expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id='u-t1'`)).rows[0]!['n']).toBe(1);
+  });
+
+  it('post-backup rows are removed EXPLICITLY and reported (full-restore contract)', async () => {
+    await insertLegacy(conn, 'u-k1', 'org-1', '+15550101021', '+15550101021');
+    const lines = await backupNow();
+    await insertLegacy(conn, 'u-extra', 'org-1', '+15550101022', '+15550101022'); // created after backup
+    const r = await restoreUsers(conn, lines);
+    expect(r.removedPostBackupRows).toEqual(['u-extra']);
+    expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id='u-extra'`)).rows[0]!['n']).toBe(0);
+    expect(r.verified).toBe(true);
+  });
+
+  it('no-index colliding backup restored over a CURRENT index: index dropped inside the tx BEFORE colliding rows load', async () => {
+    // legacy backup: no index, two colliding rows
+    await insertLegacy(conn, 'u-l1', 'org-1', ' +15550101031 ', '+15550101031');
+    await insertLegacy(conn, 'u-l2', 'org-2', '+15550101031', '+15550101031');
+    const lines = await backupNow();
+    expect(JSON.parse(lines[0]!).usersPhoneUniqueIndex.existed).toBe(false);
+    // current DB: rows removed, index created clean
+    await conn.query(`DELETE FROM users WHERE user_id IN ('u-l1','u-l2')`);
+    await conn.query(`CREATE UNIQUE INDEX users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
+    const r = await restoreUsers(conn, lines);
+    expect(r.verified).toBe(true);
+    expect(r.indexRestored).toBe(false);
+    expect(await usersPhoneIndexExists(conn)).toBe(false);
+    expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id IN ('u-l1','u-l2')`)).rows[0]!['n']).toBe(2);
+  });
+
+  it('index-creation failure inside restore rolls back EVERYTHING (rows + schema)', async () => {
+    await insertLegacy(conn, 'u-r1', 'org-1', ' +15550101041 ', '+15550101041');
+    expect((await createUsersPhoneIndex(conn)).created).toBe(true);
+    const lines = await backupNow();
+    // tamper the stored definition: passes header shape, fails at execution
+    const tampered = lines.map((l, i) => {
+      if (i !== 0) return l;
+      const h = JSON.parse(l);
+      h.usersPhoneUniqueIndex.definition = 'CREATE UNIQUE INDEX users_phone_unique ON public.users USING btree (btrim(nope_column)) WHERE (phone IS NOT NULL)';
+      return JSON.stringify(h);
+    });
+    await conn.query(`UPDATE users SET phone=' +19990000000 ' WHERE user_id='u-r1'`);
+    await expect(restoreUsers(conn, tampered)).rejects.toThrow();
+    // rollback proof: the pre-restore state is intact (mutated value, index present)
+    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-r1'`)).rows[0]!['phone']).toBe(' +19990000000 ');
+    expect(await usersPhoneIndexExists(conn)).toBe(true);
+  });
+});
+
+pgOnly('locked maintenance transaction (security 2026-09-18)', () => {
+  it('clean path: preflight under lock -> normalize -> rerun under lock -> index -> final preflight; idempotent re-run', async () => {
+    await insertLegacy(conn, 'u-m1', 'org-1', ' +15550101051 ', ' +15550101051 ');
+    const r = await migrateUsersPhone(conn);
+    expect(r.migrated).toBe(true);
+    expect(await usersPhoneIndexExists(conn)).toBe(true);
+    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-m1'`)).rows[0]!['phone']).toBe('+15550101051');
+    const again = await migrateUsersPhone(conn);
+    expect(again.migrated).toBe(true);
+    if (again.migrated) expect(again.normalized).toBe(0);
+  });
+
+  it('blocking path: collision -> migrated:false, NOTHING written, no index; inconsistency likewise', async () => {
+    await insertLegacy(conn, 'u-b1', 'org-1', '+15550101061', '+15550101061');
+    await insertLegacy(conn, 'u-b2', 'org-2', ' +15550101061', '+15550101061');
+    const r = await migrateUsersPhone(conn);
+    expect(r.migrated).toBe(false);
+    expect(await usersPhoneIndexExists(conn)).toBe(false);
+    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-b2'`)).rows[0]!['phone']).toBe(' +15550101061');
+    await conn.query(`DELETE FROM users WHERE user_id IN ('u-b1','u-b2')`);
+    await insertLegacy(conn, 'u-b3', 'org-1', '+15550101071', '+15550101072'); // inconsistent
+    const r2 = await migrateUsersPhone(conn);
+    expect(r2.migrated).toBe(false);
+    expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-b3'`)).rows[0]!['phone']).toBe('+15550101071');
+  });
+});

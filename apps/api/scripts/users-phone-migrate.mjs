@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Reversible users-phone migration (QA 21:06, v2 2026-09-18).
+/** Reversible users-phone migration (QA 21:06, v3 2026-09-18).
  *  Steps (explicit flags, in this recommended order):
  *    --backup <file>      dump ALL users rows + index state (JSONL, header
  *                         first line, per-row sha256)
@@ -19,7 +19,7 @@
  *  post-migration verification. */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { Pool } from 'pg';
-import { backupUsers, createUsersPhoneIndex, normalizeUsersPhones, restoreUsers } from '../dist/services/phone-migration.js';
+import { backupUsers, createUsersPhoneIndex, migrateUsersPhone, normalizeUsersPhones, restoreUsers } from '../dist/services/phone-migration.js';
 
 const arg = (name) => { const i = process.argv.indexOf(name); return i === -1 ? undefined : process.argv[i + 1]; };
 const has = (name) => process.argv.includes(name);
@@ -29,8 +29,8 @@ if (!url) {
   process.exit(64);
 }
 const backupFile = arg('--backup');
-if ((has('--normalize') || has('--create-index')) && !backupFile) {
-  console.error('FATAL: --normalize/--create-index require --backup <file> in the SAME invocation (reversible-by-construction).');
+if ((has('--normalize') || has('--create-index') || has('--maintenance')) && !backupFile) {
+  console.error('FATAL: --normalize/--create-index/--maintenance require --backup <file> in the SAME invocation (reversible-by-construction).');
   process.exit(64);
 }
 const pool = new Pool({ connectionString: url });
@@ -44,7 +44,7 @@ try {
   if (has('--restore')) {
     const restoreFile = arg('--restore');
     const r = await restoreUsers(pool, readFileSync(restoreFile, 'utf8').split('\n').filter(Boolean));
-    console.log(`restore: ${r.restoredRows} rows written back; index state reversed (recreated=${r.indexRestored}); verified=${r.verified}`);
+    console.log(`restore: ${r.restoredRows} rows written back; post-backup rows removed explicitly: [${r.removedPostBackupRows.join(', ')}]; index state reversed (recreated=${r.indexRestored}); verified=${r.verified}`);
   }
   if (has('--normalize')) {
     const r = await normalizeUsersPhones(pool);
@@ -65,5 +65,15 @@ try {
       console.error('No index created. No winner picked, nothing deleted, nothing mutated. Smallest explicit operator decision required.');
       process.exit(2);
     }
+  }
+  if (has('--maintenance')) {
+    const r = await migrateUsersPhone(pool);
+    if (!r.migrated) {
+      console.error(`maintenance: ABORTED - preflight blocking under lock: ${r.preflight.blockingReasons.join('; ')}`);
+      console.error(JSON.stringify({ collisionGroups: r.preflight.collisionGroups, inconsistentRows: r.preflight.inconsistentRows }, null, 2));
+      console.error('Nothing written. Smallest explicit operator decision required.');
+      process.exit(2);
+    }
+    console.log(`maintenance: migrated under advisory lock - normalized=${r.normalized}; index created=${r.indexCreated}; final preflight clean=${r.finalPreflight.clean}`);
   }
 } finally { await pool.end(); }
