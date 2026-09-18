@@ -9,14 +9,20 @@
  *  rollback.
  *  Phase 2 (after a REAL cluster stop/start): restart durability of the
  *  migration history and seeded rows, boot gate still green.
+ *  Phase 3: least-privilege roles, R3 section-5 closed-registry attacks
+ *  (typed-param injection, registry/artifact tamper), boot-gate history
+ *  tamper proof. Phase 4: CTL-DDL-CONFINEMENT on real roles - R3
+ *  construction-impossibility sweep, sequence restore contract, default
+ *  privilege lockdown.
  *
  *  Usage: tsx evidence-realpg-release-migrations.mts <phase1|phase2|phase3|phase4> <socketDirOrHost> <port>
  */
 import { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
 import {
-  MIGRATIONS, assertDirectDatabaseUrl, assertSchemaCurrent, assertZeroCatalogDelta, catalogSnapshot,
-  runMigrations, stepDigest, validateMigrationArtifact, verifyTargetPreconditions,
+  MIGRATIONS, TEMPLATES, assertDirectDatabaseUrl, assertSchemaCurrent, assertZeroCatalogDelta, catalogSnapshot,
+  renderStepStatements, restoreSequenceValues, runMigrations, sequenceValues, stepDigest, templateHash,
+  type MigrationStep,
 } from './src/migrations/runner.js';
 import { runStagingSeed } from './src/migrations/staging-seed.js';
 
@@ -33,6 +39,10 @@ const check = (name: string, ok: boolean, detail?: unknown) => {
 // Evidence-harness credentials are generated EPHEMERALLY at runtime (CSPRNG)
 // and never printed, persisted or committed (independent security).
 const CREDS = { adminPassword: randomBytes(12).toString('base64url'), managerPassword: randomBytes(12).toString('base64url') };
+/** SA-shaped inert params for the ddl.create-index template (shared). */
+const SA_PARAMS = { index: 'sa_idx', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' };
+/** R3: the ONLY step shapes that exist - closed registry renders. */
+const saStep = (params: Record<string, unknown> = {}, over: Record<string, unknown> = {}): MigrationStep => ({ version: '0009', name: 'sa', description: 'sa', template: 'ddl.create-index', ...over, params: { ...SA_PARAMS, ...params } });
 check('evidence credentials are ephemeral (>=16 chars, runtime-generated)', CREDS.adminPassword.length >= 16 && CREDS.managerPassword.length >= 16);
 
 const admin = mk('postgres');
@@ -61,8 +71,9 @@ if (phase === 'phase1') {
   ]);
   check('both racers settled without error', ra.status === 'fulfilled' && rb.status === 'fulfilled', [ra.status, rb.status]);
   const appliedNow = [ra, rb].map(r => (r.status === 'fulfilled' ? r.value.appliedNow : []));
+  const [an0 = [], an1 = []] = appliedNow;
   check('exactly one racer applied; the loser no-oped',
-    (appliedNow[0].length === 1 && appliedNow[1].length === 0) || (appliedNow[0].length === 0 && appliedNow[1].length === 1),
+    (an0.length === 1 && an1.length === 0) || (an0.length === 0 && an1.length === 1),
     appliedNow);
   const v = await db.query(`SELECT count(*)::int AS n FROM schema_migrations`);
   check('exactly one version row after the race', Number(v.rows[0]?.['n']) === 1, v.rows[0]?.['n']);
@@ -73,33 +84,38 @@ if (phase === 'phase1') {
   await db.end(); await a.end(); await b.end(); await admin.query(`DROP DATABASE contake_evidence WITH (FORCE)`);
   await admin.query(`CREATE DATABASE contake_evidence`);
   const db2 = mk('contake_evidence');
+  // R3: caller SQL is gone - a step is inert {template, params}; a FAILING
+  // TEMPLATE EXECUTION (strict create against a missing table) must roll the
+  // whole step back on REAL postgres and record no version.
   const failing: MigrationStep = {
-    version: '0001', name: 'partial-ddl', description: 'second statement fails',
-    sql: 'CREATE TABLE partial_leak(id int); CREATE TABLE partial_leak(id int)',
+    version: '0001', name: 'partial-ddl', description: 'template executes against a missing table',
+    template: 'ddl.create-index',
+    params: { index: 'partial_leak_idx', table: 'no_such_table', unique: 'plain', expression: 'EXPR_NONE', predicate: 'PRED_NONE', ifNotExists: 'strict' },
   };
   let threw = false;
   try { await runMigrations(db2, { deployment: 'staging', migrations: [failing] }); } catch { threw = true; }
-  check('failing artifact threw', threw);
-  const leak = await db2.query(`SELECT to_regclass('partial_leak') AS r`);
-  check('partial DDL rolled back on REAL postgres', leak.rows[0]?.['r'] === null, leak.rows[0]);
+  check('failing template execution threw', threw);
+  const leak = await db2.query(`SELECT to_regclass('partial_leak_idx') AS r`);
+  check('step effect rolled back on REAL postgres', leak.rows[0]?.['r'] === null, leak.rows[0]);
   const vv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations`);
   check('no version row after rollback', Number(vv.rows[0]?.['n']) === 0);
 
-  // 3b) AST allowlist on REAL postgres: tx-control / DO / session-lock artifacts
-  // are rejected at registration, before ANY statement executes.
-  for (const [label, sql] of [
-    ['COMMIT artifact', 'CREATE TABLE escape_leak(id int); COMMIT'],
-    ['DO artifact', `DO $$ BEGIN RAISE EXCEPTION 'x'; END $$`],
-    ['quoted session-unlock artifact', 'SELECT "pg_advisory_unlock"(841000001)'],
-    ['schema-qualified session-lock artifact', 'SELECT pg_catalog.pg_advisory_lock(1)'],
-  ] as const) {
+  // 3b) R3 closed registry on REAL postgres: caller SQL itself is an unknown
+  // template; tx-control / session-lock shapes cannot be expressed; param-level
+  // injection dies in the closed binders - all BEFORE any statement executes.
+  for (const [label, bad] of [
+    ['caller SQL as template name', { version: '0001', name: 'bad', description: 'x', template: 'CREATE TABLE escape_leak(id int); COMMIT', params: {} } as MigrationStep],
+    ['unknown template (session-lock shape)', { version: '0001', name: 'bad', description: 'x', template: 'SELECT pg_catalog.pg_advisory_lock(1)', params: {} } as MigrationStep],
+    ['identifier injection in params', saStep({ table: 'users"; DROP TABLE users;--' }, { version: '0001', name: 'bad' })],
+    ['free-text expression in params', saStep({ expression: 'pg_catalog.pg_advisory_unlock(841000001)' }, { version: '0001', name: 'bad' })],
+  ] as [string, MigrationStep][]) {
     let refused = false;
-    try { await runMigrations(db2, { deployment: 'staging', migrations: [{ version: '0001', name: 'bad', description: 'x', sql }] }); }
-    catch (e) { refused = /ARTIFACT refusal/.test(String(e)); }
+    try { await runMigrations(db2, { deployment: 'staging', migrations: [bad] }); }
+    catch (e) { refused = /TEMPLATE refusal/.test(String(e)); }
     check(`${label} rejected at registration`, refused);
   }
   const el = await db2.query(`SELECT to_regclass('escape_leak') AS r`);
-  check('no statement executed from a rejected artifact', el.rows[0]?.['r'] === null);
+  check('no statement executed from a rejected step', el.rows[0]?.['r'] === null);
 
   // 3c) Guard primitive hard-fail rolls back on REAL postgres.
   await runMigrations(db2, { deployment: 'staging' });
@@ -112,7 +128,8 @@ if (phase === 'phase1') {
         version: '0002', name: 'guarded', description: 'x',
         xactLockKey: 4242, lockTables: ['users'],
         assertions: [{ kind: 'table-empty', table: 'users' }],
-        sql: 'CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL',
+        template: 'ddl.create-index',
+        params: { ...SA_PARAMS, index: 'users_phone_unique' },
       }],
     });
   } catch (e) { guardRefused = /ASSERTION refusal/.test(String(e)); }
@@ -252,26 +269,51 @@ if (phase === 'phase1') {
   try { await run.query(`INSERT INTO public.schema_migrations(version, name, sha256, applied_by) VALUES('x','x','x','x')`); } catch { writeRefused = true; }
   check('runtime role cannot write migration history', writeRefused);
 
-  // Attacker regressions at the registration gate (real parser, real shapes):
-  const attackArtifacts: [string, string][] = [
-    ['schema-qualified UDF with allowlisted leaf (attacker.lower)', `INSERT INTO public.users(user_id, org_id, phone, data) VALUES (attacker.lower('x'), 'o', 'p', '{}')`],
-    ['schema-qualified UDF shadowing now() (evil.now)', `CREATE TABLE public.t(x timestamptz DEFAULT evil.now())`],
-    ['qualified public.btrim as FUNCTION (wrong catalog)', `CREATE UNIQUE INDEX i ON public.users(public.btrim(phone))`],
-    ['custom operator statement', `CREATE OPERATOR public.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = f)`],
-    ['custom cast statement', `CREATE CAST (text AS int) WITH FUNCTION f(text) AS ASSIGNMENT`],
-    ['trigger statement', `CREATE TRIGGER t BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION f()`],
-    ['trigger function (plpgsql)', `CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'`],
-    ['mutating CTE', `WITH d AS (DELETE FROM public.users RETURNING *) SELECT 1`],
-    ['read CTE smuggled into DML', `WITH x AS (SELECT 1) INSERT INTO public.users(user_id) SELECT * FROM x`],
-    ['nested subquery in DML', `UPDATE public.users SET org_id = 'o' WHERE user_id IN (SELECT user_id FROM public.channels)`],
-    ['ALTER OWNER', `ALTER TABLE public.users OWNER TO postgres`],
-    ['DO block', `DO $$ BEGIN RAISE NOTICE 'x'; END $$`],
+  // R3 section-5 attacks at the closed registry: there is no caller SQL to
+  // parse, so every code-object / DML / ALTER-OWNER shape is inexpressible;
+  // typed-param injection dies in the closed binders. OBSERVED refusal text
+  // for every attack.
+  const registryAttacks: [string, MigrationStep][] = [
+    ['caller SQL as template name', { version: '9', name: 'x', description: 'x', template: `CREATE OPERATOR public.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = f)`, params: {} }],
+    ['DO block as template name', { version: '9', name: 'x', description: 'x', template: `DO $$ BEGIN RAISE NOTICE 'x'; END $$`, params: {} }],
+    ['mutating CTE as template name', { version: '9', name: 'x', description: 'x', template: `WITH d AS (DELETE FROM public.users RETURNING *) SELECT 1`, params: {} }],
+    ['ALTER OWNER as template name', { version: '9', name: 'x', description: 'x', template: `ALTER TABLE public.users OWNER TO postgres`, params: {} }],
+    ['typed-param injection: quote/semicolon identifier', saStep({ table: 'users"; DROP TABLE users;--' }, { version: '9' })],
+    ['typed-param injection: schema-path identifier', saStep({ table: 'attacker.users' }, { version: '9' })],
+    ['typed-param injection: pg_ system prefix', saStep({ index: 'pg_evil' }, { version: '9' })],
+    ['typed-param injection: enum escape', saStep({ unique: 'concurrently' }, { version: '9' })],
+    ['typed-param injection: non-string literal', saStep({ index: 1 as never }, { version: '9' })],
+    ['typed-param injection: free-text expression', saStep({ expression: 'attacker.lower(phone)' }, { version: '9' })],
+    ['typed-param injection: free-text predicate', saStep({ predicate: 'true' }, { version: '9' })],
+    ['typed-param injection: extra param (schema drift)', saStep({ extra: 'x' }, { version: '9' })],
+    ['typed-param injection: missing param', { version: '9', name: 'x', description: 'x', template: 'ddl.create-index', params: { index: 'x' } as never }],
   ];
-  for (const [label, sql] of attackArtifacts) {
-    let refused = false;
-    try { validateMigrationArtifact(sql); } catch { refused = true; }
-    check(`attacker regression refused: ${label}`, refused);
+  for (const [label, bad] of registryAttacks) {
+    let refused = false; let observed = '';
+    try { renderStepStatements(bad); } catch (e) { refused = true; observed = String(e); }
+    console.error(`OBSERVED[registry attack ${label}]: ${observed.slice(0, 200)}`);
+    check(`attacker regression refused: ${label}`, refused && /TEMPLATE refusal/.test(observed), observed.slice(0, 160));
   }
+  // Registry/artifact tamper: param edits move the step digest; render-source
+  // edits move the template hash (hash-pinned registry, fail-closed).
+  const pinnedDigest = stepDigest(saStep({}, { version: '0002' }));
+  check('param tamper moves the step digest', stepDigest(saStep({ index: 'evil_idx' }, { version: '0002' })) !== pinnedDigest);
+  const realTemplate = TEMPLATES.find(t => t.name === 'ddl.create-index')!;
+  const tamperedTemplate = { ...realTemplate, render: () => [{ text: 'CREATE FUNCTION public.evil() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$', values: [] as unknown[] }] };
+  check('registry render tamper moves the template hash', templateHash(tamperedTemplate) !== templateHash(realTemplate));
+
+  // R3 section-3 boot-gate tamper proofs on REAL PG: edited applied history
+  // fails the boot gate; restoring the pinned digest makes it green again.
+  const goodRow = await mig.query(`SELECT sha256 FROM schema_migrations WHERE version = '0001'`);
+  await mig.query(`UPDATE schema_migrations SET sha256 = 'tampered' WHERE version = '0001'`);
+  let histRefused = false; let histObserved = '';
+  try { await assertSchemaCurrent(mig, undefined, { deployment: 'staging', instanceId: rr.identity.instanceId }); }
+  catch (e) { histRefused = true; histObserved = String(e); }
+  console.error(`OBSERVED[history tamper boot gate]: ${histObserved.slice(0, 200)}`);
+  check('boot gate refuses edited applied history on REAL PG (OBSERVED)', histRefused, histObserved.slice(0, 160));
+  await mig.query(`UPDATE schema_migrations SET sha256 = $1 WHERE version = '0001'`, [goodRow.rows[0]?.['sha256']]);
+  await assertSchemaCurrent(mig, undefined, { deployment: 'staging', instanceId: rr.identity.instanceId });
+  check('boot gate green after history restore', true);
   // Planted attacker schema UDF is UNREACHABLE through the canonical gate and
   // the catalog diff would catch any code-object delta a step tried to leave.
   await adminRole.query(`CREATE FUNCTION attacker.lower(text) RETURNS text LANGUAGE sql AS $$ SELECT 'pwn' $$`);
@@ -306,23 +348,22 @@ if (phase === 'phase1') {
   check('conf: migrator applies 0001', rr.appliedNow.length === 1);
 
   // (1) One tx per governed operation / non-transactional classes refused at the gate.
-  const nonTx: [string, string][] = [
-    ['CREATE INDEX CONCURRENTLY', `CREATE INDEX CONCURRENTLY i ON public.users(phone)`],
-    ['DROP INDEX CONCURRENTLY', `DROP INDEX CONCURRENTLY public.i`],
-    ['VACUUM', `VACUUM public.users`],
-    ['ALTER SYSTEM', `ALTER SYSTEM SET work_mem = '64MB'`],
-    ['CREATE DATABASE', `CREATE DATABASE evil`],
-    ['DROP DATABASE', `DROP DATABASE contake_conf`],
-    ['REINDEX CONCURRENTLY', `REINDEX INDEX CONCURRENTLY public.i`],
-    ['CALL', `CALL public.f()`],
-    ['DO', `DO $$ BEGIN RAISE NOTICE 'x'; END $$`],
-    ['SECURITY DEFINER function', `CREATE FUNCTION public.sd() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'`],
-  ];
-  for (const [label, sql] of nonTx) {
+  // R3: non-transactional / code classes CANNOT EXIST BY CONSTRUCTION - no
+  // template emits them (full-registry render sweep), no template NAME can
+  // request them, and the closed enums carry no escape value.
+  const allRendered = TEMPLATES.flatMap(t => renderStepStatements(t.name === 'ddl.create-index'
+    ? { version: '0', name: 'x', description: 'x', template: t.name, params: { ...SA_PARAMS } }
+    : { version: '0', name: 'x', description: 'x', template: t.name, params: {} }));
+  check('conf: full-registry render sweep emits no non-transactional/code class',
+    allRendered.every(st => !/CONCURRENTLY|\bVACUUM\b|ALTER SYSTEM|CREATE DATABASE|DROP DATABASE|REINDEX|\bCALL\b|\bDO\b|SECURITY DEFINER/i.test(st.text)));
+  for (const label of ['create-index-concurrently', 'vacuum', 'alter-system', 'create-database', 'call', 'do', 'security-definer-function']) {
     let refused = false;
-    try { validateMigrationArtifact(sql); } catch { refused = true; }
-    check(`conf: non-transactional/code class refused at gate: ${label}`, refused);
+    try { renderStepStatements({ version: '9', name: 'x', description: 'x', template: `ddl.${label}`, params: {} }); } catch { refused = true; }
+    check(`conf: no template exists for non-tx class: ${label}`, refused);
   }
+  let concRefused = false;
+  try { renderStepStatements(saStep({ unique: 'concurrently' }, { version: '9' })); } catch { concRefused = true; }
+  check('conf: enum escape toward CONCURRENTLY refused by the closed enum', concRefused);
 
   // (2)+(3)+(5) NAMED ATTACK: SECURITY DEFINER trigger function planted under
   // the migration role must not survive to fire under runtime-role INSERT;
@@ -371,22 +412,28 @@ if (phase === 'phase1') {
     check('conf: dblink contrib package unavailable on disposable cluster (privilege refusal proven; gate covered by unit suite)', true);
   }
 
-  // (6) Sequence values are non-transactional: an artifact nextval on a
-  // pre-existing sequence is diff-caught AND actively restored by the runner.
+  // (6) R3: no template can drift a sequence mid-step (general DML is gone),
+  // so the runner capture/restore path is DORMANT defense-in-depth; its
+  // helper-level contract is proven here on REAL PG: exact text capture,
+  // non-transactional nextval drift, ACTIVE restore, and a restore failure
+  // that PROPAGATES with explicit DIRTY/INDETERMINATE labeling.
   await mig.query(`CREATE SEQUENCE public.conf_seq`);
-  await mig.query(`CREATE TABLE public.seq_t(id bigint)`);
-  const greedy = {
-    version: '0002', name: 'greedy',
-    sql: `INSERT INTO public.seq_t(id) VALUES (pg_catalog.nextval('public.conf_seq'))`,
-  };
-  let seqRefused = false;
-  try {
-    await runMigrations(mig, { deployment: 'staging', appliedBy: 'conf-evidence', migrations: [...MIGRATIONS, greedy] });
-  } catch (e) { seqRefused = /CATALOG DELTA refusal/.test(String(e)); }
-  check('conf: artifact nextval on pre-existing sequence refused (catalog delta)', seqRefused);
+  const before6 = await sequenceValues(mig);
+  await mig.query(`SELECT nextval('public.conf_seq')`);
+  const drift6 = await sequenceValues(mig);
+  check('conf: nextval drift observed (non-transactional)', drift6.get('public.conf_seq')?.isCalled !== before6.get('public.conf_seq')?.isCalled);
+  const restored6 = await restoreSequenceValues(mig, before6);
+  console.error(`OBSERVED[restored sequences]: ${JSON.stringify(restored6)}`);
+  check('conf: sequence value ACTIVELY RESTORED (OBSERVED list)', restored6.includes('public.conf_seq'), restored6);
   const sv = await mig.query(`SELECT last_value::text AS lv, is_called AS ic FROM public.conf_seq`);
   console.error(`OBSERVED[restored sequence row]: ${JSON.stringify(sv.rows[0])}`);
-  check('conf: sequence value ACTIVELY RESTORED after rollback (OBSERVED row)', sv.rows[0]?.['ic'] === false, sv.rows);
+  check('conf: restored row matches the capture exactly (OBSERVED row)', sv.rows[0]?.['ic'] === false, sv.rows);
+  await mig.query(`DROP SEQUENCE public.conf_seq`);
+  let restoreErr = '';
+  try { await restoreSequenceValues(mig, drift6); } catch (e) { restoreErr = String(e); }
+  console.error(`OBSERVED[restore failure propagation]: ${restoreErr.slice(0, 220)}`);
+  check('conf: restore failure PROPAGATES with DIRTY/INDETERMINATE labeling (no swallow)', /SEQUENCE RESTORE failure/.test(restoreErr) && /DIRTY/.test(restoreErr), restoreErr.slice(0, 160));
+  await mig.query(`CREATE SEQUENCE public.conf_seq`);
   // >2^53 exact-text sequence handling on REAL PG
   const BIG = '9007199254740993';
   await mig.query(`SELECT setval('public.conf_seq', $1::text::bigint, true)`, [BIG]);
@@ -397,7 +444,7 @@ if (phase === 'phase1') {
   check('conf: snapshot carries the >2^53 value as exact text', bigSnap.some(x => x.startsWith('seqval ') && x.includes(BIG)));
   await mig.query(`SELECT setval('public.conf_seq', 1, false)`);
   const afterAll = JSON.stringify(await catalogSnapshot(mig));
-  await mig.query(`DROP TABLE public.seq_t`); await mig.query(`DROP SEQUENCE public.conf_seq`);
+  await mig.query(`DROP SEQUENCE public.conf_seq`);
 
   // R2 §4: pre-existing-object alteration matrix on REAL PG (migrator role
   // CAN perform these in-schema by privilege - the DIFF is the boundary).

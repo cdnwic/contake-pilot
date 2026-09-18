@@ -327,3 +327,84 @@ in evidence phase4, and in the unit suite):
   session-lock escape rejection on real PG, seed transaction + exact rerun +
   drift refusal + forced post-write rollback, pooled/direct targeting,
   restart durability, CLI end-to-end.
+
+## R3 closed-template execution contract (trust-head ruling R3, 2026-09-18)
+
+R3 is the binding fresh-qualification architecture for migration execution
+(ruling sha256 begins 476d455a). It replaces the artifact-SQL boundary
+entirely; the R2 canonical diff survives only at secondary scope.
+
+1. Runner-owned closed template registry (`TEMPLATES` in runner.ts). A
+   migration step is INERT DATA: {version, name, description, template,
+   params, assertions?, lockTables?, xactLockKey?}. There is no caller SQL
+   anywhere - the AST allowlist machinery (parser, canonicalizer, relation
+   qualifier, expression closer) is DELETED, not refactored. Unknown
+   template names refuse fail-closed.
+2. Parameter discipline: identifiers must match a strict canonical shape
+   (pg_ prefixes, quotes, semicolons and schema paths rejected); literals
+   are bound parameters, never interpolated; enums are closed sets;
+   expressions exist only as NAMED registry forms (EXPR_NORM_PHONE =
+   btrim(phone); PRED_PHONE_NOT_NULL = phone IS NOT NULL) so expression
+   indexes are covered without free text. Param key sets must match the
+   template schema exactly.
+3. Identity: templateHash pins sha256(template name + render source + param
+   schema); zero-param templates additionally pin their exact rendered
+   bytes. stepDigest v7 binds version + name + template + templateHash +
+   canonical params - tampered params or tampered registry render source
+   move every digest (registry/artifact tamper refusal).
+4. General DML is removed. The staging synthetic seed uses a separate
+   closed DATA template family (`DATA_TEMPLATES` in staging-seed.ts):
+   frozen per-table INSERT ... ON CONFLICT forms with bound literals,
+   module-load integrity proof, and a pinned registry fingerprint
+   (DATA_REGISTRY_SHA256) bound into the staging inventory. Staging stamp,
+   dirty refusal and absence proofs are preserved.
+5. The frozen 0001 baseline runs through template init.schema-baseline.0001:
+   runner-owned GRAPH_DDL/OTP_DDL text, qualified to the controlled schema
+   by a closed-form module-load rewrite (three permitted shapes; any
+   deviation fails closed at load) because the migration session pins
+   search_path EMPTY and no AST exists.
+6. The catalog diff is demoted to a SECONDARY tripwire: zero-delta on the
+   never-touch executable/security classes plus environment-tamper
+   detection. No PASS rests on its completeness; its residual
+   column-enumeration incompleteness is accepted and recorded (security's
+   R2 COST/STRICT/PARALLEL SAFE finding).
+7. Capability growth happens ONLY by adding a reviewed template to the
+   registry. There is no artifact-level escape hatch: non-transactional
+   classes (CONCURRENTLY/VACUUM/ALTER SYSTEM/CREATE+DROP DATABASE/REINDEX/
+   CALL/DO/SECURITY DEFINER) and code objects (trigger/cast/operator/rule/
+   policy/event trigger) cannot exist by construction - proven by a
+   full-registry render sweep on unit and real PG.
+8. Carried boundary-independent invariants (R1/R2, unchanged): one
+   transaction per governed operation; deployment+instance pinning (TOFU
+   then pin) verified BEFORE any write; boot gates fail closed on every PG
+   boot with REAL-PG tamper proofs (history, default ACLs, pinned extension
+   baseline); least-privilege roles with search_path hygiene; sequence
+   values exact text end-to-end with active restore, ERR-PROPAGATE,
+   restore-failure injection and explicit DIRTY/INDETERMINATE labeling
+   (a sequence that vanished since capture is an explicit restore failure,
+   never a silent skip); migration-role default privileges revoke PUBLIC
+   EXECUTE, asserted at boot; observed-artifact evidence standard;
+   SHA256SUMS + commit records + no-clobber archive.
+
+### R3 evidence
+
+- `apps/api/tests/release-migrations.test.ts` (30 tests): the R3 gate suite
+  (renders, typed-param injection per class, unknown template, registry/
+  artifact tamper digests, code-object impossibility sweep, non-tx
+  impossibility sweep, sequence helper proofs incl. restore-failure
+  injection, catalog-diff tripwire, R2 attack matrix) plus the runner
+  suite (boot gate, adoption, pin binding, forward-only, history tamper,
+  param-edit tamper, failing-template rollback, foreign-history refusal,
+  guard rollback, SA-shaped template step, registry validation, role
+  separation).
+- `apps/api/evidence-realpg-release-migrations.mts` phases 1-4 on real
+  PostgreSQL 14: full run + race + failing-template rollback + closed-
+  registry registration refusals + guard rollback + TOFU/pin refusals +
+  seed (DATA family) transaction/rerun/drift/rollback; REAL restart
+  durability; least-privilege roles + R3 section-5 attacks (13 typed-param/
+  caller-SQL refusals with OBSERVED text) + param/render tamper digests +
+  boot-gate history tamper proof; CTL-DDL-CONFINEMENT: construction-
+  impossibility sweep, secdef-trigger plant, dblink baseline refusal,
+  sequence restore contract (capture/drift/restore/PROPAGATING failure),
+  >2^53 exactness, pre-existing-object alteration matrix, default-privilege
+  lockdown.

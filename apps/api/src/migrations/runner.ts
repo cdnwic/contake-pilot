@@ -55,180 +55,178 @@ export type MigrationAssertion =
   | { readonly kind: 'no-nulls'; readonly table: string; readonly column: string }
   | { readonly kind: 'no-duplicates'; readonly table: string; readonly column: string; readonly normalize?: 'btrim' | 'none'; readonly skipNulls?: boolean };
 
-/** Declarative migration step: frozen SQL text + declared primitives. */
+/** R3: a migration step is INERT DATA - a registry template name plus
+ *  strictly typed params. No caller SQL exists anywhere in the system. */
 export interface MigrationStep {
   /** Zero-padded, strictly increasing ('0001', '0002', ...). */
   readonly version: string;
   readonly name: string;
   readonly description: string;
-  /** The EXACT SQL text: parsed, allowlisted, executed and hashed. Frozen
-   *  once shipped - editing it is a new migration version. */
-  readonly sql: string;
-  /** Runner-executed zero-row guards (hard-fail), evaluated BEFORE sql. */
+  /** Closed runner-owned registry template name. */
+  readonly template: string;
+  /** Strictly typed params (identifier/literal/closed-enum/named-expression);
+   *  validated and bound by the runner - never interpolated raw. */
+  readonly params?: Readonly<Record<string, unknown>>;
+  /** Runner-executed zero-row guards (hard-fail), evaluated BEFORE the step. */
   readonly assertions?: readonly MigrationAssertion[];
-  /** Runner-executed `LOCK TABLE <t> IN SHARE ROW EXCLUSIVE MODE` before sql. */
+  /** Runner-executed `LOCK TABLE <t> IN SHARE ROW EXCLUSIVE MODE` before the step. */
   readonly lockTables?: readonly string[];
   /** Runner-executed pg_advisory_xact_lock(key) first (step-scoped). */
   readonly xactLockKey?: number;
 }
 
-/** Declarative statement types permitted in migration artifacts (TL
- *  reconciliation: DDL+DML only - no DO/CALL/SELECT/functions/tx-control). */
-const ARTIFACT_ALLOWLIST: ReadonlySet<string> = new Set([
-  'create table', 'create index', 'alter table', 'drop table', 'drop index',
-  'insert', 'update', 'delete',
-]);
+/** R3 PRIMARY BOUNDARY: the CLOSED TEMPLATE REGISTRY. Named, frozen,
+ *  parameterized SQL shapes - reviewed like code, versioned, hash-pinned.
+ *  Capability grows ONLY by adding a reviewed template here; there is no
+ *  artifact-level escape hatch. The real-parser AST allowlist machinery is
+ *  DELETED (R3 §1), not refactored: artifacts carry no SQL to parse. */
 
-/** SEMANTIC LAYER (TL architecture ruling + security closures, 2026-09-18 -
- *  replaces every syntactic name allowlist):
- *  1. The migration session runs with search_path PINNED EMPTY; pg_catalog is
- *     implicitly searched first, so unqualified built-ins resolve to
- *     pg_catalog and NOTHING ELSE can be shadowed in.
- *  2. Every artifact identifier is canonically FULLY QUALIFIED by the runner:
- *     relation names to the controlled schema 'public', function calls to
- *     'pg_catalog'. A caller-supplied schema other than the controlled one
- *     (attacker.lower, public.btrim for a function) is REFUSED - resolution
- *     is provably impossible outside {public, pg_catalog}.
- *  3. RECURSIVELY CLOSED shapes: no WITH/CTEs anywhere, no nested SELECT
- *     (subqueries) anywhere, no code/object-bearing statements (function/
- *     procedure/operator/cast/trigger/rule/aggregate/type/DO/CALL/COPY /
- *     owner/security-definer) - the statement allowlist plus an explicit
- *     ALTER-action allowlist close these.
- *  4. Runner-owned CATALOG SNAPSHOTS before/after every step assert ZERO
- *     delta of functions/operators/casts/triggers/rules; any delta rolls the
- *     step back. Execution is digest-bound to the canonical qualified
- *     serialization that actually runs. */
-const CONTROLLED_SCHEMA = 'public';
-const CATALOG_SCHEMA = 'pg_catalog';
-
-/** Exact-shape name node: {name: string} or {name, schema} and nothing else. */
-const isNameNode = (o: Record<string, unknown>): boolean => {
-  const keys = Object.keys(o).sort();
-  return typeof o['name'] === 'string' &&
-    (keys.length === 1 || (keys.length === 2 && keys[1] === 'schema' && typeof o['schema'] === 'string'));
+/** Named expression forms: the ONLY way an expression enters a statement.
+ *  Free-text expressions do not exist (expression indexes are covered
+ *  without caller text). */
+export const NAMED_EXPRESSIONS: Readonly<Record<string, string>> = {
+  EXPR_NORM_PHONE: 'btrim(phone)',
+  EXPR_NONE: '',
+};
+export const NAMED_PREDICATES: Readonly<Record<string, string>> = {
+  PRED_PHONE_NOT_NULL: 'phone IS NOT NULL',
+  PRED_NONE: '',
 };
 
-/** ALTER TABLE actions that remain declarative schema evolution. OWNER,
- *  SET SCHEMA, trigger/constraint-creation of code objects and everything
- *  else is refused. */
-const ALTER_ACTION_ALLOWLIST: ReadonlySet<string> = new Set([
-  'add column', 'drop column', 'alter column', 'rename column',
-  'add constraint', 'drop constraint', 'rename constraint', 'rename table',
-]);
-
-function artifactRefusal(why: string): never {
-  throw new Error(`release-migrations: ARTIFACT refusal - ${why}`);
+export type TemplateParamKind = 'identifier' | 'literal' | 'enum' | 'expression';
+export interface RenderedStatement { text: string; values: unknown[] }
+export interface TemplateEntry {
+  readonly name: string;
+  readonly description: string;
+  /** Typed parameter schema: param name -> kind. Exact own-key sets enforced. */
+  readonly paramSpec: Readonly<Record<string, TemplateParamKind>>;
+  /** Closed enum value sets, per enum param. */
+  readonly enumValues?: Readonly<Record<string, readonly string[]>>;
+  /** Catalogs this template may write (statement-kind x catalog matrix, R2 carried). */
+  readonly writesCatalogs: readonly string[];
+  /** Fixed parameterized shape: validated params in, bound statements out.
+   *  Identifiers are strict-shaped and pinned into the controlled schema;
+   *  literals are bound $n values, NEVER interpolated. */
+  readonly render: (params: Readonly<Record<string, unknown>>) => readonly RenderedStatement[];
 }
 
-/** Qualifies one relation name node to the controlled schema (fail-closed). */
-function qualifyRelation(n: unknown, ctx: string): void {
-  if (!n || typeof n !== 'object' || !isNameNode(n as Record<string, unknown>)) {
-    artifactRefusal(`unexpected relation shape in ${ctx} (closed AST shapes only)`);
+const CONTROLLED_SCHEMA = 'public';
+const IDENT_STRICT_LOCAL = /^[a-z_][a-z0-9_]{0,62}$/;
+function templateRefusal(why: string): never {
+  throw new Error(`release-migrations: TEMPLATE refusal - ${why} (fail-closed)`);
+}
+/** Identifier params: strict shape only. System schemas and extension-owned
+ *  objects CANNOT be targeted by construction - every identifier is pinned
+ *  into the controlled schema as a bare name ("public"."name"); a name
+ *  carrying quotes/semicolons/schema paths fails the shape check. */
+export function bindIdentifier(v: unknown, what: string): string {
+  if (typeof v !== 'string' || !IDENT_STRICT_LOCAL.test(v)) {
+    templateRefusal(`identifier param '${what}' must be a canonical lowercase identifier, got ${JSON.stringify(v)}`);
   }
-  const o = n as { name: string; schema?: string };
-  const schema = o.schema ?? CONTROLLED_SCHEMA;
-  if (schema !== CONTROLLED_SCHEMA) {
-    artifactRefusal(`relation "${schema}"."${o.name}" in ${ctx} is outside the controlled schema '${CONTROLLED_SCHEMA}' - every identifier must resolve to ${CONTROLLED_SCHEMA} (search_path is pinned empty)`);
+  if (v.startsWith('pg_')) templateRefusal(`identifier param '${what}' targets a system namespace prefix (${v})`);
+  return v;
+}
+/** Literal params are bound values only - never interpolated into text. */
+export function bindLiteral(v: unknown, what: string): string | number | boolean | null {
+  if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  templateRefusal(`literal param '${what}' must be a string/number/boolean/null value, got ${JSON.stringify(v)}`);
+}
+function bindEnum(v: unknown, what: string, allowed: readonly string[]): string {
+  if (typeof v !== 'string' || !allowed.includes(v)) {
+    templateRefusal(`enum param '${what}' must be one of [${allowed.join(', ')}], got ${JSON.stringify(v)}`);
   }
-  o.schema = CONTROLLED_SCHEMA;
+  return v;
+}
+function bindExpression(v: unknown, what: string, forms: Readonly<Record<string, string>>): string {
+  if (typeof v !== 'string' || !(v in forms)) {
+    templateRefusal(`expression param '${what}' must be a NAMED registry form [${Object.keys(forms).join(', ')}], got ${JSON.stringify(v)}`);
+  }
+  return forms[v]!;
 }
 
-/** Recursively closes expression shapes and qualifies every function call to
- *  pg_catalog. Refuses CTEs, nested SELECTs/subqueries and any non-pg_catalog
- *  call target (attacker.lower can never resolve). */
-function closeExpressions(node: unknown): void {
-  if (!node || typeof node !== 'object') return;
-  if (Array.isArray(node)) { for (const n of node) closeExpressions(n); return; }
-  const o = node as Record<string, unknown>;
-  if (o['type'] === 'select') artifactRefusal('nested SELECT/subquery is not a permitted artifact shape');
-  if (o['with'] !== undefined) artifactRefusal('WITH/CTE is not a permitted artifact shape');
-  if (o['securityDefiner'] !== undefined || o['security'] !== undefined) artifactRefusal('SECURITY DEFINER is not a permitted artifact shape');
-  if (o['type'] === 'call') {
-    const fn = o['function'] as Record<string, unknown>;
-    if (!fn || !isNameNode(fn)) artifactRefusal('unexpected function-call shape (closed AST shapes only)');
-    const f = fn as { name: string; schema?: string };
-    const schema = f.schema ?? CATALOG_SCHEMA;
-    if (schema !== CATALOG_SCHEMA) {
-      artifactRefusal(`function call "${schema}"."${f.name}" targets a non-pg_catalog schema - with search_path pinned empty only pg_catalog functions can resolve`);
-    }
-    f.schema = CATALOG_SCHEMA;
+/** The frozen 0001 baseline statements (GRAPH_DDL/OTP_DDL from the repo layer
+ *  - runner-owned reviewed constants, never caller input). */
+const BASELINE_0001_STATEMENTS: readonly string[] = `${GRAPH_DDL};${OTP_DDL}`
+  .split(';')
+  // Frozen runner-owned text may carry `--` comment lines; they carry no
+  // semantics, so strip them before the closed-shape check (an AST did this in R2).
+  .map(x => x.split('\n').filter(line => !line.trimStart().startsWith('--')).join('\n').trim())
+  .filter(Boolean)
+  .map(text => {
+    // R3: the migration session pins search_path EMPTY and no AST exists, so
+    // qualification is a CLOSED-FORM rewrite of runner-owned frozen text: every
+    // baseline statement must match the single permitted shape exactly, or the
+    // module fails closed at load. `now()` resolves via implicit pg_catalog.
+    // Exactly three closed shapes exist in the frozen baseline; anything else fails closed.
+    const t = /^CREATE TABLE IF NOT EXISTS ([a-z_][a-z0-9_]*)\(([\s\S]*)$/.exec(text);
+    if (t) return `CREATE TABLE IF NOT EXISTS "public"."${t[1]}"(${t[2]}`;
+    const i = /^CREATE (UNIQUE )?INDEX IF NOT EXISTS ([a-z_][a-z0-9_]*) ON ([a-z_][a-z0-9_]*)\(([\s\S]*)$/.exec(text);
+    // PG forbids schema-qualifying the index NAME; qualifying the TABLE pins the index schema deterministically.
+    if (i) return `CREATE ${i[1] ?? ''}INDEX IF NOT EXISTS "${i[2]}" ON "public"."${i[3]}"(${i[4]}`;
+    throw new Error(`release-migrations: TEMPLATE integrity refusal - frozen baseline statement deviates from its closed shapes: ${text.slice(0, 80)}`);
+  });
+
+export const TEMPLATES: readonly TemplateEntry[] = [
+  {
+    name: 'init.schema-baseline.0001',
+    description: '0001 graph + OTP schema baseline (frozen DDL constants; IF NOT EXISTS adoption).',
+    paramSpec: {},
+    writesCatalogs: ['owner_rel', 'acl_rel'],
+    render: () => BASELINE_0001_STATEMENTS.map(text => ({ text, values: [] })),
+  },
+  {
+    name: 'ddl.create-index',
+    description: 'Create an index on ONE controlled-schema table; expression only via a NAMED form; predicate only via a NAMED form.',
+    paramSpec: { index: 'identifier', table: 'identifier', unique: 'enum', expression: 'expression', predicate: 'expression', ifNotExists: 'enum' },
+    enumValues: { unique: ['unique', 'plain'], ifNotExists: ['if-not-exists', 'strict'] },
+    writesCatalogs: ['owner_rel', 'acl_rel'],
+    render: (params) => {
+      const index = bindIdentifier(params['index'], 'index');
+      const table = bindIdentifier(params['table'], 'table');
+      const unique = bindEnum(params['unique'], 'unique', ['unique', 'plain']);
+      const target = bindExpression(params['expression'], 'expression', NAMED_EXPRESSIONS) || `"${table}"`;
+      const pred = bindExpression(params['predicate'], 'predicate', NAMED_PREDICATES);
+      const ine = bindEnum(params['ifNotExists'], 'ifNotExists', ['if-not-exists', 'strict']);
+      const text = `CREATE ${unique === 'unique' ? 'UNIQUE ' : ''}INDEX ${ine === 'if-not-exists' ? 'IF NOT EXISTS ' : ''}"${index}" ON "public"."${table}" (${target})${pred ? ` WHERE ${pred}` : ''}`;
+      return [{ text, values: [] }];
+    },
+  },
+];
+
+const templateByName = new Map(TEMPLATES.map(t => [t.name, t]));
+export function getTemplate(name: string): TemplateEntry {
+  const t = templateByName.get(name);
+  if (!t) templateRefusal(`unknown template name ${JSON.stringify(name)} - the registry is closed`);
+  return t!;
+}
+/** Hash-pin: a template's identity is its name + frozen render source +
+ *  param schema. Editing a template changes every dependent step digest and
+ *  fails the runner/boot history check - registry tamper is refused. */
+export const templateHash = (t: TemplateEntry): string => {
+  const h = createHash('sha256').update(`contake-template/v1\n${t.name}\n${t.render.toString()}\n${canonicalJson({ paramSpec: t.paramSpec, enumValues: t.enumValues ?? {}, writesCatalogs: t.writesCatalogs })}`);
+  // Zero-param templates have ONE fixed rendering: pin its exact bytes too, so
+  // tampering with the module-level frozen text (not only the render source)
+  // moves the hash.
+  if (Object.keys(t.paramSpec).length === 0) {
+    h.update('\nrendered\n').update(canonicalJson(t.render({}).map(st => ({ text: st.text, values: st.values }))));
   }
-  for (const [k, v] of Object.entries(o)) {
-    if (k === 'name' || k === 'schema') continue; // handled at their owning nodes
-    closeExpressions(v);
+  return h.digest('hex');
+};
+
+/** Validate a step's params against the template schema (exact own-key sets,
+ *  per-kind validation) and render the bound statements the runner executes. */
+export function renderStepStatements(m: MigrationStep): readonly RenderedStatement[] {
+  const t = getTemplate(m.template);
+  const params = m.params ?? {};
+  const specKeys = Object.keys(t.paramSpec).sort();
+  const given = Object.keys(params).sort();
+  if (JSON.stringify(given) !== JSON.stringify(specKeys)) {
+    templateRefusal(`step '${m.version}' params ${JSON.stringify(given)} do not exactly match template '${t.name}' schema ${JSON.stringify(specKeys)}`);
   }
+  return t.render(params);
 }
 
-/** Canonicalizes one parsed statement: closed shapes + fully qualified
- *  identifiers, in place. The re-serialized result is what executes AND what
- *  the digest binds. */
-function canonicalizeStatement(st: Record<string, unknown>): void {
-  const t = String(st['type']);
-  if (!ARTIFACT_ALLOWLIST.has(t)) {
-    artifactRefusal(`statement type '${t}' is not declarative DDL+DML (allowed: ${[...ARTIFACT_ALLOWLIST].join(', ')}; code/object-bearing statements, transaction control, SELECT/CALL/DO and locks are runner-owned or forbidden)`);
-  }
-  // CTL-DDL-CONFINEMENT condition 1: rollback equals prevention ONLY inside
-  // one transaction - every non-transactional class is refused outright.
-  if (st['concurrently']) {
-    artifactRefusal(`'${t} CONCURRENTLY' is non-transactional - it cannot roll back, so it can never run inside a governed step`);
-  }
-  switch (t) {
-    case 'create table': qualifyRelation(st['name'], 'CREATE TABLE'); break;
-    case 'create index':
-      qualifyRelation(st['table'], 'CREATE INDEX ... ON');
-      break;
-    case 'alter table': {
-      qualifyRelation(st['table'], 'ALTER TABLE');
-      const changes = st['changes'];
-      if (!Array.isArray(changes)) artifactRefusal('unexpected ALTER TABLE shape');
-      for (const a of changes as Record<string, unknown>[]) {
-        if (!ALTER_ACTION_ALLOWLIST.has(String(a['type']))) {
-          artifactRefusal(`ALTER TABLE action '${String(a['type'])}' is not in the closed declarative set (no OWNER/SET SCHEMA/code-object actions)`);
-        }
-      }
-      break;
-    }
-    case 'drop table': for (const n of (st['names'] ?? []) as unknown[]) qualifyRelation(n, 'DROP TABLE'); break;
-    case 'drop index': for (const n of (st['names'] ?? []) as unknown[]) qualifyRelation(n, 'DROP INDEX'); break;
-    case 'insert': qualifyRelation(st['into'], 'INSERT INTO'); break;
-    case 'update': qualifyRelation(st['table'], 'UPDATE'); break;
-    case 'delete': qualifyRelation(st['from'], 'DELETE FROM'); break;
-    default: break; // drop index carries no relation schema
-  }
-  closeExpressions(st);
-}
-
-/** Registration-time artifact gate + canonicalizer (one object): parses with
- *  the real parser (fail-closed on garbage), closes shapes recursively and
- *  fully qualifies every identifier. Returns the canonical executed
- *  serializations - one per driver call. Execution runs EXACTLY these and the
- *  digest hashes EXACTLY their join. */
-export function artifactStatements(sql: string): string[] {
-  let stmts: Record<string, unknown>[];
-  try {
-    stmts = parseSql(sql) as unknown as Record<string, unknown>[];
-  } catch (e) {
-    artifactRefusal(`unparsable SQL (fail-closed): ${(e as Error).message.split('\n')[0]}`);
-  }
-  if (stmts.length === 0) artifactRefusal('empty artifact');
-  for (const st of stmts) canonicalizeStatement(st);
-  return stmts.map(st => toSql.statement(st as never));
-}
-export const canonicalArtifactSql = (sql: string): string => artifactStatements(sql).join(';\n');
-export function validateMigrationArtifact(sql: string): void {
-  artifactStatements(sql); // throws on any refusal; validation IS canonicalization
-}
-
-/** Runner-owned CATALOG SNAPSHOT assertion (TL semantic layer): the identity
- *  set of user functions/operators/casts/triggers/rules visible to the
- *  migration role. A step must produce ZERO delta; any delta rolls the step
- *  back, so no artifact can leave code/objects behind even through a parser
- *  blind spot. Extension-owned and catalog objects are excluded. */
-/** R2 canonical boundary: ONE JSON object per catalog row (jsonb_build_object,
- *  EXPLICIT per-catalog column lists); compared as a sorted multiset of
- *  per-row sha256 hashes in JS - delimiter concatenation cannot exist under
- *  per-row JSON. Identity keys are fully-qualified NAMES, never bare OIDs;
- *  OID resolution happens only within one snapshot for joins. */
 const CATALOG_SNAPSHOT_SQL = `
 SELECT kind, body FROM (
   SELECT 'pg_proc' AS kind, jsonb_build_object(
@@ -364,14 +362,9 @@ SELECT kind, body FROM (
  *  change. Writable (data-object) classes accept NEW rows only; any change
  *  to a PRE-EXISTING row (alteration or drop) is a hard fail. NEVER-TOUCH:
  *  ANY delta (add, drop, or alteration) is a hard fail + rollback. */
-export const STATEMENT_CATALOG_MATRIX: Readonly<Record<string, readonly string[]>> = {
-  'create table': ['owner_rel', 'acl_rel'],
-  'create index': ['owner_rel', 'acl_rel'],
-  'drop table': [],
-  'drop index': [],
-  'alter table': ['owner_rel', 'acl_rel'],
-  'insert/update/delete/select': [],
-};
+export const STATEMENT_CATALOG_MATRIX: Readonly<Record<string, readonly string[]>> = Object.fromEntries(
+  TEMPLATES.map(t => [t.name, t.writesCatalogs]),
+);
 const NEVER_TOUCH_KINDS: ReadonlySet<string> = new Set([
   'pg_proc', 'pg_trigger', 'pg_rewrite', 'pg_operator', 'pg_opclass', 'pg_cast',
   'pg_extension', 'pg_event_trigger', 'pg_policy', 'pg_default_acl',
@@ -403,7 +396,7 @@ export async function catalogSnapshotRows(conn: Queryable): Promise<CatalogRow[]
  *  hard-fails; restoration (not just detection) is what makes the step's
  *  aftermath exactly equal. */
 interface SeqVal { lastValue: string; isCalled: boolean }
-async function sequenceValues(conn: Queryable): Promise<Map<string, SeqVal>> {
+export async function sequenceValues(conn: Queryable): Promise<Map<string, SeqVal>> {
   const seqs = await conn.query(
     `SELECT schemaname, sequencename FROM pg_sequences WHERE schemaname NOT LIKE 'pg\\_%' ESCAPE '\\' AND schemaname <> 'information_schema'`,
   );
@@ -415,12 +408,16 @@ async function sequenceValues(conn: Queryable): Promise<Map<string, SeqVal>> {
   }
   return m;
 }
-async function restoreSequenceValues(conn: Queryable, before: Map<string, SeqVal>): Promise<string[]> {
+export async function restoreSequenceValues(conn: Queryable, before: Map<string, SeqVal>): Promise<string[]> {
   const now = await sequenceValues(conn);
   const restored: string[] = [];
   for (const [name, bv] of before) {
     const nv = now.get(name);
-    if (nv && (nv.lastValue !== bv.lastValue || nv.isCalled !== bv.isCalled)) {
+    // No swallow anywhere in the restore path: a sequence that VANISHED since
+    // capture cannot be restored - that is an explicit restore failure with
+    // dirty/indeterminate labeling, never a silent skip.
+    if (!nv) throw new Error(`release-migrations: SEQUENCE RESTORE failure (DIRTY/INDETERMINATE) - "${name}" vanished since capture; pinned value ${bv.lastValue} (is_called=${bv.isCalled}) cannot be restored`);
+    if (nv.lastValue !== bv.lastValue || nv.isCalled !== bv.isCalled) {
       const [sch, seq] = name.split('.') as [string, string];
       // Exact text: the bigint travels as a string parameter, never a JS number.
       await conn.query(`SELECT pg_catalog.setval('"${sch}"."${seq}"', $1::text::bigint, $2)`, [bv.lastValue, bv.isCalled]);
@@ -567,9 +564,18 @@ export const stepDigest = (m: MigrationStep): string => {
   if (m.xactLockKey !== undefined && (!Number.isSafeInteger(m.xactLockKey) || m.xactLockKey < 0)) {
     throw new Error('release-migrations: xactLockKey must be a non-negative safe integer');
   }
+  // Inert-data integrity: template name + HASH-PINNED template identity +
+  // canonical typed params. Tampering with artifact bytes (params) or the
+  // registry (template source) changes the digest and fails history checks.
+  const t = getTemplate(m.template);
+  const params = m.params ?? {};
+  const specKeys = Object.keys(t.paramSpec).sort();
+  if (JSON.stringify(Object.keys(params).sort()) !== JSON.stringify(specKeys)) {
+    templateRefusal(`step '${m.version}' params do not exactly match template '${t.name}' schema`);
+  }
   return createHash('sha256').update(
-    `contake-migration/v6\n${m.version}\n${m.name}\n${canonicalArtifactSql(m.sql)}\n${canonicalJson({
-      assertions: m.assertions ?? [], lockTables: m.lockTables ?? [], xactLockKey: m.xactLockKey ?? null,
+    `contake-migration/v7\n${m.version}\n${m.name}\n${m.template}\n${templateHash(t)}\n${canonicalJson({
+      params, assertions: m.assertions ?? [], lockTables: m.lockTables ?? [], xactLockKey: m.xactLockKey ?? null,
     })}`,
   ).digest('hex');
 };
@@ -583,7 +589,8 @@ export const MIGRATIONS: readonly MigrationStep[] = [
     version: '0001',
     name: 'init-schema',
     description: 'Graph + OTP schema baseline (schema ownership moved out of app boot; idempotent IF NOT EXISTS).',
-    sql: `${GRAPH_DDL};${OTP_DDL}`,
+    template: 'init.schema-baseline.0001',
+    params: {},
   },
   // SA lane plug-in contract (backend compatibility confirmed 2026-09-18;
   // TL reconciliation: declarative-only, guards as runner primitives):
@@ -717,7 +724,7 @@ export function validateRegistry(migrations: readonly MigrationStep[]): void {
     if (m.version !== String(i + 1).padStart(4, '0')) {
       throw new Error(`release-migrations: registry is not strictly sequential at index ${i} (version ${m.version}) - refusing`);
     }
-    validateMigrationArtifact(m.sql);
+    renderStepStatements(m); // unknown template / param-schema drift refuses here
     for (const a of m.assertions ?? []) validateAssertion(a);
     for (const t of m.lockTables ?? []) {
       if (typeof t !== 'string' || !IDENT_STRICT.test(t)) throw new Error(`release-migrations: invalid lockTables identifier ${JSON.stringify(t)}`);
@@ -824,9 +831,9 @@ export async function runMigrations(
           }
           const catalogBefore = await catalogSnapshotRows(client);
           sequencesBefore = await sequenceValues(client);
-          for (const stmt of artifactStatements(m.sql)) {
+          for (const stmt of renderStepStatements(m)) {
             await client.query(`SELECT pg_catalog.set_config('search_path', '', true)`);
-            await client.query(stmt);
+            await client.query(stmt.text, stmt.values);
           }
           // Zero function/operator/cast/trigger/rule delta across the step.
           assertZeroCatalogDeltaRows(catalogBefore, await catalogSnapshotRows(client), m.version);
@@ -855,8 +862,19 @@ export async function runMigrations(
           await client.query('ROLLBACK').catch(() => undefined);
           // Condition 6: rollback cannot restore sequence state - do it
           // actively, then hard-fail with the original error retained.
-          // ERR-PROPAGATE: a restore failure is itself a hard failure (no swallow).
-          const restored = sequencesBefore ? await restoreSequenceValues(client, sequencesBefore) : [];
+          // ERR-PROPAGATE with DIRTY labeling: a restore FAILURE makes the
+          // step's aftermath unprovable - DIRTY/INDETERMINATE hard failure
+          // retaining BOTH error records (original + restore).
+          const restored = sequencesBefore
+            ? await restoreSequenceValues(client, sequencesBefore).catch((re) => {
+                const original = e instanceof Error ? e.message : String(e);
+                const restoreErr = re instanceof Error ? re.message : String(re);
+                throw new Error(
+                  `release-migrations: DIRTY/INDETERMINATE step '${m.version}' - sequence restoration could not be proven; ` +
+                  `the database may hold non-transactional drift. original failure: ${original} | restore failure: ${restoreErr} (fail-closed)`,
+                );
+              })
+            : [];
           if (restored.length > 0 && e instanceof Error) {
             e.message += ` [non-transactional sequence state actively restored: ${restored.join(', ')}]`;
           }

@@ -26,8 +26,8 @@
  *    rejected as dirty/foreign state;
  *  - ONE transaction: any failed gate or proof rolls back EVERYTHING. */
 import { createHash, randomBytes, randomInt } from 'node:crypto';
-import { PostgresGraphRepository, type Connectable } from '../repo/postgres.js';
-import { applySeed, seedDemo } from '../seed.js';
+import { type Connectable } from '../repo/postgres.js';
+import { seedDemo } from '../seed.js';
 import { campDemoSeed, campDemoStagingSlice } from '../demo/camp-demo.js';
 import { seedFilmShoot } from '../seeds/film-shoot.seed.js';
 import { seedEventProduction } from '../seeds/event-production.seed.js';
@@ -111,6 +111,85 @@ export const rowDigest = (row: unknown): string => createHash('sha256').update(c
 export const manifestDigest = (manifest: { rows: readonly { table: string; pk: string; digest: string }[]; emptyTables: readonly string[] }): string =>
   createHash('sha256').update(canonicalJson(manifest)).digest('hex');
 
+/** R3 section 4: closed DATA template family - the ONLY data-movement shapes
+ *  the staging seed can execute (general DML is removed). Each entry freezes
+ *  one per-table INSERT ... ON CONFLICT form; every value is a BOUND literal,
+ *  never interpolated. A data shape that fits no entry forces a reviewed
+ *  registry addition - never a special case. */
+interface DataTemplateEntry {
+  readonly name: string;
+  readonly table: string;
+  readonly columns: readonly string[];
+  readonly conflict: string;
+  readonly update: readonly string[];
+}
+
+const DATA_IDENT = /^[a-z_][a-z0-9_]*$/;
+export const DATA_TEMPLATES: readonly DataTemplateEntry[] = [
+  { name: 'data.users.upsert', table: 'users', columns: ['user_id', 'org_id', 'email', 'phone', 'data'], conflict: 'user_id', update: ['org_id', 'email', 'phone', 'data'] },
+  { name: 'data.channels.upsert', table: 'channels', columns: ['id', 'org_id', 'address', 'data'], conflict: 'id', update: ['org_id', 'address', 'data'] },
+  { name: 'data.events.upsert', table: 'events', columns: ['id', 'org_id', 'version', 'data'], conflict: 'id', update: ['org_id', 'version', 'data'] },
+  { name: 'data.resources.upsert', table: 'resources', columns: ['id', 'event_id', 'version', 'data'], conflict: 'id', update: ['event_id', 'version', 'data'] },
+  { name: 'data.tasks.upsert', table: 'tasks', columns: ['id', 'event_id', 'version', 'data'], conflict: 'id', update: ['event_id', 'version', 'data'] },
+  { name: 'data.dependencies.upsert', table: 'dependencies', columns: ['id', 'from_task_id', 'to_task_id', 'data'], conflict: 'id', update: ['from_task_id', 'to_task_id', 'data'] },
+  { name: 'data.whitelist.upsert', table: 'whitelist_entries', columns: ['phone', 'org_id', 'status', 'data'], conflict: 'phone', update: ['org_id', 'status', 'data'] },
+];
+
+// Module-load integrity proof: strict identifiers, unique names, conflict and
+// update columns drawn from the frozen column list - any drift fails closed.
+{
+  const seen = new Set<string>();
+  for (const t of DATA_TEMPLATES) {
+    if (seen.has(t.name)) throw new Error(`seed:staging: DATA registry integrity refusal - duplicate template ${t.name}`);
+    seen.add(t.name);
+    for (const id of [t.table, t.conflict, ...t.columns, ...t.update]) {
+      if (!DATA_IDENT.test(id) || id.startsWith('pg_')) throw new Error(`seed:staging: DATA registry integrity refusal - non-canonical identifier "${id}" in ${t.name}`);
+    }
+    if (!t.columns.includes(t.conflict)) throw new Error(`seed:staging: DATA registry integrity refusal - conflict target outside columns in ${t.name}`);
+    for (const u of t.update) if (!t.columns.includes(u)) throw new Error(`seed:staging: DATA registry integrity refusal - update column outside columns in ${t.name}`);
+  }
+}
+
+export const dataTemplateHash = (t: DataTemplateEntry): string =>
+  createHash('sha256').update(`contake-data-template/v1\n${t.name}\n${canonicalJson({ table: t.table, columns: t.columns, conflict: t.conflict, update: t.update })}`).digest('hex');
+
+/** Pinned registry fingerprint, bound into the staging inventory. */
+export const DATA_REGISTRY_SHA256 = createHash('sha256')
+  .update(canonicalJson(DATA_TEMPLATES.map(t => [t.name, dataTemplateHash(t)])))
+  .digest('hex');
+
+export function getDataTemplate(name: string): DataTemplateEntry {
+  const t = DATA_TEMPLATES.find(x => x.name === name);
+  if (!t) throw new Error(`seed:staging: DATA refusal - unknown template name "${name}" - the registry is closed (fail-closed)`);
+  return t;
+}
+
+/** Bound literals only: string/number(finite)/boolean/null. jsonb payloads
+ *  travel as canonical strings. Anything else refuses - values are bound
+ *  parameters, never interpolated. */
+function bindDataLiteral(v: unknown): string | number | boolean | null {
+  if (v === null) return null;
+  const k = typeof v;
+  if (k === 'string' || k === 'boolean') return v as string | boolean;
+  if (k === 'number' && Number.isFinite(v as number)) return v as number;
+  throw new Error(`seed:staging: DATA refusal - a ${v === undefined ? 'undefined' : k} value cannot be bound; literals are bound parameters, never interpolated`);
+}
+
+export function renderDataStatement(templateName: string, values: readonly unknown[]): { text: string; values: (string | number | boolean | null)[] } {
+  const t = getDataTemplate(templateName);
+  if (values.length !== t.columns.length) {
+    throw new Error(`seed:staging: DATA refusal - template '${t.name}' takes exactly ${t.columns.length} bound values (${t.columns.join(', ')}), got ${values.length}`);
+  }
+  const bound = values.map(bindDataLiteral);
+  const cols = t.columns.map(c => `"${c}"`).join(', ');
+  const ph = t.columns.map((_, i) => `$${i + 1}`).join(', ');
+  const set = t.update.map(c => `"${c}" = EXCLUDED."${c}"`).join(', ');
+  return {
+    text: `INSERT INTO "public"."${t.table}"(${cols}) VALUES (${ph}) ON CONFLICT ("${t.conflict}") DO UPDATE SET ${set}`,
+    values: bound,
+  };
+}
+
 /** Explicit bookkeeping tables owned by the runner/seed (excluded from the
  *  zero-row business-table proof). */
 export const SEED_BOOKKEEPING_TABLES: readonly string[] = ['contake_db_identity', 'schema_migrations', 'staging_seed_state'];
@@ -158,6 +237,8 @@ export interface StagingInventory {
   /** Every other public business table, verified to carry ZERO rows. */
   emptyTables: string[];
   manifestSha256: string;
+  /** Pinned DATA template registry fingerprint (R3 section 4 binding). */
+  dataRegistrySha256: string;
   absenceProof: {
     fixtureIdentifiersChecked: number;
     forbiddenIdentifiersChecked: number;
@@ -309,6 +390,7 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
           rowDigests: live.rows,
           emptyTables: live.emptyTables,
           manifestSha256: liveManifest,
+          dataRegistrySha256: DATA_REGISTRY_SHA256,
           absenceProof: {
             fixtureIdentifiersChecked: fixtureForbidden.length,
             forbiddenIdentifiersChecked: envForbidden.length,
@@ -405,9 +487,21 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
     ];
     assertNoForbidden(generatedIds, forbiddenArr);
 
-    // Apply through the repository contract (same semantics as the app).
-    const repo = PostgresGraphRepository.connect(txConn);
-    await applySeed(repo, seed);
+    // R3 section 4: data movement executes ONLY through the closed DATA
+    // template family (frozen per-table upsert forms, bound literals) -
+    // state-equivalent to the repository contract the app itself uses.
+    const dataPlan: [string, unknown[]][] = [];
+    for (const u of seed.users) dataPlan.push(['data.users.upsert', [u.userId, u.orgId, u.email ?? null, u.phone ?? null, JSON.stringify(u)]]);
+    for (const c of seed.channels) dataPlan.push(['data.channels.upsert', [c.id, c.orgId, c.address, JSON.stringify(c)]]);
+    for (const e of seed.events) dataPlan.push(['data.events.upsert', [e.id, e.orgId, e.version, JSON.stringify(e)]]);
+    for (const r of seed.resources) dataPlan.push(['data.resources.upsert', [r.id, r.eventId, r.version, JSON.stringify(r)]]);
+    for (const t of seed.tasks) dataPlan.push(['data.tasks.upsert', [t.id, t.eventId, t.version, JSON.stringify(t)]]);
+    for (const d of seed.dependencies) dataPlan.push(['data.dependencies.upsert', [d.id, d.fromTaskId, d.toTaskId, JSON.stringify(d)]]);
+    for (const w of seed.whitelist ?? []) dataPlan.push(['data.whitelist.upsert', [w.phone, w.orgId, w.status, JSON.stringify(w)]]);
+    for (const [tpl, vals] of dataPlan) {
+      const st = renderDataStatement(tpl, vals);
+      await client.query(st.text, st.values);
+    }
 
     // Post-write ABSENCE PROOF: no forbidden identifier anywhere in the
     // business tables. Gate 3 proved the database empty before this run, so
@@ -470,6 +564,7 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
       rowDigests,
       emptyTables: live.emptyTables,
       manifestSha256,
+      dataRegistrySha256: DATA_REGISTRY_SHA256,
       absenceProof: {
         fixtureIdentifiersChecked: fixtureForbidden.length,
         forbiddenIdentifiersChecked: envForbidden.length,

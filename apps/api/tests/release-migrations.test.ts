@@ -8,11 +8,11 @@ import { describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { pgliteConnectable } from '../src/repo/postgres.js';
 import {
-  MIGRATIONS, EXPECTED_SCHEMA_VERSIONS, artifactStatements, assertDirectDatabaseUrl,
-  assertSchemaCurrent, assertZeroCatalogDelta, buildAssertionQuery, canonicalArtifactSql,
-  catalogSnapshot, requiredBootIdentity,
-  runMigrations, stepDigest, validateAssertion, validateMigrationArtifact,
-  verifyTargetPreconditions, type MigrationStep,
+  MIGRATIONS, EXPECTED_SCHEMA_VERSIONS, assertDirectDatabaseUrl,
+  assertSchemaCurrent, assertZeroCatalogDelta, bindIdentifier, bindLiteral, buildAssertionQuery,
+  catalogSnapshot, getTemplate, renderStepStatements, requiredBootIdentity,
+  runMigrations, sequenceValues, restoreSequenceValues, stepDigest, templateHash, validateAssertion,
+  verifyTargetPreconditions, NAMED_EXPRESSIONS, NAMED_PREDICATES, TEMPLATES, type MigrationStep,
 } from '../src/migrations/runner.js';
 
 async function freshDb() {
@@ -21,81 +21,88 @@ async function freshDb() {
   return { pg, conn };
 }
 
-const step = (version: string, name: string, sql: string, extra?: Partial<MigrationStep>): MigrationStep => ({
-  version, name, description: `test step ${name}`, sql, ...extra,
+const step = (version: string, name: string, template: string, params: Readonly<Record<string, unknown>>, extra?: Partial<MigrationStep>): MigrationStep => ({
+  version, name, description: `test step ${name}`, template, params, ...extra,
 });
+/** The SA-shaped step as inert data (R3 section 4 coverage): runner-managed
+ *  lock + named guards + canonical expression index via the NAMED form. */
+const SA_PARAMS = { index: 'users_phone_unique', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' } as const;
 
-describe('declarative artifact gate (real-parser AST allowlist)', () => {
-  it('accepts declarative DDL+DML', () => {
-    expect(() => validateMigrationArtifact(`CREATE TABLE t(id int); CREATE UNIQUE INDEX i ON t(btrim(id::text)); INSERT INTO t VALUES (1);`)).not.toThrow();
-    expect(() => validateMigrationArtifact(`ALTER TABLE t ADD COLUMN x text; DROP INDEX i; DELETE FROM t WHERE id = 1;`)).not.toThrow();
-    // R2: pg_description is NEVER-TOUCH (COMMENT drift is security drift), so
-    // COMMENT is removed from the gate entirely - it can never satisfy the diff.
-    expect(() => validateMigrationArtifact(`COMMENT ON TABLE t IS 'c'`)).toThrow(/ARTIFACT refusal/);
-    expect(() => validateMigrationArtifact(`COMMENT ON COLUMN t.id IS 'c'`)).toThrow(/ARTIFACT refusal/);
+describe('R3 closed-template contract (artifacts are inert data; no caller SQL exists)', () => {
+  it('renders the SA-shaped index and the 0001 baseline from inert params', () => {
+    const idx = renderStepStatements(step('0002', 'sa', 'ddl.create-index', SA_PARAMS));
+    expect(idx).toEqual([{ text: 'CREATE UNIQUE INDEX IF NOT EXISTS "users_phone_unique" ON "public"."users" (btrim(phone)) WHERE phone IS NOT NULL', values: [] }]);
+    const base = renderStepStatements(MIGRATIONS[0]!);
+    expect(base.length).toBeGreaterThan(10); // frozen GRAPH_DDL/OTP_DDL statements
+    expect(() => renderStepStatements(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, extra: 1 }))).toThrow(/do not exactly match/);
   });
-  it('rejects transaction control by AST type, not spelling', () => {
-    for (const bad of ['COMMIT', 'commit', 'BEGIN', 'START TRANSACTION', 'ROLLBACK', 'END', 'ABORT', 'PREPARE TRANSACTION \'x\'']) {
-      expect(() => validateMigrationArtifact(bad), bad).toThrow(/ARTIFACT refusal|unparsable/);
+  it('identifier-injection refused: quotes, semicolons, schema paths, system prefixes', () => {
+    for (const bad of [`us"; DROP TABLE users;--`, `users' OR '1'='1`, 'public.users', 'attacker.users', 'Users', 'pg_catalog', 'pg_shadow', 'us ers', '']) {
+      let observed = '';
+      try { renderStepStatements(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, table: bad })); } catch (e) { observed = String(e); }
+      console.log(`OBSERVED[identifier-injection ${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
+      expect(observed, bad).toMatch(/TEMPLATE refusal/);
+      expect(() => bindIdentifier(bad, 'table')).toThrow(/TEMPLATE refusal/);
     }
   });
-  it('rejects DO/CALL/SELECT/function execution (TL: no code in artifacts)', () => {
-    for (const bad of [
-      `DO $$ BEGIN RAISE EXCEPTION 'x'; END $$`, `CALL do_thing()`, 'SELECT 1',
-      'SELECT pg_advisory_xact_lock(1)', // even the xact lock is runner-owned, not artifact SQL
-      'CREATE TABLE t(id int); SELECT 1',
-    ]) {
-      expect(() => validateMigrationArtifact(bad), bad).toThrow(/ARTIFACT refusal/);
+  it('enum escape refused: closed sets only', () => {
+    for (const [k, bad] of [['unique', 'UNIQUE'], ['unique', 'yes'], ['ifNotExists', 'sometimes'], ['ifNotExists', 'if-not-exists; DROP TABLE users']] as const) {
+      let observed = '';
+      try { renderStepStatements(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, [k]: bad })); } catch (e) { observed = String(e); }
+      console.log(`OBSERVED[enum escape ${k}=${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
+      expect(observed, `${k}=${bad}`).toMatch(/TEMPLATE refusal - enum/);
     }
   });
-  it('rejects session advisory locks through quoting/schema/comment disguise', () => {
-    for (const bad of [
-      'SELECT pg_advisory_unlock(841000001)', 'SELECT "pg_advisory_unlock"(1)',
-      'SELECT pg_catalog.pg_advisory_unlock(1)', '/* x */ SELECT pg_advisory_lock(1) -- y',
-      'SELECT pg_advisory_unlock_all()', 'SELECT pg_try_advisory_lock(1)',
-    ]) {
-      expect(() => validateMigrationArtifact(bad), bad).toThrow(/ARTIFACT refusal/);
+  it('literal type confusion refused: bound values only, never interpolated', () => {
+    expect(bindLiteral('x', 'p')).toBe('x');
+    expect(bindLiteral(4, 'p')).toBe(4);
+    expect(bindLiteral(null, 'p')).toBeNull();
+    for (const bad of [{ a: 1 }, ['x'], undefined, NaN, Infinity]) {
+      expect(() => bindLiteral(bad, 'p'), JSON.stringify(bad)).toThrow(/TEMPLATE refusal - literal/);
     }
   });
-  it('unparseable text fails closed (SAVEPOINT/SET/LOCK syntax unsupported)', () => {
-    for (const bad of ['SAVEPOINT sp', 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE', 'LOCK TABLE users']) {
-      expect(() => validateMigrationArtifact(bad), bad).toThrow(/ARTIFACT refusal - unparsable/);
+  it('named-expression substitution refused: registry forms only, no free text', () => {
+    for (const bad of ['btrim(phone)', 'attacker.lower(phone)', 'EXPR_NORM_PHONE; DROP TABLE users', 'expr_norm_phone', '']) {
+      let observed = '';
+      try { renderStepStatements(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, expression: bad })); } catch (e) { observed = String(e); }
+      console.log(`OBSERVED[expression substitution ${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
+      expect(observed, bad).toMatch(/TEMPLATE refusal/);
     }
+    expect(NAMED_EXPRESSIONS['EXPR_NORM_PHONE']).toBe('btrim(phone)');
+    expect(NAMED_PREDICATES['PRED_PHONE_NOT_NULL']).toBe('phone IS NOT NULL');
   });
-  it('semantic layer: schema-qualified UDF, code/object-bearing statements, CTEs, subqueries all refused', () => {
-    // QA escape class: schema-qualified UDF with an allowlisted leaf name
-    expect(() => validateMigrationArtifact(`INSERT INTO users(user_id) VALUES (attacker.lower('x'))`)).toThrow(/non-pg_catalog schema/);
-    expect(() => validateMigrationArtifact(`CREATE UNIQUE INDEX i ON users(public.btrim(phone))`)).toThrow(/non-pg_catalog schema/);
-    expect(() => validateMigrationArtifact(`CREATE UNIQUE INDEX i ON attacker.users(btrim(phone))`)).toThrow(/controlled schema/);
-    // code/object-bearing statement types
-    for (const bad of [
-      `CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'`,
-      `CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'`,
-      `CREATE TRIGGER t BEFORE INSERT ON users FOR EACH ROW EXECUTE FUNCTION f()`,
-      `CREATE OPERATOR public.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = f)`,
-      `CREATE CAST (text AS int) WITH FUNCTION f(text) AS ASSIGNMENT`,
-      `CREATE RULE r AS ON INSERT TO users DO ALSO NOTHING`,
-      `CREATE AGGREGATE a(text)(SFUNC = textcat, STYPE = text)`,
-      `CREATE TYPE mood AS ENUM ('sad','ok')`,
-      `CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1'`,
-      `DO $$ BEGIN RAISE NOTICE 'x'; END $$`,
-      `CALL p()`,
-    ]) {
-      expect(() => validateMigrationArtifact(bad), bad).toThrow(/ARTIFACT refusal/);
+  it('unknown template name refused', () => {
+    let observed = '';
+    try { renderStepStatements(step('0002', 'x', 'ddl.drop-database', {})); } catch (e) { observed = String(e); }
+    console.log(`OBSERVED[unknown template]: ${observed.slice(0, 140)}`);
+    expect(observed).toMatch(/unknown template name/);
+  });
+  it('registry/artifact integrity: tampered params or template source change every digest', () => {
+    const a = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
+    expect(stepDigest(a)).not.toBe(stepDigest(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique2' })));
+    expect(stepDigest(a)).not.toBe(stepDigest({ ...a, xactLockKey: 7 }));
+    expect(stepDigest(a)).toBe(stepDigest({ ...a, description: 'edited metadata only' }));
+    const t = getTemplate('ddl.create-index');
+    const tampered = { ...t, render: () => [{ text: 'CREATE FUNCTION public.evil() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$', values: [] }] };
+    expect(templateHash(tampered)).not.toBe(templateHash(t)); // registry tamper = every dependent digest shifts
+    console.log(`OBSERVED[template hash-pin]: registry=${templateHash(t).slice(0, 16)} tampered=${templateHash(tampered).slice(0, 16)}`);
+  });
+  it('code-object creation is impossible by construction (no template emits one)', () => {
+    const CODE = /FUNCTION|TRIGGER|OPERATOR|CAST\s*\(|\bRULE\b|POLICY|EXTENSION|\bDO\b|\bCALL\b|SECURITY\s+DEFINER/i;
+    const NON_TX = /CONCURRENTLY|\bVACUUM\b|ALTER SYSTEM|CREATE DATABASE|DROP DATABASE|REINDEX/i;
+    const sweep: MigrationStep[] = [
+      MIGRATIONS[0]!,
+      step('0002', 'sa', 'ddl.create-index', SA_PARAMS),
+      step('0002', 'plain', 'ddl.create-index', { ...SA_PARAMS, unique: 'plain', expression: 'EXPR_NONE', predicate: 'PRED_NONE', ifNotExists: 'strict' }),
+    ];
+    for (const m of sweep) {
+      for (const st of renderStepStatements(m)) {
+        expect(st.text, st.text).not.toMatch(CODE);
+        expect(st.text, st.text).not.toMatch(NON_TX);
+      }
     }
-    // mutating CTEs and unneeded subqueries (recursively closed shapes)
-    expect(() => validateMigrationArtifact(`WITH d AS (DELETE FROM users RETURNING *) SELECT 1`)).toThrow(/ARTIFACT refusal/);
-    expect(() => validateMigrationArtifact(`WITH x AS (SELECT 1) INSERT INTO users(user_id) SELECT * FROM x`)).toThrow(/ARTIFACT refusal/);
-    expect(() => validateMigrationArtifact(`INSERT INTO users(user_id) VALUES ((SELECT max(user_id) FROM users))`)).toThrow(/subquery/);
-    expect(() => validateMigrationArtifact(`UPDATE users SET org_id = 'o1' WHERE user_id IN (SELECT user_id FROM channels)`)).toThrow(/subquery/);
-    // ALTER action closure: OWNER refused
-    expect(() => validateMigrationArtifact(`ALTER TABLE users OWNER TO postgres`)).toThrow(/ARTIFACT refusal/);
-    // declarative shapes still pass (unqualified built-ins canonically pg_catalog)
-    expect(() => validateMigrationArtifact(`CREATE UNIQUE INDEX i ON users(btrim(phone)) WHERE phone IS NOT NULL`)).not.toThrow();
-    expect(() => validateMigrationArtifact(`CREATE TABLE t(id int DEFAULT 1, created timestamptz DEFAULT now())`)).not.toThrow();
-    expect(() => validateMigrationArtifact(`INSERT INTO users(user_id, org_id, phone, data) VALUES ('u','o','p','{}')`)).not.toThrow();
+    for (const t of TEMPLATES) expect(t.writesCatalogs.every(c => ['owner_rel', 'acl_rel'].includes(c)), t.name).toBe(true);
   });
-
   it('named runner-generated guards: strict objects, qualified SQL generated by the runner only', () => {
     expect(buildAssertionQuery({ kind: 'table-empty', table: 'users' }))
       .toBe('SELECT 1 AS violation FROM "public"."users" LIMIT 1');
@@ -117,19 +124,13 @@ describe('declarative artifact gate (real-parser AST allowlist)', () => {
     expect(() => validateAssertion(null as never)).toThrow(/must be an object/);
   });
 
-  it('CTL-DDL-CONFINEMENT: every non-transactional statement class refused', () => {
-    for (const bad of [
-      `CREATE INDEX CONCURRENTLY i ON users(phone)`,
-      `DROP INDEX CONCURRENTLY users_phone_unique`,
-      `VACUUM users`,
-      `REINDEX TABLE users`,
-      `ALTER SYSTEM SET work_mem = '64MB'`,
-      `CREATE DATABASE rogue`,
-      `DROP DATABASE contake`,
-      `CALL p()`,
-      `DO $$ BEGIN NULL; END $$`,
-    ]) {
-      expect(() => validateMigrationArtifact(bad), bad).toThrow(/ARTIFACT refusal/);
+  it('non-transactional statement classes cannot exist by construction', () => {
+    // R1 classes (CONCURRENTLY/VACUUM/ALTER SYSTEM/CREATE+DROP DATABASE/
+    // REINDEX/CALL/DO/SECURITY DEFINER) died with general caller SQL: no
+    // template can emit them - the registry sweep proves it.
+    const all = TEMPLATES.flatMap(t => renderStepStatements({ version: '0001', name: 't', description: 't', template: t.name, params: t.name === 'ddl.create-index' ? SA_PARAMS : {} }));
+    for (const st of all) {
+      expect(st.text).not.toMatch(/CONCURRENTLY|\bVACUUM\b|ALTER SYSTEM|CREATE DATABASE|DROP DATABASE|REINDEX|\bCALL\b|\bDO\b/i);
     }
   });
 
@@ -253,17 +254,32 @@ describe('declarative artifact gate (real-parser AST allowlist)', () => {
     await pg.close();
   });
 
-  it('CTL-DDL-CONFINEMENT condition 6: artifact nextval on a pre-existing sequence is refused AND actively restored', async () => {
+  it('sequence restore: exact text past 2^53, active restore, ERR-PROPAGATE on injected restore failure', async () => {
     const { pg, conn } = await freshDb();
     await runMigrations(conn, { deployment: 'staging' });
-    await conn.query(`CREATE SEQUENCE public.demo_seq`);
-    await conn.query(`CREATE TABLE public.t(id bigint)`);
-    const greedy = step('0002', 'greedy', `INSERT INTO public.t(id) VALUES (pg_catalog.nextval('public.demo_seq'))`);
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, greedy] })).rejects.toThrow(/CATALOG DELTA refusal/);
-    const v = await conn.query(`SELECT count(*)::int AS n FROM public.t`);
-    expect(Number(v.rows[0]?.['n'])).toBe(0);
-    const sq = await conn.query(`SELECT is_called AS ic FROM public.demo_seq`);
-    expect(sq.rows[0]?.['ic']).toBe(false); // actively restored, not merely detected
+    await conn.query(`CREATE SEQUENCE public.restore_seq`);
+    const before = await sequenceValues(conn);
+    const BIG = '9007199254740993'; // 2^53 + 1 - JS Number would corrupt this
+    await conn.query(`SELECT setval('public.restore_seq', $1::text::bigint, true)`, [BIG]);
+    const drifted = await sequenceValues(conn);
+    expect(drifted.get('public.restore_seq')?.lastValue).toBe(BIG); // exact text capture
+    const restored = await restoreSequenceValues(conn, before);
+    console.log(`OBSERVED[restore]: restored=${JSON.stringify(restored)}`);
+    expect(restored).toContain('public.restore_seq');
+    const after = await sequenceValues(conn);
+    expect(after.get('public.restore_seq')).toEqual(before.get('public.restore_seq')); // both fields exactly restored
+    // restore-failure INJECTION: the sequence vanished since capture -
+    // restoration errors PROPAGATE (no swallow anywhere in the path).
+    await conn.query(`DROP SEQUENCE public.restore_seq`);
+    let observed = '';
+    try { await restoreSequenceValues(conn, drifted); } catch (e) { observed = String(e); }
+    console.log(`OBSERVED[restore-failure injection]: ${observed.slice(0, 180)}`);
+    expect(observed).not.toBe('');
+    // DIRTY/INDETERMINATE labeling lives in the runner catch path: with
+    // general DML removed, no template can drift a sequence mid-step, so the
+    // runner-level path is dormant defense-in-depth proven here at helper
+    // level (capture/restore/failure-injection) with both errors retained
+    // by construction of the catch wrapper.
     await pg.close();
   });
 
@@ -289,18 +305,11 @@ describe('declarative artifact gate (real-parser AST allowlist)', () => {
     await pg.close();
   });
 
-  it('digest binds the canonical QUALIFIED serialization actually executed; parse-serialize-reparse is stable', () => {
-    const canon = canonicalArtifactSql('CREATE TABLE IF NOT EXISTS t(id int)');
-    // identifiers canonically fully qualified: relations to public, calls to pg_catalog
-    expect(canon).toContain('public');
-    expect(canonicalArtifactSql('CREATE UNIQUE INDEX i ON users(btrim(phone)) WHERE phone IS NOT NULL')).toContain('pg_catalog');
-    expect(canonicalArtifactSql('CREATE TABLE IF NOT EXISTS public.t(id int)')).toBe(canon);
-    expect(canonicalArtifactSql('CREATE TABLE IF NOT EXISTS t (id bigint)')).not.toBe(canon);
-    for (const m of MIGRATIONS) {
-      const once = canonicalArtifactSql(m.sql);
-      expect(canonicalArtifactSql(once)).toBe(once);
-    }
-    expect(stepDigest(step('0001', 'x', 'CREATE TABLE a(id int)'))).toBe(stepDigest(step('0001', 'x', 'CREATE  TABLE  public.a(id  int)')));
+  it('digest binds the inert template identity AND params; registry rendering is deterministic', () => {
+    const a = step('0001', 'x', 'ddl.create-index', SA_PARAMS);
+    expect(stepDigest(a)).toBe(stepDigest(step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS })));
+    expect(renderStepStatements(a)).toEqual(renderStepStatements(a)); // stable render
+    expect(stepDigest(MIGRATIONS[0]!)).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 
@@ -396,48 +405,54 @@ describe('release-migration runner', () => {
     await pg.close();
   });
 
-  it('digest binds the exact artifact text AND declared primitives', () => {
-    const a = step('0001', 'x', 'CREATE TABLE a(id int)');
-    expect(stepDigest(a)).not.toBe(stepDigest(step('0001', 'x', 'CREATE TABLE b(id int)')));
+  it('digest binds the exact inert artifact (template identity + params) AND declared primitives', () => {
+    const a = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
+    expect(stepDigest(a)).not.toBe(stepDigest(step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, index: 'other_idx' })));
+    expect(stepDigest(a)).not.toBe(stepDigest(step('0002', 'sa', 'init.schema-baseline.0001', {})));
     expect(stepDigest(a)).not.toBe(stepDigest({ ...a, xactLockKey: 7 }));
-    expect(stepDigest(a)).not.toBe(stepDigest({ ...a, assertions: [{ kind: 'table-empty', table: 'a' }] }));
+    expect(stepDigest(a)).not.toBe(stepDigest({ ...a, assertions: [{ kind: 'table-empty', table: 'users' }] }));
     expect(stepDigest(a)).toBe(stepDigest({ ...a, description: 'edited metadata only' }));
   });
 
-  it('implementation-only edit of an applied artifact fails rerun AND boot', async () => {
+  it('param-level edit of an applied step (tampered artifact bytes) fails rerun AND boot', async () => {
     const { pg, conn } = await freshDb();
-    const decl = { version: '0002', name: 'add-flags', description: 'd' };
-    const implA = step(decl.version, decl.name, `ALTER TABLE users ADD COLUMN IF NOT EXISTS flags text`);
+    const implA = step('0002', 'sa', 'ddl.create-index', SA_PARAMS);
     const r = await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implA] });
     expect(r.appliedNow).toEqual(['0001', '0002']);
-    const implB = step(decl.version, decl.name, `ALTER TABLE users ADD COLUMN IF NOT EXISTS flags varchar`);
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implB] })).rejects.toThrow(/INTEGRITY refusal/);
+    const implB = step('0002', 'sa', 'ddl.create-index', { ...SA_PARAMS, index: 'users_phone_unique_v2' });
+    let observed = '';
+    try { await runMigrations(conn, { deployment: 'staging', migrations: [...MIGRATIONS, implB] }); } catch (e) { observed = String(e); }
+    console.log(`OBSERVED[tampered artifact refused]: ${observed.slice(0, 160)}`);
+    expect(observed).toMatch(/INTEGRITY refusal/);
     await expect(assertSchemaCurrent(conn, [...MIGRATIONS, implA])).resolves.toBeUndefined();
     await pg.close();
   });
 
-  it('a failing artifact statement rolls back the whole step (no partial DDL, no version)', async () => {
+  it('a failing template execution rolls back the whole step (no partial DDL, no version)', async () => {
     const { pg, conn } = await freshDb();
-    const failing = step('0001', 'partial', `CREATE TABLE partial_leak(id int); CREATE TABLE partial_leak(id int)`);
+    await conn.query(`CREATE TABLE public.partial_leak(id int)`);
+    await conn.query(`CREATE INDEX partial_idx ON public.partial_leak(id)`);
+    // strict duplicate: the rendered statement fails mid-step
+    const failing = step('0001', 'partial', 'ddl.create-index', { index: 'partial_idx', table: 'partial_leak', unique: 'plain', expression: 'EXPR_NONE', predicate: 'PRED_NONE', ifNotExists: 'strict' });
     await expect(runMigrations(conn, { deployment: 'staging', migrations: [failing] })).rejects.toThrow();
-    const t = await conn.query(`SELECT to_regclass('partial_leak') AS r`);
-    expect(t.rows[0]?.['r']).toBeNull();
+    // the step rolled back atomically: no version row, pre-existing objects
+    // untouched (the table/index were planted OUTSIDE the runner).
     const v = await conn.query(`SELECT count(*)::int AS n FROM schema_migrations`);
     expect(Number(v.rows[0]?.['n'])).toBe(0);
+    const t = await conn.query(`SELECT to_regclass('partial_leak') AS r, to_regclass('partial_idx') AS i`);
+    expect(t.rows[0]?.['r']).toBe('partial_leak');
+    expect(t.rows[0]?.['i']).toBe('partial_idx');
     await runMigrations(conn, { deployment: 'staging' });
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     await pg.close();
   });
 
-  it('a version-record collision rolls back the artifact DML too', async () => {
+  it('version-record integrity: foreign history refuses before any step (squatter class)', async () => {
     const { pg, conn } = await freshDb();
-    const squat = step('0001', 'squatter', `INSERT INTO schema_migrations(version, name, sha256, applied_by) VALUES('0001', 'squatter', 'x', 'test')`);
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [squat] })).rejects.toThrow(/collided inside its own transaction|CATALOG DELTA refusal/);
-    const v = await conn.query(`SELECT count(*)::int AS n FROM schema_migrations`);
-    expect(Number(v.rows[0]?.['n'])).toBe(0);
-    // condition 6: the squatter's nextval was actively RESTORED after rollback
-    const sq = await conn.query(`SELECT is_called AS ic FROM public.schema_migrations_seq_seq`);
-    expect(sq.rows[0]?.['ic']).toBe(false);
+    await runMigrations(conn, { deployment: 'staging' });
+    await conn.query(`UPDATE schema_migrations SET sha256 = 'deadbeef' WHERE version = '0001'`);
+    await expect(runMigrations(conn, { deployment: 'staging' })).rejects.toThrow(/INTEGRITY refusal/);
+    await expect(assertSchemaCurrent(conn)).rejects.toThrow(/fail-closed/);
     await pg.close();
   });
 
@@ -445,7 +460,7 @@ describe('release-migration runner', () => {
     const { pg, conn } = await freshDb();
     await runMigrations(conn, { deployment: 'staging' });
     await conn.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u1', 'o1', '+972555111111', '{}')`);
-    const guarded = step('0002', 'guarded-index', `CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`, {
+    const guarded = step('0002', 'guarded-index', 'ddl.create-index', SA_PARAMS, {
       xactLockKey: 4242,
       lockTables: ['users'],
       assertions: [{ kind: 'table-empty', table: 'users' }],
@@ -460,7 +475,7 @@ describe('release-migration runner', () => {
 
   it('SA-shaped declarative step (locks + guards + canonical index) applies and is recorded', async () => {
     const { pg, conn } = await freshDb();
-    const sa = step('0002', 'users-phone-unique-index', `CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`, {
+    const sa = step('0002', 'users-phone-unique-index', 'ddl.create-index', SA_PARAMS, {
       xactLockKey: 123456,
       lockTables: ['users'],
       assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim' }],
@@ -481,8 +496,9 @@ describe('release-migration runner', () => {
 
   it('rejects a non-sequential registry and invalid primitive declarations', async () => {
     const { pg, conn } = await freshDb();
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [step('0007', 'x', 'SELECT 1')] })).rejects.toThrow(/strictly sequential/);
-    await expect(runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'CREATE TABLE t(id int)', { lockTables: ['evil; DROP TABLE users'] })] })).rejects.toThrow(/invalid lockTables/);
+    await expect(runMigrations(conn, { deployment: 'staging', migrations: [step('0007', 'x', 'ddl.create-index', SA_PARAMS)] })).rejects.toThrow(/strictly sequential/);
+    await expect(runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', SA_PARAMS, { lockTables: ['evil; DROP TABLE users'] })] })).rejects.toThrow(/invalid lockTables/);
+    await expect(runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, table: 'users; DROP' })] })).rejects.toThrow(/TEMPLATE refusal/);
     await pg.close();
   });
 
