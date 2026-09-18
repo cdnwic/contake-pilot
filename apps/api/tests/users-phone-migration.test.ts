@@ -20,10 +20,12 @@ import {
 } from '../src/services/phone-migration.js';
 import type { ArtifactAuth } from '../src/services/phone-migration.js';
 
-/** Ephemeral TEST-ONLY credentials (generated per suite run would also be
- *  fine; this constant is NOT a real secret - live keys come only from the
- *  managed secret store per CLI custody rules). */
-const TEST_AUTH: ArtifactAuth = { key: 'test-only-ephemeral-mac-key-0001', keyId: 'test-key-v1', env: 'test-env' };
+import { generateBackupMacKey } from '../src/services/phone-migration.js';
+
+/** Ephemeral TEST-ONLY credentials: a fresh crypto-strong canonical key
+ *  per suite run (NOT a real secret); live keys come only from the managed
+ *  secret store per CLI custody rules. env is a UNIQUE deployment ID. */
+const TEST_AUTH: ArtifactAuth = { key: generateBackupMacKey(), keyId: 'test-key-v1', env: 'test-deploy-01' };
 const TEST_AUTH_V2: ArtifactAuth = { ...TEST_AUTH, keyId: 'test-key-v2' };
 
 /** Re-MAC a (possibly tampered) artifact with the TEST key: produces a
@@ -338,7 +340,7 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
     const rows = [...parsed.slice(1), colliding].map(r => ({ user_id: r.user_id, org_id: r.org_id, email: r.email, phone: r.phone, data: r.data }));
     const digests = rows.map(rowDigest);
     const base = { type: parsed[0].type, version: parsed[0].version, createdAt: parsed[0].createdAt, rowCount: rows.length, usersPhoneUniqueIndex: parsed[0].usersPhoneUniqueIndex };
-    const sansMac = { ...base, manifestSha256: manifestDigest(base, digests), keyId: TEST_AUTH.keyId, env: TEST_AUTH.env };
+    const sansMac = { ...base, manifestSha256: manifestDigest(base, digests), backupId: parsed[0].backupId, keyId: TEST_AUTH.keyId, env: TEST_AUTH.env };
     const rowLines = rows.map((r, i) => ({ ...r, rowSha256: digests[i] }));
     const resigned = [JSON.stringify({ ...sansMac, macSha256: artifactMac(TEST_AUTH.key, sansMac, rowLines) }),
       ...rowLines.map(r => JSON.stringify(r))];
@@ -391,7 +393,7 @@ pgOnly('artifact authentication + closed index schema (QA/security 2026-09-18 v4
   const resign = (rows: { user_id: string; org_id: string; email: string | null; phone: string | null; data: unknown }[], header: Record<string, unknown>): string[] => {
     const digests = rows.map(rowDigest);
     const base = { type: header['type'], version: header['version'], createdAt: header['createdAt'], rowCount: rows.length, usersPhoneUniqueIndex: header['usersPhoneUniqueIndex'] } as Parameters<typeof manifestDigest>[0];
-    const sansMac = { ...base, manifestSha256: manifestDigest(base, digests), keyId: TEST_AUTH.keyId, env: TEST_AUTH.env };
+    const sansMac = { ...base, manifestSha256: manifestDigest(base, digests), backupId: String(header['backupId']), keyId: TEST_AUTH.keyId, env: TEST_AUTH.env };
     const rowLines = rows.map((r, i) => ({ ...r, rowSha256: digests[i]! }));
     return [JSON.stringify({ ...sansMac, macSha256: artifactMac(TEST_AUTH.key, sansMac, rowLines) }),
       ...rowLines.map(r => JSON.stringify(r))];
@@ -574,7 +576,7 @@ pgOnly('artifact MAC authentication (QA/security 2026-09-18 v5)', () => {
   it('wrong key: MAC mismatch, refused BEFORE any mutation', async () => {
     await insertLegacy(conn, 'u-k1', 'org-1', '+15550102001', '+15550102001');
     const lines = await backupNow();
-    await expect(restoreUsers(conn, lines, { ...TEST_AUTH, key: 'some-other-key-9999' }))
+    await expect(restoreUsers(conn, lines, { ...TEST_AUTH, key: generateBackupMacKey() }))
       .rejects.toThrow(/MAC mismatch/);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-k1'`)).rows[0]!['phone']).toBe('+15550102001');
   });
@@ -597,7 +599,7 @@ pgOnly('artifact MAC authentication (QA/security 2026-09-18 v5)', () => {
     const digests = rows.map(rowDigest);
     const base = { type: parsed[0].type, version: parsed[0].version, createdAt: parsed[0].createdAt, rowCount: 1, usersPhoneUniqueIndex: parsed[0].usersPhoneUniqueIndex };
     // attacker rehashes EVERYTHING they can - but keeps the old MAC
-    const tampered = [JSON.stringify({ ...base, manifestSha256: manifestDigest(base, digests), keyId: parsed[0].keyId, env: parsed[0].env, macSha256: parsed[0].macSha256 }),
+    const tampered = [JSON.stringify({ ...base, manifestSha256: manifestDigest(base, digests), backupId: parsed[0].backupId, keyId: parsed[0].keyId, env: parsed[0].env, macSha256: parsed[0].macSha256 }),
       JSON.stringify({ ...forged, rowSha256: digests[0] })];
     await expect(restoreUsers(conn, tampered, TEST_AUTH)).rejects.toThrow(/MAC mismatch/);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-k3'`)).rows[0]!['phone']).toBe('+15550102021');
@@ -605,8 +607,15 @@ pgOnly('artifact MAC authentication (QA/security 2026-09-18 v5)', () => {
 
   it('cross-environment replay: artifact MACed for env A refused in env B', async () => {
     await insertLegacy(conn, 'u-k4', 'org-1', '+15550102031', '+15550102031');
-    const lines = await backupNow({ ...TEST_AUTH, env: 'staging' });
-    await expect(restoreUsers(conn, lines, { ...TEST_AUTH, env: 'production' }))
+    const lines = await backupNow({ ...TEST_AUTH, env: 'staging-pg-a' });
+    await expect(restoreUsers(conn, lines, { ...TEST_AUTH, env: 'production-pg-a' }))
+      .rejects.toThrow(/cross-environment replay/);
+  });
+
+  it('same-env-class CROSS-DB replay: artifact MACed for staging-pg-a refused on staging-pg-b (deployment-unique binding)', async () => {
+    await insertLegacy(conn, 'u-k4b', 'org-1', '+15550102032', '+15550102032');
+    const lines = await backupNow({ ...TEST_AUTH, env: 'staging-pg-a' });
+    await expect(restoreUsers(conn, lines, { ...TEST_AUTH, env: 'staging-pg-b' }))
       .rejects.toThrow(/cross-environment replay/);
   });
 
@@ -618,7 +627,7 @@ pgOnly('artifact MAC authentication (QA/security 2026-09-18 v5)', () => {
 
   it('backup REFUSES without complete external auth (custody guard)', async () => {
     await expect(backupUsers(conn, () => undefined, { auth: undefined as unknown as ArtifactAuth })).rejects.toThrow(/external MAC key/);
-    await expect(backupUsers(conn, () => undefined, { auth: { key: '', keyId: 'k', env: 'e' } })).rejects.toThrow(/external MAC key/);
+    await expect(backupUsers(conn, () => undefined, { auth: { key: '', keyId: 'test-key-v1', env: 'test-deploy-01' } })).rejects.toThrow(/64 lowercase hex/);
   });
 
   it('MAC + digests verify post-restore in-tx (restore of authenticated artifact still VERIFIES)', async () => {

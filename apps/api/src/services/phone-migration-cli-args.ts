@@ -24,12 +24,15 @@ const REMOVED_FLAGS = new Set(['--normalize', '--create-index']);
 export function parseMigrateCliArgs(argv: string[]): MigrateCliArgs {
   const out: { databaseUrl?: string; backup?: string; restore?: string; maintenance: boolean; overwriteBackup: boolean } =
     { maintenance: false, overwriteBackup: false };
+  const seen = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (REMOVED_FLAGS.has(a)) {
       throw new CliUsageError(`${a} was REMOVED in v4 (split mutating paths closed). Mutations go through --maintenance only.`);
     }
     if (VALUE_FLAGS.has(a)) {
+      if (seen.has(a)) throw new CliUsageError(`duplicate flag: ${a} (singleton flags may appear at most once)`);
+      seen.add(a);
       const v = argv[i + 1];
       if (v === undefined || v.startsWith('--')) throw new CliUsageError(`${a} requires a value`);
       if (a === '--database-url') out.databaseUrl = v;
@@ -39,6 +42,8 @@ export function parseMigrateCliArgs(argv: string[]): MigrateCliArgs {
       continue;
     }
     if (BOOL_FLAGS.has(a)) {
+      if (seen.has(a)) throw new CliUsageError(`duplicate flag: ${a} (singleton flags may appear at most once)`);
+      seen.add(a);
       if (a === '--maintenance') out.maintenance = true;
       else out.overwriteBackup = true;
       continue;

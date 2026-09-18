@@ -62,11 +62,19 @@
  *    LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE. Backup additionally
  *    runs in REPEATABLE READ so rows + index state are one consistent
  *    snapshot that concurrent row/schema mutation cannot disturb.
- *  - DURABLE CLI PUBLICATION: temp-write with restrictive (0600)
- *    permissions, fsync, atomic rename, then independent readback
- *    validation (full artifact validation + MAC) before reporting
- *    success. No partial publication: a failed backup leaves no final
- *    file. Existing files are never overwritten without --overwrite-backup.
+ *  - DURABLE CLI PUBLICATION (v6): temp-write 0600, fsync, TEMP readback
+ *    validation BEFORE publish, atomic no-clobber hard-link (EEXIST if the
+ *    destination appeared) or explicit overwrite via atomic rename-replace,
+ *    containing-directory fsync, temp/final cleanup on every failure.
+ *  - REPLAY/FRESHNESS POLICY (documented, operator-approved): every backup
+ *    carries a unique backupId + createdAt bound into the MAC. A restore
+ *    is legitimate ONLY for an operator-approved recovery against the SAME
+ *    deployment/database ID the artifact was MACed for; operators review
+ *    backupId + createdAt (printed by the CLI on restore) before applying.
+ *    Same-env-class cross-database replay is refused by the env binding;
+ *    stale-artifact application is a human gate, not automatic.
+ *  - PER-DEPLOYMENT KEYS: each deployed database gets its OWN managed MAC
+ *    key + keyId + unique env ID; keys are never shared across deployments.
  *
  *  OPERATOR GATES for later live use (carried; NO live action now):
  *  1. explicit approval to run the read-only preflight against the live DB;
@@ -77,7 +85,7 @@
  *  4. an approved atomic migration window for normalize + index creation;
  *  5. idempotent post-migration verification (preflight clean, index
  *     present, restart re-check). */
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Connectable } from '../repo/postgres.js';
 
 export interface PhoneMember {
@@ -182,10 +190,80 @@ export interface ArtifactAuth {
   env: string;
 }
 
+/** Canonical MAC key form (QA 2026-09-18 v6): EXACTLY 64 lowercase hex
+ *  chars decoding to 32 bytes. Weak/predictable/repeated/known values are
+ *  REJECTED: repeated single bytes, repeated 2/4/8/16-byte blocks,
+ *  ascending/descending byte runs, and a documented known-weak list.
+ *  The key is EXTERNAL (managed secrets) and NEVER logged - errors here
+ *  deliberately describe the CLASS of weakness, never the value. */
+const KNOWN_WEAK_KEYS = new Set([
+  '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8', // sha256('password')
+  'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', // sha256('')
+  '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f', // documented example pattern
+]);
+export const parseBackupMacKey = (key: string): Buffer => {
+  if (!/^[0-9a-f]{64}$/.test(key)) throw new Error('MAC key must be canonical: exactly 64 lowercase hex characters (32 bytes), from the managed secret store');
+  const bytes = Buffer.from(key, 'hex');
+  const allEqual = bytes.every(b => b === bytes[0]);
+  if (allEqual) throw new Error('MAC key rejected: repeated single byte (weak/predictable)');
+  for (const block of [16, 8, 4, 2]) {
+    const first = bytes.subarray(0, block).toString('hex');
+    let repeated = true;
+    for (let off = block; off < 32; off += block) {
+      if (bytes.subarray(off, off + block).toString('hex') !== first) { repeated = false; break; }
+    }
+    if (repeated) throw new Error(`MAC key rejected: repeated ${block}-byte block (weak/predictable)`);
+  }
+  const delta = ((bytes[1]! - bytes[0]!) + 256) % 256;
+  if (delta !== 0) {
+    let arithmetic = true;
+    for (let i = 1; i < 32; i++) {
+      if (bytes[i] !== (bytes[i - 1]! + delta) % 256) { arithmetic = false; break; }
+    }
+    if (arithmetic) throw new Error('MAC key rejected: sequential byte run (weak/predictable)');
+  }
+  if (KNOWN_WEAK_KEYS.has(key)) throw new Error('MAC key rejected: known-weak published value');
+  return bytes;
+};
+
+/** Bounded canonical key version id: 1-32 chars, lowercase alnum + inner
+ *  dashes (rotation labels like bkp-2026-09-v1). */
+export const parseBackupKeyId = (keyId: string): string => {
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(keyId)) {
+    throw new Error('MAC keyId rejected: must be 1-32 chars, lowercase alnum with inner dashes (bounded canonical form)');
+  }
+  return keyId;
+};
+
+/** Environment/domain binding (QA+security 2026-09-18 v6): a UNIQUE
+ *  deployment/database ID, NOT a generic label like "production" - one ID
+ *  per deployed database, never shared, with a DISTINCT managed MAC key
+ *  and keyId per deployment. Bounded canonical form: 2-64 chars,
+ *  lowercase alnum with inner dashes (e.g. contake-prod-pg-01). */
+export const parseBackupEnv = (env: string): string => {
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])$/.test(env) || env === 'production' || env === 'staging' || env === 'development' || env === 'test') {
+    throw new Error('MAC env rejected: must be a UNIQUE deployment/database ID (bounded canonical: 2-64 lowercase alnum + inner dashes; generic labels like "production" are refused) - one ID + one managed key/keyId per deployed database, never shared');
+  }
+  return env;
+};
+
+/** Generate a fresh canonical key (crypto-strong). Used by the keygen
+ *  script; the value is shown to the operator ONCE and never logged by
+ *  any migration path. */
+
+/** Generate a fresh canonical key (crypto-strong). Used by the keygen
+ *  script; the value is shown to the operator ONCE and never logged by
+ *  any migration path. */
+export const generateBackupMacKey = (): string => randomBytes(32).toString('hex');
+
 const requireAuth = (auth: ArtifactAuth | undefined): ArtifactAuth => {
-  if (!auth || (typeof auth.key === 'string' ? auth.key.length === 0 : auth.key.length === 0) || !auth.keyId || !auth.env) {
+  if (!auth || auth.key === undefined || auth.key === null) {
     throw new Error('artifact auth: external MAC key, keyId and env are REQUIRED (key from managed secrets only - never committed, never argv, never stored in the artifact)');
   }
+  if (typeof auth.key === 'string') parseBackupMacKey(auth.key); // canonical + strength (throws weak)
+  else if (!(auth.key.length === 32)) throw new Error('artifact auth: MAC key Buffer must be exactly 32 bytes');
+  parseBackupKeyId(auth.keyId);
+  parseBackupEnv(auth.env);
   return auth;
 };
 
@@ -288,6 +366,9 @@ export interface BackupHeader {
   usersPhoneUniqueIndex: { existed: boolean; definition: string | null };
   /** sha256 manifest binding header + index state + ordered row digests. */
   manifestSha256: string;
+  /** Unique per-backup identifier (freshness/replay evidence), bound into
+   *  the MAC as part of the header. */
+  backupId: string;
   /** Key VERSION id (rotation) - not the key itself. */
   keyId: string;
   /** Environment/domain binding (cross-env replay refused). */
@@ -322,7 +403,7 @@ export async function backupUsers(conn: Connectable, sink: (line: string) => voi
       type: 'users-phone-backup-header' as const, version: 2 as const, createdAt: now().toISOString(),
       rowCount: rows.length, usersPhoneUniqueIndex: await indexState(c),
     };
-    const headerSansMac = { ...base, manifestSha256: manifestDigest(base, digests), keyId: auth.keyId, env: auth.env };
+    const headerSansMac = { ...base, manifestSha256: manifestDigest(base, digests), backupId: `bkp-${base.createdAt}-${randomBytes(4).toString('hex')}`, keyId: auth.keyId, env: auth.env };
     const rowLines = rows.map((row, i) => ({ ...row, rowSha256: digests[i]! }));
     const header: BackupHeader = { ...headerSansMac, macSha256: artifactMac(auth.key, headerSansMac, rowLines) };
     sink(JSON.stringify(header));
@@ -354,6 +435,9 @@ export function validateBackupArtifact(lines: string[], auth: ArtifactAuth): Val
   if (typeof header.keyId !== 'string' || typeof header.env !== 'string' ||
       typeof header.macSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(header.macSha256)) {
     throw new Error('restore: unsigned artifact (missing keyId/env/macSha256) - refused');
+  }
+  if (typeof header.backupId !== 'string' || !/^bkp-\S{10,80}$/.test(header.backupId)) {
+    throw new Error('restore: backupId missing/invalid (freshness/replay evidence) - refused');
   }
   requireAuth(auth);
   if (header.keyId !== auth.keyId) throw new Error(`restore: key version mismatch (artifact keyId "${header.keyId}" != provided "${auth.keyId}")`);
