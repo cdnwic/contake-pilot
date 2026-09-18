@@ -24,7 +24,7 @@ import { parseCliArgs, resolveDatabaseUrl, validateActor } from './cli-args.js';
 
 const args = parseCliArgs(process.argv.slice(2), {
   required: ['--deployment', '--expect-host', '--expect-db'],
-  optional: ['--by', '--database-url', '--expect-instance-id'],
+  optional: ['--by', '--database-url', '--expect-instance-id', '--expect-registry-digest'],
 });
 const databaseUrl = resolveDatabaseUrl(args['--database-url'], process.env['DATABASE_URL']);
 const appliedBy = validateActor(args['--by'] ?? 'release-job');
@@ -50,8 +50,8 @@ try {
   // PRE-MUTATION target binding (security): verify the stamped deployment +
   // instance pin READ-ONLY before any write. First runs are unstamped and
   // proceed to the operator-attended TOFU stamp below.
-  await verifyTargetPreconditions(pool, { deployment: args['--deployment']!, expectInstanceId: args['--expect-instance-id'] });
-  const result = await runMigrations(pool, { deployment: args['--deployment']!, appliedBy, expectInstanceId: args['--expect-instance-id'] });
+  await verifyTargetPreconditions(pool, { deployment: args['--deployment']!, expectInstanceId: args['--expect-instance-id'], expectRegistryDigest: args['--expect-registry-digest'] });
+  const result = await runMigrations(pool, { deployment: args['--deployment']!, appliedBy, expectInstanceId: args['--expect-instance-id'], expectRegistryDigest: args['--expect-registry-digest'] });
   if (result.stampedNow) {
     console.error(
       `release-migrations: OPERATOR GATE (first run) - stamped deployment '${result.identity.deploymentLabel}' ` +

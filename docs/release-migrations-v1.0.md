@@ -464,3 +464,51 @@ is anchored to.
   confined-surface proofs, named-form tamper load refusal, anchor B tamper
   refusal at run AND boot on real PG, and DATA anchor drift with identical
   rows after a REAL cluster restart.
+
+## R5 inert blueprint (trust-head ruling R5, 2026-09-18)
+
+R5 is the binding bounded correction under R3+R4. Root cause of the R4 FAIL:
+the R4 digest hashed render-closure source (`Function.toString()`), which is
+toolchain-dependent - security proved a three-way divergence (source/tsx,
+tsc dist, vitest) while the pure-data DATA digest stayed stable everywhere.
+
+1. The registry is inert canonical data: statement shape strings with named
+   `{param}` placeholders, data parameter declarations (identifier quoting,
+   enum value sets with fragment maps, named-form references with empty/
+   non-empty fragment patterns), named expression/predicate forms, and
+   per-template canonical sample vectors. ZERO function closures exist in
+   the blueprint. Rendering is ONE runner-private assembly mechanism over
+   that data; the bind helpers are module-private.
+2. REGISTRY_DIGEST = sha256 over the canonical JSON of the blueprint data
+   ONLY - nothing executable-as-text, nothing build-derived, no
+   Function.toString anywhere. One identical value across source/tsx, tsc
+   dist, vitest, and the real-PG run; divergence in any context is an
+   automatic FAIL. Reviewers recompute the expected digest from reviewed
+   source (anchor A); anchor B (first pinned governed run, compare on every
+   run and boot, drift refuses) is unchanged.
+3. Legacy NULL adoption of the registry anchor or the extension baseline
+   writes NOTHING without BOTH operator pins (expect-instance-id AND
+   expect-registry-digest); unpinned adoption refuses with the observed
+   refusal. A wrong registry-digest pin refuses BEFORE any write.
+4. Real-PG evidence executes the BUILT DIST artifacts. The evidence pack
+   names the chain: exact head SHA, lockfile hash, literal build log, dist
+   hashes, runtime pin.
+5. Carried real-PG proofs closed: default-ACL boot tamper (refuse + heal),
+   in-transaction trigger firing with the observed effect + byte-identical
+   post-rollback catalog, unpinned-adoption refusal with nothing written,
+   dual-pinned adoption. R3/R4 matrices stand unchanged.
+
+### R5 evidence
+
+- `apps/api/tests/release-migrations.test.ts` (31 tests): R4 suite carried,
+  with pin-hardened adoption (unpinned refusal writes nothing, wrong pins
+  refuse, dual pins adopt) and type-confusion driven through the runner
+  (bind helpers private, proven on the confined surface).
+- `apps/api/evidence-realpg-release-migrations.mts` phases 1-4 run against
+  `dist/` (module under evidence printed per phase): 133 checks, adds the
+  R5 set - wrong-pin refusal, dual-pin pass, unpinned NULL adoption refusal
+  with nothing written, dual-pinned adoption, default-ACL boot tamper with
+  restore, in-transaction trigger firing with observed effect.
+- Four-context digest proof: source/tsx, tsc dist (node), vitest, and the
+  real-PG dist run all record the identical REGISTRY_DIGEST and
+  DATA_REGISTRY_DIGEST (values in COMMIT-RECORD).

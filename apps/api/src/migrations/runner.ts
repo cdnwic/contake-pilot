@@ -14,8 +14,20 @@
  *    MODULE-PRIVATE and deeply frozen at load; NOTHING exports it and no
  *    render capability crosses the module boundary - callers submit inert
  *    artifact data and receive results/refusals; rendered SQL never leaves
- *    the runner. One canonical REGISTRY_DIGEST is computed at load AFTER
- *    freezing, and every template hash / step digest derives from it.
+ *    the runner.
+ *  - INERT BLUEPRINT (R5): the registry is PURE CANONICAL DATA - statement
+ *    shape strings with named placeholders, data parameter declarations,
+ *    enum fragment maps, named forms, canonical sample vectors. ZERO render
+ *    closures exist; ONE runner-private assembly mechanism interprets the
+ *    data. REGISTRY_DIGEST hashes the canonical blueprint data ONLY (no
+ *    Function.toString, nothing build-derived), so source/tsx, tsc dist,
+ *    vitest and the real-PG run compute ONE identical value. Runner code is
+ *    anchored by the code trust chain (head SHA -> lockfile -> literal
+ *    build -> dist hashes -> instance pin); the blueprint is anchored by
+ *    REGISTRY_DIGEST - two distinct anchors, neither impersonates the other.
+ *    Legacy NULL adoption (extension baseline or registry anchor) writes
+ *    NOTHING without BOTH operator pins (expect-instance-id AND
+ *    expect-registry-digest).
  *  - TWO TRUST ANCHORS (R4): Anchor A - the reviewer records the EXPECTED
  *    REGISTRY_DIGEST from the reviewed source tree (never the code's
  *    self-report) and qualification/deploy compares. Anchor B - the first
@@ -101,21 +113,37 @@ const NAMED_PREDICATES: Readonly<Record<string, string>> = {
   PRED_NONE: '',
 };
 
-export type TemplateParamKind = 'identifier' | 'literal' | 'enum' | 'expression';
+export type TemplateParamKind = 'identifier' | 'enum' | 'expression';
 export interface RenderedStatement { text: string; values: unknown[] }
+
+/** R5 section 1: parameter declarations are PURE DATA. Every variation the
+ *  assembly mechanism needs is declared here as data - no function values
+ *  exist anywhere in the blueprint. */
+export interface IdentifierParamDecl { readonly kind: 'identifier'; readonly quote: 'bare' | 'schema' }
+export interface EnumParamDecl { readonly kind: 'enum'; readonly values: readonly string[]; readonly fragments: Readonly<Record<string, string>> }
+export interface ExpressionParamDecl {
+  readonly kind: 'expression';
+  readonly forms: 'expressions' | 'predicates';
+  /** Fragment patterns; {form} is the named-form text, {param} references
+   *  another declared param (resolved by the assembly mechanism). */
+  readonly nonEmpty: string;
+  readonly empty: string;
+}
+export type ParamDecl = IdentifierParamDecl | EnumParamDecl | ExpressionParamDecl;
+
 export interface TemplateEntry {
   readonly name: string;
   readonly description: string;
-  /** Typed parameter schema: param name -> kind. Exact own-key sets enforced. */
-  readonly paramSpec: Readonly<Record<string, TemplateParamKind>>;
-  /** Closed enum value sets, per enum param. */
-  readonly enumValues?: Readonly<Record<string, readonly string[]>>;
+  /** Typed parameter declarations (pure data). Exact own-key sets enforced. */
+  readonly params: Readonly<Record<string, ParamDecl>>;
   /** Catalogs this template may write (statement-kind x catalog matrix, R2 carried). */
   readonly writesCatalogs: readonly string[];
-  /** Fixed parameterized shape: validated params in, bound statements out.
-   *  Identifiers are strict-shaped and pinned into the controlled schema;
-   *  literals are bound $n values, NEVER interpolated. */
-  readonly render: (params: Readonly<Record<string, unknown>>) => readonly RenderedStatement[];
+  /** Statement shapes with {param} placeholders (pure data), assembled by
+   *  the ONE runner-private mechanism. */
+  readonly shapes: readonly string[];
+  /** Canonical sample vector (schema-valid), used by the load-time
+   *  single-statement assertion and by reviewer recomputation. */
+  readonly sample: Readonly<Record<string, unknown>>;
 }
 
 const CONTROLLED_SCHEMA = 'public';
@@ -127,19 +155,15 @@ function templateRefusal(why: string): never {
  *  objects CANNOT be targeted by construction - every identifier is pinned
  *  into the controlled schema as a bare name ("public"."name"); a name
  *  carrying quotes/semicolons/schema paths fails the shape check. */
-export function bindIdentifier(v: unknown, what: string): string {
+function bindIdentifier(v: unknown, what: string): string {
   if (typeof v !== 'string' || !IDENT_STRICT_LOCAL.test(v)) {
     templateRefusal(`identifier param '${what}' must be a canonical lowercase identifier, got ${JSON.stringify(v)}`);
   }
   if (v.startsWith('pg_')) templateRefusal(`identifier param '${what}' targets a system namespace prefix (${v})`);
   return v;
 }
-/** Literal params are bound values only - never interpolated into text. */
-export function bindLiteral(v: unknown, what: string): string | number | boolean | null {
-  if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
-  if (typeof v === 'number' && Number.isFinite(v)) return v;
-  templateRefusal(`literal param '${what}' must be a string/number/boolean/null value, got ${JSON.stringify(v)}`);
-}
+// R5: no literal param kind exists in the blueprint; every value entering a
+// statement does so through one of the three data-declared kinds above.
 function bindEnum(v: unknown, what: string, allowed: readonly string[]): string {
   if (typeof v !== 'string' || !allowed.includes(v)) {
     templateRefusal(`enum param '${what}' must be one of [${allowed.join(', ')}], got ${JSON.stringify(v)}`);
@@ -175,32 +199,71 @@ const BASELINE_0001_STATEMENTS: readonly string[] = `${GRAPH_DDL};${OTP_DDL}`
     throw new Error(`release-migrations: TEMPLATE integrity refusal - frozen baseline statement deviates from its closed shapes: ${text.slice(0, 80)}`);
   });
 
+/** R5 section 1: the registry is INERT CANONICAL DATA - shape strings with
+ *  named placeholders, data parameter declarations, named forms, canonical
+ *  sample vectors. Zero render closures exist anywhere in it. */
 const TEMPLATES: readonly TemplateEntry[] = [
   {
     name: 'init.schema-baseline.0001',
     description: '0001 graph + OTP schema baseline (frozen DDL constants; IF NOT EXISTS adoption).',
-    paramSpec: {},
+    params: {},
     writesCatalogs: ['owner_rel', 'acl_rel'],
-    render: () => BASELINE_0001_STATEMENTS.map(text => ({ text, values: [] })),
+    shapes: BASELINE_0001_STATEMENTS,
+    sample: {},
   },
   {
     name: 'ddl.create-index',
     description: 'Create an index on ONE controlled-schema table; expression only via a NAMED form; predicate only via a NAMED form.',
-    paramSpec: { index: 'identifier', table: 'identifier', unique: 'enum', expression: 'expression', predicate: 'expression', ifNotExists: 'enum' },
-    enumValues: { unique: ['unique', 'plain'], ifNotExists: ['if-not-exists', 'strict'] },
-    writesCatalogs: ['owner_rel', 'acl_rel'],
-    render: (params) => {
-      const index = bindIdentifier(params['index'], 'index');
-      const table = bindIdentifier(params['table'], 'table');
-      const unique = bindEnum(params['unique'], 'unique', ['unique', 'plain']);
-      const target = bindExpression(params['expression'], 'expression', NAMED_EXPRESSIONS) || `"${table}"`;
-      const pred = bindExpression(params['predicate'], 'predicate', NAMED_PREDICATES);
-      const ine = bindEnum(params['ifNotExists'], 'ifNotExists', ['if-not-exists', 'strict']);
-      const text = `CREATE ${unique === 'unique' ? 'UNIQUE ' : ''}INDEX ${ine === 'if-not-exists' ? 'IF NOT EXISTS ' : ''}"${index}" ON "public"."${table}" (${target})${pred ? ` WHERE ${pred}` : ''}`;
-      return [{ text, values: [] }];
+    params: {
+      index: { kind: 'identifier', quote: 'bare' },
+      table: { kind: 'identifier', quote: 'schema' },
+      unique: { kind: 'enum', values: ['unique', 'plain'], fragments: { unique: 'UNIQUE ', plain: '' } },
+      ifNotExists: { kind: 'enum', values: ['if-not-exists', 'strict'], fragments: { 'if-not-exists': 'IF NOT EXISTS ', strict: '' } },
+      expression: { kind: 'expression', forms: 'expressions', nonEmpty: '{form}', empty: '"{table}"' },
+      predicate: { kind: 'expression', forms: 'predicates', nonEmpty: ' WHERE {form}', empty: '' },
     },
+    writesCatalogs: ['owner_rel', 'acl_rel'],
+    shapes: ['CREATE {unique}INDEX {ifNotExists}{index} ON {table} ({expression}){predicate}'],
+    sample: { index: 'sa_idx', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
   },
 ];
+
+/** R5 section 1: the ONE assembly mechanism over the inert data. Runner code
+ *  is anchored by the code trust chain (exact head SHA -> frozen lockfile ->
+ *  literal build -> dist hashes -> instance pin); the BLUEPRINT it interprets
+ *  is anchored by REGISTRY_DIGEST. Two distinct anchors; neither impersonates
+ *  the other. */
+function fragmentFor(decl: ParamDecl, value: unknown, paramName: string): string {
+  switch (decl.kind) {
+    case 'identifier': {
+      const v = bindIdentifier(value, paramName);
+      return decl.quote === 'schema' ? `"${CONTROLLED_SCHEMA}"."${v}"` : `"${v}"`;
+    }
+    case 'enum': {
+      const v = bindEnum(value, paramName, decl.values);
+      const f = decl.fragments[v];
+      if (f === undefined) templateRefusal(`enum param '${paramName}' has no declared fragment for ${JSON.stringify(v)}`);
+      return f;
+    }
+    case 'expression': {
+      const forms = decl.forms === 'expressions' ? NAMED_EXPRESSIONS : NAMED_PREDICATES;
+      const form = bindExpression(value, paramName, forms);
+      return (form === '' ? decl.empty : decl.nonEmpty).replaceAll('{form}', form);
+    }
+  }
+}
+
+function assembleShape(shape: string, t: TemplateEntry, params: Readonly<Record<string, unknown>>): string {
+  let text = shape;
+  // Two passes: fragments may themselves reference params (e.g. '"{table}"').
+  for (let pass = 0; pass < 2; pass++) {
+    for (const [pname, decl] of Object.entries(t.params)) {
+      text = text.replaceAll(`{${pname}}`, fragmentFor(decl, params[pname], pname));
+    }
+  }
+  if (/\{[a-zA-Z]+\}/.test(text)) templateRefusal(`unresolved placeholder in assembled statement: ${text.slice(0, 80)}`);
+  return text;
+}
 
 const templateByName = new Map(TEMPLATES.map(t => [t.name, t]));
 function getTemplate(name: string): TemplateEntry {
@@ -208,33 +271,18 @@ function getTemplate(name: string): TemplateEntry {
   if (!t) templateRefusal(`unknown template name ${JSON.stringify(name)} - the registry is closed`);
   return t!;
 }
-/** Hash-pin: a template's identity is its name + frozen render source +
- *  param schema. Editing a template changes every dependent step digest and
- *  fails the runner/boot history check - registry tamper is refused. */
-/** R4: every template hash DERIVES from REGISTRY_DIGEST, so no closed-over
- *  executable byte can drift without moving every digest anchored on it. */
-const templateHash = (t: TemplateEntry): string => {
-  const h = createHash('sha256').update(`contake-template/v2\n${REGISTRY_DIGEST}\n${t.name}\n${t.render.toString()}\n${canonicalJson({ paramSpec: t.paramSpec, enumValues: t.enumValues ?? {}, writesCatalogs: t.writesCatalogs })}`);
-  // Zero-param templates have ONE fixed rendering: pin its exact bytes too, so
-  // tampering with the module-level frozen text (not only the render source)
-  // moves the hash.
-  if (Object.keys(t.paramSpec).length === 0) {
-    h.update('\nrendered\n').update(canonicalJson(t.render({}).map(st => ({ text: st.text, values: st.values }))));
-  }
-  return h.digest('hex');
-};
-
-/** Validate a step's params against the template schema (exact own-key sets,
- *  per-kind validation) and render the bound statements the runner executes. */
+/** Validate a step's params against the template declarations (exact own-key
+ *  sets) and assemble the bound statements the runner executes - through the
+ *  ONE mechanism, over the inert blueprint data. */
 function renderStepStatements(m: MigrationStep): readonly RenderedStatement[] {
   const t = getTemplate(m.template);
   const params = m.params ?? {};
-  const specKeys = Object.keys(t.paramSpec).sort();
+  const specKeys = Object.keys(t.params).sort();
   const given = Object.keys(params).sort();
   if (JSON.stringify(given) !== JSON.stringify(specKeys)) {
     templateRefusal(`step '${m.version}' params ${JSON.stringify(given)} do not exactly match template '${t.name}' schema ${JSON.stringify(specKeys)}`);
   }
-  return t.render(params);
+  return t.shapes.map(shape => ({ text: assembleShape(shape, t, params), values: [] as unknown[] }));
 }
 
 const CATALOG_SNAPSHOT_SQL = `
@@ -397,16 +445,18 @@ deepFreeze(TEMPLATES);
  *  hashed at module load AFTER freezing, from the private state. Anchor A
  *  records this value from reviewed source; anchor B records it in the
  *  migration identity at the first pinned governed run. */
+/** R5 sections 1+2: ONE canonical digest over the blueprint DATA ONLY.
+ *  Nothing executable-as-text, nothing build-derived, no Function.toString
+ *  anywhere - toolchain-independent by construction (like the DATA digest):
+ *  source/tsx, tsc dist, vitest and the real-PG run all compute the SAME
+ *  value. Anchor A records this value from reviewed source; anchor B records
+ *  it in the migration identity at the first pinned governed run. */
 export const REGISTRY_DIGEST: string = createHash('sha256')
-  .update(`contake-registry/v1\n${canonicalJson(TEMPLATES.map(t => ({
-    name: t.name,
-    description: t.description,
-    paramSpec: t.paramSpec,
-    enumValues: t.enumValues ?? {},
-    writesCatalogs: t.writesCatalogs,
-    renderSource: t.render.toString(),
-    rendered: Object.keys(t.paramSpec).length === 0 ? t.render({}).map(st => ({ text: st.text, values: st.values })) : null,
-  })))}`)
+  .update(`contake-registry/v2\n${canonicalJson({
+    templates: TEMPLATES,
+    namedExpressions: NAMED_EXPRESSIONS,
+    namedPredicates: NAMED_PREDICATES,
+  })}`)
   .digest('hex');
 
 /** R4 section 4: single-statement construction guarantee. Exported ONLY as a
@@ -425,12 +475,10 @@ export function assertSingleStatementForms(forms: readonly string[], ctx: string
 }
 {
   // Load-time assertion over the private frozen registry: every template
-  // shape (rendered with schema-valid sample params) and every named form.
-  const sample: Record<string, Record<string, string>> = {
-    'ddl.create-index': { index: 'sa_idx', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
-  };
+  // shape, assembled from its DECLARED canonical sample vector (data), and
+  // every named form - a statement separator refuses the module at load.
   for (const t of TEMPLATES) {
-    const rendered = t.render(t.name === 'ddl.create-index' ? sample['ddl.create-index']! : {});
+    const rendered = renderStepStatements({ version: '0000', name: 'load-check', description: 'load-check', template: t.name, params: t.sample });
     assertSingleStatementForms(rendered.map(st => st.text), `template '${t.name}'`);
   }
   assertSingleStatementForms(Object.values(NAMED_EXPRESSIONS), 'NAMED_EXPRESSIONS');
@@ -637,12 +685,12 @@ export const stepDigest = (m: MigrationStep): string => {
   // registry (template source) changes the digest and fails history checks.
   const t = getTemplate(m.template);
   const params = m.params ?? {};
-  const specKeys = Object.keys(t.paramSpec).sort();
+  const specKeys = Object.keys(t.params).sort();
   if (JSON.stringify(Object.keys(params).sort()) !== JSON.stringify(specKeys)) {
     templateRefusal(`step '${m.version}' params do not exactly match template '${t.name}' schema`);
   }
   return createHash('sha256').update(
-    `contake-migration/v8\n${REGISTRY_DIGEST}\n${m.version}\n${m.name}\n${m.template}\n${templateHash(t)}\n${canonicalJson({
+    `contake-migration/v9\n${REGISTRY_DIGEST}\n${m.version}\n${m.name}\n${m.template}\n${canonicalJson({
       params, assertions: m.assertions ?? [], lockTables: m.lockTables ?? [], xactLockKey: m.xactLockKey ?? null,
     })}`,
   ).digest('hex');
@@ -728,10 +776,20 @@ export async function readDbIdentity(conn: Connectable | Queryable): Promise<DbI
  *  operator-attended TOFU gate (never authentication). */
 export async function verifyTargetPreconditions(
   conn: Connectable | Queryable,
-  opts: { deployment: string; expectInstanceId?: string },
+  opts: { deployment: string; expectInstanceId?: string; expectRegistryDigest?: string },
 ): Promise<{ firstRun: boolean; identity?: DbIdentity }> {
   if (!DEPLOYMENT_LABEL.test(opts.deployment)) {
     throw new Error(`release-migrations: invalid deployment label ${JSON.stringify(opts.deployment)} (expected ${DEPLOYMENT_LABEL})`);
+  }
+  // R5 section 2/3: a wrong registry-digest pin refuses BEFORE any write, on
+  // first-run TOFU and on stamped databases alike (authenticity, not
+  // self-consistency - the pin is the operator's independently recomputed
+  // expectation from reviewed source).
+  if (opts.expectRegistryDigest !== undefined && opts.expectRegistryDigest !== REGISTRY_DIGEST) {
+    throw new Error(
+      `release-migrations: REGISTRY PIN refusal - operator pinned registry digest ${String(opts.expectRegistryDigest).slice(0, 16)}... ` +
+      `but the running blueprint computes ${REGISTRY_DIGEST.slice(0, 16)}... Refusing BEFORE any write (fail-closed).`,
+    );
   }
   const identity = await readDbIdentity(conn);
   if (!identity) {
@@ -807,7 +865,7 @@ export function validateRegistry(migrations: readonly MigrationStep[]): void {
 /** Applies every pending migration in registry order. */
 export async function runMigrations(
   conn: Connectable,
-  opts: { deployment: string; appliedBy?: string; migrations?: readonly MigrationStep[]; expectInstanceId?: string },
+  opts: { deployment: string; appliedBy?: string; migrations?: readonly MigrationStep[]; expectInstanceId?: string; expectRegistryDigest?: string },
 ): Promise<MigrationRunResult> {
   const migrations = opts.migrations ?? MIGRATIONS;
   validateRegistry(migrations);
@@ -836,7 +894,7 @@ export async function runMigrations(
         // Pre-mutation target binding is enforced inside the bootstrap tx as
         // well (the CLI also checks read-only before calling): any refusal
         // here still precedes every step write and rolls back.
-        const pre = await verifyTargetPreconditions(client, { deployment: opts.deployment, expectInstanceId: opts.expectInstanceId });
+        const pre = await verifyTargetPreconditions(client, { deployment: opts.deployment, expectInstanceId: opts.expectInstanceId, expectRegistryDigest: opts.expectRegistryDigest });
         if (pre.firstRun) {
           identity = { deploymentLabel: opts.deployment, instanceId: randomBytes(8).toString('hex') };
           stampedNow = true;
@@ -848,10 +906,39 @@ export async function runMigrations(
           );
         } else {
           identity = pre.identity!;
+          // R5 section 3: legacy NULL adoption (extension baseline OR registry
+          // anchor) writes NOTHING without BOTH operator pins verified against
+          // the stamped identity and the running blueprint (fail-closed).
+          const requireAdoptionPins = (what: string): void => {
+            const missing: string[] = [];
+            if (opts.expectInstanceId === undefined) missing.push('expect-instance-id');
+            if (opts.expectRegistryDigest === undefined) missing.push('expect-registry-digest');
+            if (missing.length > 0) {
+              throw new Error(
+                `release-migrations: LEGACY ADOPTION refusal - ${what} is NULL on a stamped identity; adopting it writes ` +
+                `nothing without BOTH operator pins (missing ${missing.join(' + ')}) - re-run with --expect-instance-id and ` +
+                `--expect-registry-digest after verifying them from reviewed source (fail-closed)`,
+              );
+            }
+            if (opts.expectInstanceId !== identity.instanceId) {
+              throw new Error(
+                `release-migrations: LEGACY ADOPTION refusal - expect-instance-id ${JSON.stringify(opts.expectInstanceId)} does not ` +
+                `match the stamped instance ${identity.instanceId} - refusing to adopt ${what} (fail-closed)`,
+              );
+            }
+            if (opts.expectRegistryDigest !== REGISTRY_DIGEST) {
+              throw new Error(
+                `release-migrations: LEGACY ADOPTION refusal - expect-registry-digest ${String(opts.expectRegistryDigest).slice(0, 16)}... does not ` +
+                `match the running REGISTRY_DIGEST ${REGISTRY_DIGEST.slice(0, 16)}... - refusing to adopt ${what} (fail-closed)`,
+              );
+            }
+          };
           const base = await client.query(`SELECT ext_baseline AS b FROM public.contake_db_identity WHERE id = 1`);
           const pinned = base.rows[0]?.['b'];
           if (pinned === null || pinned === undefined) {
-            // One-time adoption for pre-R2 deployments: pin what is there.
+            // One-time adoption for pre-R2 deployments: pin what is there,
+            // only with both operator pins (R5 section 3).
+            requireAdoptionPins('extension baseline');
             await client.query(`UPDATE public.contake_db_identity SET ext_baseline = $1::jsonb WHERE id = 1`, [currentExt]);
           } else if (JSON.stringify(pinned) !== currentExt) {
             throw new Error(
@@ -866,7 +953,9 @@ export async function runMigrations(
           const anchor = await client.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
           const anchored = anchor.rows[0]?.['d'];
           if (anchored === null || anchored === undefined) {
-            // One-time adoption for pre-R4 deployments.
+            // One-time adoption for pre-R4 deployments, only with both
+            // operator pins (R5 section 3).
+            requireAdoptionPins('registry anchor');
             await client.query(`UPDATE public.contake_db_identity SET registry_digest = $1 WHERE id = 1`, [REGISTRY_DIGEST]);
           } else if (String(anchored) !== REGISTRY_DIGEST) {
             throw new Error(

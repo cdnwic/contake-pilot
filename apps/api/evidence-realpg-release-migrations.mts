@@ -19,13 +19,21 @@
  */
 import { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
-import {
+import type { MigrationStep } from './src/migrations/runner.js';
+// R5 section 4: the module under evidence is selectable - the SAME phases run
+// against src (tsx) or the BUILT DIST (the artifact that deploys). The
+// evidence pack records which module path ran plus its sha256.
+const RUNNER_PATH = process.env['EVIDENCE_RUNNER'] ?? './src/migrations/runner.js';
+const SEED_PATH = process.env['EVIDENCE_SEED'] ?? './src/migrations/staging-seed.js';
+const R = await import(RUNNER_PATH) as typeof import('./src/migrations/runner.js');
+const S = await import(SEED_PATH) as typeof import('./src/migrations/staging-seed.js');
+const {
   MIGRATIONS, REGISTRY_DIGEST, assertDirectDatabaseUrl, assertSchemaCurrent, assertSingleStatementForms, assertZeroCatalogDelta, catalogSnapshot,
   restoreSequenceValues, runMigrations, sequenceValues, stepDigest,
-  type MigrationStep,
-} from './src/migrations/runner.js';
-import * as runnerModule from './src/migrations/runner.js';
-import { DATA_REGISTRY_DIGEST, runStagingSeed } from './src/migrations/staging-seed.js';
+} = R;
+const { DATA_REGISTRY_DIGEST, runStagingSeed } = S;
+const runnerModule = R as unknown as Record<string, unknown>;
+console.error(`OBSERVED[module under evidence]: runner=${RUNNER_PATH} seed=${SEED_PATH}`);
 
 const phase = process.argv[2];
 const host = process.argv[3] ?? '/tmp';
@@ -321,7 +329,7 @@ if (phase === 'phase1') {
   check('R4 anchor A: a wrong expected digest is detectably different', REGISTRY_DIGEST !== 'deadbeef'.repeat(8));
   // R4 section 1: the registry/named forms/render capability are not on the
   // module surface - external mutation is IMPOSSIBLE (OBSERVED undefined).
-  for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'getTemplate', 'renderStepStatements', 'templateHash']) {
+  for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'getTemplate', 'renderStepStatements', 'templateHash', 'bindIdentifier', 'bindLiteral']) {
     const surfaced = (runnerModule as Record<string, unknown>)[name];
     console.error(`OBSERVED[confined surface ${name}]: ${typeof surfaced}`);
     check(`R4: registry surface confined - ${name} not exported`, surfaced === undefined, typeof surfaced);
@@ -351,6 +359,56 @@ if (phase === 'phase1') {
   await mig.query(`UPDATE public.contake_db_identity SET registry_digest = $1 WHERE id = 1`, [REGISTRY_DIGEST]);
   await assertSchemaCurrent(mig, undefined, { deployment: 'staging', instanceId: rr.identity.instanceId });
   check('R4 anchor B: restore heals the boot gate', true);
+  // R5 section 2: a WRONG registry-digest operator pin refuses BEFORE any write.
+  let pinRefusal = '';
+  try { await runMigrations(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: 'deadbeef'.repeat(8) }); } catch (e) { pinRefusal = String(e); }
+  console.error(`OBSERVED[wrong registry pin]: ${pinRefusal.slice(0, 200)}`);
+  check('R5: wrong expect-registry-digest pin refuses pre-write (OBSERVED)', /REGISTRY PIN refusal/.test(pinRefusal), pinRefusal.slice(0, 160));
+  check('R5: correct dual pin passes the preconditions', true,
+    await (async () => { const p = await runMigrations(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: REGISTRY_DIGEST }); return p.identity.instanceId; })());
+  // R5 section 3 on REAL PG: legacy NULL adoption writes NOTHING without BOTH
+  // pins; only the dual-pinned run adopts.
+  await mig.query(`UPDATE public.contake_db_identity SET registry_digest = NULL WHERE id = 1`);
+  let unpinned = '';
+  try { await runMigrations(mig, { deployment: 'staging' }); } catch (e) { unpinned = String(e); }
+  console.error(`OBSERVED[unpinned NULL adoption refusal]: ${unpinned.slice(0, 220)}`);
+  check('R5: unpinned NULL-anchor adoption refuses and writes NOTHING (OBSERVED)', /LEGACY ADOPTION refusal/.test(unpinned), unpinned.slice(0, 180));
+  const stillNull = await mig.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
+  check('R5: anchor still NULL after the refused adoption (nothing written)', stillNull.rows[0]?.['d'] === null, stillNull.rows[0]);
+  await runMigrations(mig, { deployment: 'staging', expectInstanceId: rr.identity.instanceId, expectRegistryDigest: REGISTRY_DIGEST });
+  const adopted = await mig.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
+  check('R5: dual-pinned run adopts the NULL anchor', adopted.rows[0]?.['d'] === REGISTRY_DIGEST, adopted.rows[0]?.['d']);
+  // R5 section 5 (carried): default-ACL boot tamper on REAL PG - granting the
+  // PUBLIC function-EXECUTE default makes the boot gate refuse; revoking heals.
+  await mig.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO PUBLIC`);
+  await mig.query(`ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO PUBLIC`);
+  let aclRefusal = '';
+  try { await assertSchemaCurrent(mig, undefined, { deployment: 'staging', instanceId: rr.identity.instanceId }); } catch (e) { aclRefusal = String(e); }
+  console.error(`OBSERVED[default-ACL boot tamper]: ${aclRefusal.slice(0, 220)}`);
+  check('R5: boot gate refuses tampered default ACLs on REAL PG (OBSERVED)', /DEFAULT PRIVILEGE refusal/.test(aclRefusal), aclRefusal.slice(0, 180));
+  await mig.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`);
+  await mig.query(`ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`);
+  await assertSchemaCurrent(mig, undefined, { deployment: 'staging', instanceId: rr.identity.instanceId });
+  check('R5: default-ACL restore heals the boot gate', true);
+  // R5 section 5 (carried): in-transaction trigger firing with the OBSERVED
+  // effect on REAL PG - the trigger fires mid-tx, the tx rolls back, the
+  // catalog is byte-identical afterwards.
+  {
+    const preTrig = JSON.stringify(await catalogSnapshot(mig));
+    const c = await mig.connect();
+    let fired = '';
+    try {
+      await c.query('BEGIN');
+      await c.query(`CREATE FUNCTION public.trg_fire() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''TRIGGER FIRED''; END'`);
+      await c.query(`CREATE TRIGGER trg BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.trg_fire()`);
+      try { await c.query(`INSERT INTO public.users(user_id, org_id, phone, data) VALUES('t1','o','p','{}')`); } catch (e) { fired = String(e); }
+      await c.query('ROLLBACK');
+    } finally { c.release(); }
+    console.error(`OBSERVED[in-tx trigger firing]: ${fired.slice(0, 160)}`);
+    check('R5: in-transaction trigger fired with the observed effect on REAL PG', /TRIGGER FIRED/.test(fired), fired.slice(0, 120));
+    const postTrig = JSON.stringify(await catalogSnapshot(mig));
+    check('R5: post-rollback catalog byte-identical after the fired trigger', postTrig === preTrig);
+  }
 
   // R3 section-3 boot-gate tamper proofs on REAL PG: edited applied history
   // fails the boot gate; restoring the pinned digest makes it green again.

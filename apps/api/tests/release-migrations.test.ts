@@ -9,7 +9,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { pgliteConnectable } from '../src/repo/postgres.js';
 import {
   MIGRATIONS, EXPECTED_SCHEMA_VERSIONS, assertDirectDatabaseUrl,
-  assertSchemaCurrent, assertZeroCatalogDelta, bindIdentifier, bindLiteral, buildAssertionQuery,
+  assertSchemaCurrent, assertZeroCatalogDelta, buildAssertionQuery,
   catalogSnapshot, requiredBootIdentity,
   runMigrations, sequenceValues, restoreSequenceValues, stepDigest, validateAssertion,
   verifyTargetPreconditions, assertSingleStatementForms, REGISTRY_DIGEST, type MigrationStep,
@@ -52,9 +52,10 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
       try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, table: bad })] }); } catch (e) { observed = String(e); }
       console.log(`OBSERVED[identifier-injection ${JSON.stringify(bad)}]: ${observed.slice(0, 130)}`);
       expect(observed, bad).toMatch(/TEMPLATE refusal/);
-      expect(() => bindIdentifier(bad, 'table')).toThrow(/TEMPLATE refusal/);
     }
     await pg.close();
+    // the binders themselves are module-private (R5) - proven in the
+    // confined-surface test below.
   });
   it('enum escape refused at registration: closed sets only (runner-driven)', async () => {
     const { pg, conn } = await freshDb();
@@ -66,13 +67,15 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     }
     await pg.close();
   });
-  it('literal type confusion refused: bound values only, never interpolated', () => {
-    expect(bindLiteral('x', 'p')).toBe('x');
-    expect(bindLiteral(4, 'p')).toBe(4);
-    expect(bindLiteral(null, 'p')).toBeNull();
-    for (const bad of [{ a: 1 }, ['x'], undefined, NaN, Infinity]) {
-      expect(() => bindLiteral(bad, 'p'), JSON.stringify(bad)).toThrow(/TEMPLATE refusal - literal/);
+  it('type confusion refused at registration: params bind by declared kind, never interpolated (runner-driven)', async () => {
+    const { pg, conn } = await freshDb();
+    for (const bad of [1, NaN, Infinity, { a: 1 }, ['x'], null, undefined]) {
+      let observed = '';
+      try { await runMigrations(conn, { deployment: 'staging', migrations: [step('0001', 'x', 'ddl.create-index', { ...SA_PARAMS, index: bad })] }); } catch (e) { observed = String(e); }
+      console.log(`OBSERVED[type confusion ${JSON.stringify(bad) ?? String(bad)}]: ${observed.slice(0, 130)}`);
+      expect(observed, String(bad)).toMatch(/TEMPLATE refusal/);
     }
+    await pg.close();
   });
   it('named-form substitution refused at registration; registry unreachable from outside the module', async () => {
     const { pg, conn } = await freshDb();
@@ -86,7 +89,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     // R4 section 1: the registry, named forms and render capability no longer
     // exist on the module surface - external tamper is impossible by type and
     // at runtime (OBSERVED: each name resolves to undefined).
-    for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'getTemplate', 'renderStepStatements', 'templateHash', 'STATEMENT_CATALOG_MATRIX']) {
+    for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'getTemplate', 'renderStepStatements', 'templateHash', 'STATEMENT_CATALOG_MATRIX', 'bindIdentifier', 'bindLiteral']) {
       const surfaced = (runnerModule as Record<string, unknown>)[name];
       console.log(`OBSERVED[confined surface ${name}]: ${typeof surfaced}`);
       expect(surfaced, name).toBeUndefined();
@@ -366,15 +369,29 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     await conn.query(`UPDATE public.contake_db_identity SET registry_digest = $1 WHERE id = 1`, [REGISTRY_DIGEST]);
     await expect(runMigrations(conn, { deployment: 'staging' })).resolves.toBeDefined();
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
-    // pre-R4 database (NULL anchor): boot refuses; one run adopts; boot green
+    // pre-R4 database (NULL anchor): boot refuses; unpinned adoption writes
+    // NOTHING (R5 section 3); only a run carrying BOTH operator pins adopts.
     await conn.query(`UPDATE public.contake_db_identity SET registry_digest = NULL WHERE id = 1`);
     let adoptionRefusal = '';
     try { await assertSchemaCurrent(conn); } catch (e) { adoptionRefusal = String(e); }
     console.log(`OBSERVED[anchor NULL - boot]: ${adoptionRefusal.slice(0, 180)}`);
     expect(adoptionRefusal).toMatch(/no DB-anchored REGISTRY_DIGEST/);
-    await expect(runMigrations(conn, { deployment: 'staging' })).resolves.toBeDefined();
+    let unpinned = '';
+    try { await runMigrations(conn, { deployment: 'staging' }); } catch (e) { unpinned = String(e); }
+    console.log(`OBSERVED[unpinned adoption refused]: ${unpinned.slice(0, 200)}`);
+    expect(unpinned).toMatch(/LEGACY ADOPTION refusal/);
+    const stillNull = await conn.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
+    expect(stillNull.rows[0]?.['d']).toBeNull(); // nothing was written
+    const iid = String((await conn.query(`SELECT instance_id AS i FROM public.contake_db_identity WHERE id = 1`)).rows[0]?.['i']);
+    // wrong pins refuse too:
+    await expect(runMigrations(conn, { deployment: 'staging', expectInstanceId: 'wrong-instance', expectRegistryDigest: REGISTRY_DIGEST }))
+      .rejects.toThrow(/INSTANCE BINDING refusal/);
+    await expect(runMigrations(conn, { deployment: 'staging', expectInstanceId: iid, expectRegistryDigest: 'deadbeef' }))
+      .rejects.toThrow(/REGISTRY PIN refusal/);
+    // both correct pins adopt:
+    await expect(runMigrations(conn, { deployment: 'staging', expectInstanceId: iid, expectRegistryDigest: REGISTRY_DIGEST })).resolves.toBeDefined();
     const adopted = await conn.query(`SELECT registry_digest AS d FROM public.contake_db_identity WHERE id = 1`);
-    console.log(`OBSERVED[anchor adopted]: ${String(adopted.rows[0]?.['d'])}`);
+    console.log(`OBSERVED[anchor adopted with both pins]: ${String(adopted.rows[0]?.['d'])}`);
     expect(adopted.rows[0]?.['d']).toBe(REGISTRY_DIGEST);
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     await pg.close();
