@@ -1,3 +1,4 @@
+import { LOCAL_DEV_AUTH_SECRET } from './boot-config.js';
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import type { ID, Principal, Role, Scope, WhitelistEntry, WhitelistStatus } from '@contake/core';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
@@ -80,7 +81,7 @@ export function memoryOtpState(): OtpStateStore {
 export class AuthService {
   constructor(
     private readonly repo: GraphRepository,
-    private readonly secret: string = process.env['CONTAKE_AUTH_SECRET'] ?? 'contake-dev-secret',
+    private readonly secret: string = LOCAL_DEV_AUTH_SECRET, // explicit non-deployable local default; production boots via resolveAuthSecret()
     private readonly now: () => number = () => Date.now(),
     private readonly otpStore: OtpStateStore = memoryOtpState(),
   ) {}

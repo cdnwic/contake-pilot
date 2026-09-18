@@ -7,7 +7,7 @@ services:
     name: contake-api
     runtime: node
     plan: starter
-    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @contake/api build
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @contake/core build && pnpm --filter @contake/api build
     startCommand: node apps/api/dist/server.js
     healthCheckPath: /v1/health
     envVars:
@@ -15,8 +15,12 @@ services:
         fromDatabase:
           name: contake-pg
           property: connectionString
-      - key: CONTAKE_SEED
-        value: camp-demo
+      - key: NODE_ENV
+        value: "production"   # engages every fail-closed production invariant
+      - key: CONTAKE_AUTH_SECRET
+        sync: false           # MANAGED SECRET: set in the Render dashboard only,
+                              # never in this repo. Boot refuses missing/empty,
+                              # known fallbacks, and < 32 chars.
       - key: CONTAKE_DEV_OTP
         value: "false"        # mandatory in pilot: never return devCode
       - key: VAPID_PUBLIC_KEY

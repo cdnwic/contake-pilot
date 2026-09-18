@@ -4,6 +4,7 @@ import type {
   Action, AuditLogEntry, ChangeRequest, DominoResult, EventNode, GraphSnapshot, ID, ProposedChange, PushSubscription, StatusReport, TaskNode,
   WhitelistEntry,
 } from '@contake/core';
+import { devOtpEnabled } from './boot-config.js';
 import {
   assertAcyclic, dependencyPath, getProfile, hasProfile, inScope, listProfiles, parseInstant,
   rawDecision, renderInstant, computeDomino, wouldCreateCycle, PROFILES_VERSION,
@@ -162,7 +163,7 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
     if (!phone) fail(400, 'BAD_REQUEST', 'חסר מספר טלפון');
     const r = await auth.requestOtp(phone as string);
     if (r.rateLimited) fail(429, 'RATE_LIMITED', 'יותר מדי בקשות — נסה שוב מאוחר יותר');
-    return { sent: true, ...(process.env['CONTAKE_DEV_OTP'] !== 'false' ? { devCode: r.devCode } : {}) };
+    return { sent: true, ...(devOtpEnabled() ? { devCode: r.devCode } : {}) }; // fail-closed: only CONTAKE_DEV_OTP === 'true' exposes devCode
   });
   app.post('/v1/auth/otp/verify', async (req) => {
     const { phone, code } = (req.body ?? {}) as { phone?: string; code?: string };

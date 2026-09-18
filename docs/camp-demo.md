@@ -13,7 +13,7 @@ Fixture module: `apps/api/src/demo/camp-demo.ts`. Loader: `apps/api/src/demo/loa
 
 ## Loading
 
-- **Server boot (either adapter):** `CONTAKE_SEED=camp-demo pnpm --filter @contake/api dev` — memory mode seeds on start; PG mode seeds when the database is empty for the demo org.
+- **Server boot (local dev/demo only, either adapter):** `CONTAKE_SEED=camp-demo pnpm --filter @contake/api dev` — memory mode seeds on start; PG mode seeds when the database is empty for the demo org. Fail-closed hotfix (2026-09-17): seeds are applied ONLY on an explicit recognized CONTAKE_SEED (`demo`|`camp-demo`|`all-demo`), CONTAKE_SEED is FORBIDDEN in production (NODE_ENV=production refuses to boot with it set, and the Render blueprint no longer carries it), and OTP devCode requires exactly CONTAKE_DEV_OTP=true outside production.
 - **Standalone script:**
   - memory: `pnpm --filter @contake/api exec tsx src/demo/load-camp-demo.ts --impl memory`
   - Postgres: `DATABASE_URL=... tsx src/demo/load-camp-demo.ts --impl postgres`, or local PGlite: `PGDATA=/tmp/cdpg tsx src/demo/load-camp-demo.ts --impl postgres`
