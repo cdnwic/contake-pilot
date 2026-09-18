@@ -5,7 +5,7 @@
 #   DATABASE_URL optional; when given, the positive production-shaped boot
 #   probe runs against it (a scratch database is created/dropped by the caller).
 set -euo pipefail
-cd "$(dirname "$0")/../.."   # repo root
+cd "$(dirname "$0")/../../.."   # repo root
 
 echo '== blueprint checks =='
 grep -q 'key: CONTAKE_AUTH_SECRET' render.yaml || { echo 'FAIL: render.yaml lacks managed CONTAKE_AUTH_SECRET'; exit 1; }
@@ -20,11 +20,10 @@ pnpm --filter @contake/core build
 pnpm --filter @contake/api build
 
 echo '== negative: production-shaped boot without secret refuses =='
-if env NODE_ENV=production DATABASE_URL="${1:-postgres://localhost:1/x}" PORT=0 node apps/api/dist/server.js 2>&1 | grep -q CONTAKE_AUTH_SECRET; then
-  echo 'refusal names CONTAKE_AUTH_SECRET - OK'
-else
-  echo 'FAIL: boot did not refuse missing secret'; exit 1
-fi
+# pipefail-safe: capture, require non-zero exit, then match the refusal text.
+neg_out=$(env -u CONTAKE_AUTH_SECRET NODE_ENV=production DATABASE_URL="${1:-postgres://localhost:1/x}" PORT=0 node apps/api/dist/server.js 2>&1) && { echo 'FAIL: boot SUCCEEDED without secret'; exit 1; }
+echo "$neg_out" | grep -q CONTAKE_AUTH_SECRET || { echo 'FAIL: refusal did not name CONTAKE_AUTH_SECRET'; echo "$neg_out" | head -5; exit 1; }
+echo 'refusal names CONTAKE_AUTH_SECRET - OK'
 
 if [ -n "${1:-}" ]; then
   echo '== positive: valid production-shaped config reaches health =='
