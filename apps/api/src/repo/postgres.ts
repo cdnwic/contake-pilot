@@ -6,7 +6,8 @@ import type {
   WhitelistEntry, WhitelistStatus, AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, ImpersonationEndState, ImpersonationSessionPage, SeedData, UserRecord } from './graph-repository.js';
-import { ReportClientIdConflictError } from './graph-repository.js';
+import { ReportClientIdConflictError, isCanonicalSandboxSession,} from './graph-repository.js';
+import { SUPERADMIN_SANDBOX_ORG } from '../services/superadmin.js';
 import type { DispatchStateStore } from '../services/dispatch.js';
 import type { AuthAuditEntry, OtpCodeEntry, OtpStateStore, OtpVerifyState } from '../auth.js';
 
@@ -215,7 +216,10 @@ export class PostgresGraphRepository implements GraphRepository {
     return this.inTx(async c => {
       const r = await c.query(`SELECT data FROM users WHERE user_id=$1 FOR UPDATE`, [userId]);
       const cur = r.rows[0]?.['data'] as UserRecord | undefined;
-      if (!cur || cur.impersonationOf === undefined) return 'not-found';
+      // QA hardening (2026-09-18): only CANONICAL sandbox sessions transition;
+      // non-sandbox or malformed legacy records are not-found (route -> 404),
+      // never mutated, never deleted.
+      if (!cur || !isCanonicalSandboxSession(cur, SUPERADMIN_SANDBOX_ORG)) return 'not-found';
       if ((cur.sessionState ?? 'active') !== expected) return 'not-active';
       // Row lock held: state flip + immutable audit row commit together.
       const nextU: UserRecord = { ...cur, active: false, sessionState: next, sessionEndedAt: at, sessionEndBy: endBy };
@@ -230,8 +234,28 @@ export class PostgresGraphRepository implements GraphRepository {
     limit: number;
     cursor?: string;
   }): Promise<ImpersonationSessionPage> {
-    const conds: string[] = [`(data->>'impersonationOf') IS NOT NULL`];
-    const params: unknown[] = [];
+    // QA hardening (2026-09-18): CANONICAL sessions only - exact SQL mirror of
+    // isCanonicalSandboxSession (graph-repository.ts). Non-sandbox or
+    // malformed legacy records are invisible here and 404 on transition.
+    const isoZ = "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$";
+    const isoOk = (expr: string): string =>
+      `(${expr}) ~ '${isoZ}'`
+      + ` AND substring(${expr} from 6 for 2) BETWEEN '01' AND '12'`
+      + ` AND substring(${expr} from 9 for 2) BETWEEN '01' AND '31'`
+      + ` AND substring(${expr} from 12 for 2) BETWEEN '00' AND '23'`
+      + ` AND substring(${expr} from 15 for 2) BETWEEN '00' AND '59'`
+      + ` AND substring(${expr} from 18 for 2) BETWEEN '00' AND '60'`;
+    const params: unknown[] = [SUPERADMIN_SANDBOX_ORG];
+    const conds: string[] = [
+      `(data->>'orgId') = $1`,
+      `btrim(COALESCE(data->>'impersonationOf','')) <> ''`,
+      isoOk(`data->>'createdAt'`),
+      isoOk(`data->>'expiresAt'`),
+      `(data->>'expiresAt') > (data->>'createdAt')`,
+      `(data->>'sessionState') IN ('active','stopped','expired','revoked')`,
+      `( ((data->>'sessionState') = 'active' AND (data->>'sessionEndedAt') IS NULL AND (data->>'sessionEndBy') IS NULL)
+       OR ((data->>'sessionState') IN ('stopped','expired','revoked') AND ${isoOk(`data->>'sessionEndedAt'`)} AND btrim(COALESCE(data->>'sessionEndBy','')) <> '') )`,
+    ];
     if (opts.state) { params.push(opts.state); conds.push(`COALESCE(data->>'sessionState','active') = $${params.length}`); }
     if (opts.cursor !== undefined) {
       const sep = opts.cursor.lastIndexOf('|');

@@ -6,7 +6,8 @@ import type {
   AdvanceProposal, AdvanceOutbox,
 } from '@contake/core';
 import type { ChannelRecord, GraphRepository, ImpersonationEndState, ImpersonationSessionPage, SeedData, UserRecord } from './graph-repository.js';
-import { ReportClientIdConflictError } from './graph-repository.js';
+import { ReportClientIdConflictError, isCanonicalSandboxSession,} from './graph-repository.js';
+import { SUPERADMIN_SANDBOX_ORG } from '../services/superadmin.js';
 
 /** In-memory GraphRepository (M1). Atomic batch semantics mirror the future
  *  Postgres transaction: validate everything, then commit (QA AC-DOM-7). */
@@ -95,7 +96,10 @@ export class MemoryGraphRepository implements GraphRepository {
     at: string, auditEntry: AuditLogEntry, endBy: string,
   ): Promise<'transitioned' | 'not-active' | 'not-found'> {
     const cur = this.users.get(userId);
-    if (!cur || cur.impersonationOf === undefined) return 'not-found';
+    // QA hardening (2026-09-18): only CANONICAL sandbox sessions transition;
+    // non-sandbox or malformed legacy records are not-found (route -> 404),
+    // never mutated, never deleted.
+    if (!cur || !isCanonicalSandboxSession(cur, SUPERADMIN_SANDBOX_ORG)) return 'not-found';
     if ((cur.sessionState ?? 'active') !== expected) return 'not-active';
     // Single-threaded check+set+append: one atomic unit, audit can never be
     // lost after the state flip nor written without it.
@@ -109,7 +113,7 @@ export class MemoryGraphRepository implements GraphRepository {
     limit: number;
     cursor?: string;
   }): Promise<ImpersonationSessionPage> {
-    let rows = [...this.users.values()].filter(u => u.impersonationOf !== undefined);
+    let rows = [...this.users.values()].filter(u => isCanonicalSandboxSession(u, SUPERADMIN_SANDBOX_ORG));
     if (opts.state) rows = rows.filter(u => (u.sessionState ?? 'active') === opts.state);
     rows.sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? '') || a.userId.localeCompare(b.userId));
     if (opts.cursor !== undefined) {

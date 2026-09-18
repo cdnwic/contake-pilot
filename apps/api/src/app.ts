@@ -12,7 +12,7 @@ import { appEvents } from './services/events.js';
 import { stripContactPhone, stripSubscriberFields } from './services/sanitize.js';
 import { AuthService, SANDBOX_SESSION_TTL_MS, toPrincipal } from './auth.js';
 import type { GraphRepository, UserRecord } from './repo/graph-repository.js';
-import { ReportClientIdConflictError } from './repo/graph-repository.js';
+import { isValidSessionCursor, ReportClientIdConflictError } from './repo/graph-repository.js';
 import { ApiError, approveChange, proposeMutation, rejectChange, reportDecisionFor, applyDomino, actionOfChange , withAuditSafety } from './services/changes.js';
 import { auditDenied, type DenialMeta, audit, buildAuditRecord, deviceClassOf } from './services/audit.js';
 import type { AuditEntityType, Branch, ContentItem, ContentItemVersion, ExternalParty, OptoutSuppression, StatusToken, TaskContentRole, TaskResourceLink } from '@contake/core';
@@ -674,6 +674,11 @@ export function buildApp(repo: GraphRepository, auth: AuthService): FastifyInsta
       : fail(400, 'BAD_REQUEST', 'state לא חוקי');
     const limitRaw = q.limit === undefined ? 50 : Number.parseInt(q.limit, 10);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+    // QA hardening (2026-09-18): STRICT cursor validation - malformed cursors
+    // are a client error (400), never silently reinterpreted.
+    if (q.cursor !== undefined && !isValidSessionCursor(q.cursor)) {
+      fail(400, 'BAD_REQUEST', 'cursor לא חוקי');
+    }
     const { sessions, nextCursor } = await repo.listImpersonationSessions({ ...(state ? { state } : {}), limit, ...(q.cursor !== undefined ? { cursor: q.cursor } : {}) });
     return {
       sessions: sessions.map(x => ({

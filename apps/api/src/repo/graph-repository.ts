@@ -37,6 +37,60 @@ export interface UserRecord extends Principal {
   sessionEndBy?: string;
 }
 
+/** QA hardening (2026-09-18): CANONICAL sandbox impersonation-session shape.
+ *  A user record is a listable/transitionable impersonation session ONLY in
+ *  the canonical sandbox org with the FULL lifecycle metadata minted since
+ *  the lifecycle gate: non-empty impersonationOf, strict fixed-width ISO-Z
+ *  createdAt/expiresAt with expiresAt > createdAt, a known sessionState, and
+ *  consistent end metadata (active: none; ended: endedAt ISO-Z + endBy).
+ *  Non-sandbox or malformed legacy records are INVISIBLE to the session
+ *  surface (404) and are never mutated or deleted by it.
+ *  Pure string/shape validation (no Date.parse), mirrored EXACTLY by the
+ *  Postgres adapter's SQL filter so both adapters agree by construction.
+ *  Fixed-width ISO-Z (...T hh:mm:ss.sssZ) compares lexicographically ==
+ *  chronologically. */
+export const CANONICAL_ISO_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const isoRangeOk = (v: string, from: number, lo: string, hi: string): boolean => {
+  const s = v.slice(from, from + 2);
+  return s >= lo && s <= hi;
+};
+export function isCanonicalIsoZ(v: unknown): v is string {
+  return typeof v === 'string' && CANONICAL_ISO_Z.test(v)
+    && isoRangeOk(v, 5, '01', '12')   // month
+    && isoRangeOk(v, 8, '01', '31')   // day
+    && isoRangeOk(v, 11, '00', '23')  // hour
+    && isoRangeOk(v, 14, '00', '59')  // minute
+    && isoRangeOk(v, 17, '00', '60'); // second (60: leap-second tolerant)
+}
+
+/** Full canonical session check; sandboxOrg is the ONLY org a session may
+ *  live in (SUPERADMIN_SANDBOX_ORG, passed in so the repo layer stays
+ *  free of service imports). */
+export function isCanonicalSandboxSession(u: UserRecord, sandboxOrg: ID): boolean {
+  if (u.orgId !== sandboxOrg) return false;
+  if (typeof u.impersonationOf !== 'string' || u.impersonationOf.length === 0) return false;
+  if (!isCanonicalIsoZ(u.createdAt) || !isCanonicalIsoZ(u.expiresAt)) return false;
+  if ((u.expiresAt as string) <= (u.createdAt as string)) return false;
+  if (u.sessionState === 'active') {
+    return u.sessionEndedAt === undefined && u.sessionEndBy === undefined;
+  }
+  if (u.sessionState === 'stopped' || u.sessionState === 'expired' || u.sessionState === 'revoked') {
+    return isCanonicalIsoZ(u.sessionEndedAt) && typeof u.sessionEndBy === 'string' && u.sessionEndBy.length > 0;
+  }
+  return false;
+}
+
+/** Strict cursor shape for session listing (QA hardening 2026-09-18):
+ *  `<createdAt ISO-Z>|<userId>` - exactly one separator, canonical ISO
+ *  timestamp, non-empty id of safe charset, bounded length. */
+export function isValidSessionCursor(cursor: unknown): cursor is string {
+  if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > 256) return false;
+  const parts = cursor.split('|');
+  if (parts.length !== 2) return false;
+  if (!isCanonicalIsoZ(parts[0])) return false;
+  return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(parts[1]!);
+}
+
 /** Lifecycle states a sandbox impersonation session can END in. */
 export type ImpersonationEndState = 'stopped' | 'expired' | 'revoked';
 export interface ImpersonationSessionPage {
