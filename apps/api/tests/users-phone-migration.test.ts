@@ -15,7 +15,8 @@ import { makeTestRepo, REPO_IMPL } from './helpers/repo.js';
 import type { GraphRepository } from '../src/repo/graph-repository.js';
 import type { Connectable } from '../src/repo/postgres.js';
 import {
-  backupUsers, createUsersPhoneIndex, migrateUsersPhone, normalizeUsersPhones, preflightUsersPhone, restoreUsers, usersPhoneIndexExists,
+  backupUsers, CANONICAL_INDEX_SQL, createUsersPhoneIndex, manifestDigest, MIGRATION_LOCK_KEY, migrateUsersPhone,
+  normalizeUsersPhones, preflightUsersPhone, restoreUsers, rowDigest, usersPhoneIndexExists,
 } from '../src/services/phone-migration.js';
 
 const pgOnly = REPO_IMPL === 'memory' ? describe.skip : describe;
@@ -246,7 +247,7 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
       if (row.user_id === 'u-c1') row.data = { ...row.data, name: 'tampered' }; // hash now stale
       return JSON.stringify(row);
     });
-    await expect(restoreUsers(conn, tampered)).rejects.toThrow(/sha256 mismatch/);
+    await expect(restoreUsers(conn, tampered)).rejects.toThrow(/row digest mismatch/);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-c1'`)).rows[0]!['phone']).toBe(' +15550101001 ');
     expect((await conn.query(`SELECT data->>'name' AS n FROM users WHERE user_id='u-c1'`)).rows[0]!['n']).toBe('u-c1');
   });
@@ -287,11 +288,10 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
     expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id IN ('u-l1','u-l2')`)).rows[0]!['n']).toBe(2);
   });
 
-  it('index-creation failure inside restore rolls back EVERYTHING (rows + schema)', async () => {
+  it('tampered header index definition WITHOUT resigning: refused BEFORE any mutation (closed-schema guard fires before the manifest check)', async () => {
     await insertLegacy(conn, 'u-r1', 'org-1', ' +15550101041 ', '+15550101041');
     expect((await createUsersPhoneIndex(conn)).created).toBe(true);
     const lines = await backupNow();
-    // tamper the stored definition: passes header shape, fails at execution
     const tampered = lines.map((l, i) => {
       if (i !== 0) return l;
       const h = JSON.parse(l);
@@ -299,10 +299,37 @@ pgOnly('restore artifact validation + full-restore contract (security 2026-09-18
       return JSON.stringify(h);
     });
     await conn.query(`UPDATE users SET phone=' +19990000000 ' WHERE user_id='u-r1'`);
-    await expect(restoreUsers(conn, tampered)).rejects.toThrow();
-    // rollback proof: the pre-restore state is intact (mutated value, index present)
+    await expect(restoreUsers(conn, tampered)).rejects.toThrow(/non-canonical index definition/);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-r1'`)).rows[0]!['phone']).toBe(' +19990000000 ');
     expect(await usersPhoneIndexExists(conn)).toBe(true);
+  });
+
+  it('index-creation failure inside restore rolls back EVERYTHING (rows + schema): resigned artifact whose rows collide under the canonical index', async () => {
+    // backup taken WITH index (clean rows)
+    await conn.query(`DELETE FROM users WHERE user_id IN ('u-r2','u-r2b','u-keep')`);
+    await insertLegacy(conn, 'u-r2', 'org-1', '+15550101042', '+15550101042');
+    expect((await createUsersPhoneIndex(conn)).created).toBe(true);
+    const lines = await backupNow();
+    // insider-grade tamper: introduce a colliding second row and RESIGN
+    // (digests + manifest recomputed) - validation passes, the canonical
+    // CREATE INDEX must fail INSIDE the tx and roll back rows AND schema
+    const parsed = lines.map(l => JSON.parse(l));
+    const srcRow = parsed.slice(1).find(r => r.user_id === 'u-r2')!;
+    const colliding = { ...srcRow, user_id: 'u-r2b', phone: ' +15550101042 ' };
+    colliding.data = { ...colliding.data, userId: 'u-r2b' };
+    const rows = [...parsed.slice(1), colliding].map(r => ({ user_id: r.user_id, org_id: r.org_id, email: r.email, phone: r.phone, data: r.data }));
+    const digests = rows.map(rowDigest);
+    const base = { type: parsed[0].type, version: parsed[0].version, createdAt: parsed[0].createdAt, rowCount: rows.length, usersPhoneUniqueIndex: parsed[0].usersPhoneUniqueIndex };
+    const resigned = [JSON.stringify({ ...base, manifestSha256: manifestDigest(base, digests) }),
+      ...rows.map((r, i) => JSON.stringify({ ...r, rowSha256: digests[i] }))];
+    await conn.query(`DELETE FROM users WHERE user_id IN ('u-r2','u-r2b','u-keep')`);
+    await conn.query(`DROP INDEX IF EXISTS users_phone_unique`);
+    await insertLegacy(conn, 'u-keep', 'org-9', '+15550109999', '+15550109999');
+    await expect(restoreUsers(conn, resigned)).rejects.toThrow();
+    // rollback proof: no artifact row landed, no index was left behind
+    expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id IN ('u-r2','u-r2b')`)).rows[0]!['n']).toBe(0);
+    expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id='u-keep'`)).rows[0]!['n']).toBe(1);
+    expect(await usersPhoneIndexExists(conn)).toBe(false);
   });
 });
 
@@ -330,5 +357,172 @@ pgOnly('locked maintenance transaction (security 2026-09-18)', () => {
     const r2 = await migrateUsersPhone(conn);
     expect(r2.migrated).toBe(false);
     expect((await conn.query(`SELECT phone FROM users WHERE user_id='u-b3'`)).rows[0]!['phone']).toBe('+15550101071');
+  });
+});
+
+pgOnly('artifact authentication + closed index schema (QA/security 2026-09-18 v4)', () => {
+  const backupNow = async (): Promise<string[]> => {
+    const lines: string[] = [];
+    await backupUsers(conn, l => lines.push(l));
+    return lines;
+  };
+  /** Recompute row digests + manifest over (possibly tampered) content:
+   *  insider-grade tamper that PASSES per-layer digests. */
+  const resign = (rows: { user_id: string; org_id: string; email: string | null; phone: string | null; data: unknown }[], header: Record<string, unknown>): string[] => {
+    const digests = rows.map(rowDigest);
+    const base = { type: header['type'], version: header['version'], createdAt: header['createdAt'], rowCount: rows.length, usersPhoneUniqueIndex: header['usersPhoneUniqueIndex'] } as Parameters<typeof manifestDigest>[0];
+    return [JSON.stringify({ ...base, manifestSha256: manifestDigest(base, digests) }),
+      ...rows.map((r, i) => JSON.stringify({ ...r, rowSha256: digests[i] }))];
+  };
+
+  it('per-row digest covers EVERY authoritative column: tampering user_id/org_id/email/phone/data with a stale digest refuses pre-mutation', async () => {
+    await insertLegacy(conn, 'u-a1', 'org-1', '+15550101001', '+15550101001');
+    const lines = await backupNow();
+    const tampers: Record<string, (r: Record<string, unknown>) => void> = {
+      user_id: r => { r['user_id'] = 'u-a1-FORGED'; },
+      org_id: r => { r['org_id'] = 'org-FORGED'; },
+      email: r => { r['email'] = 'forged@example.com'; },
+      phone: r => { r['phone'] = '+19999999999'; },
+      data: r => { r['data'] = { ...(r['data'] as object), role: 'superadmin' }; },
+    };
+    for (const [col, mutate] of Object.entries(tampers)) {
+      const tampered = [...lines];
+      const row = JSON.parse(tampered[1]!);
+      mutate(row);
+      tampered[1] = JSON.stringify(row);
+      await expect(restoreUsers(conn, tampered), `column ${col}`).rejects.toThrow(/row digest mismatch/);
+    }
+    // DB untouched by every refusal
+    expect((await conn.query(`SELECT org_id FROM users WHERE user_id='u-a1'`)).rows[0]!['org_id']).toBe('org-1');
+  });
+
+  it('manifest binds the ORDERED row set: swapping two rows refuses even with intact row digests', async () => {
+    await insertLegacy(conn, 'u-o1', 'org-1', '+15550101011', '+15550101011');
+    await insertLegacy(conn, 'u-o2', 'org-1', '+15550101012', '+15550101012');
+    const lines = await backupNow();
+    expect(lines.length).toBeGreaterThanOrEqual(3);
+    const swapped = [lines[0]!, lines[2]!, lines[1]!, ...lines.slice(3)];
+    await expect(restoreUsers(conn, swapped)).rejects.toThrow(/manifest digest mismatch/);
+  });
+
+  it('manifest binds header + index state: createdAt or index-existence substitution refuses', async () => {
+    await insertLegacy(conn, 'u-h1', 'org-1', '+15550101021', '+15550101021');
+    const lines = await backupNow();
+    const h1 = { ...JSON.parse(lines[0]!), createdAt: '2001-01-01T00:00:00.000Z' };
+    await expect(restoreUsers(conn, [JSON.stringify(h1), ...lines.slice(1)])).rejects.toThrow(/manifest digest mismatch/);
+    const h2raw = JSON.parse(lines[0]!);
+    h2raw.usersPhoneUniqueIndex = { existed: true, definition: CANONICAL_INDEX_SQL };
+    await expect(restoreUsers(conn, [JSON.stringify(h2raw), ...lines.slice(1)])).rejects.toThrow(/manifest digest mismatch/);
+  });
+
+  it('closed index schema: resigned evidence definitions with appended SQL / different expression / predicate / table / schema are REFUSED and NEVER executed', async () => {
+    await insertLegacy(conn, 'u-s1', 'org-1', '+15550101031', '+15550101031');
+    expect((await createUsersPhoneIndex(conn)).created).toBe(true);
+    const lines = await backupNow();
+    const header = JSON.parse(lines[0]!);
+    const row = JSON.parse(lines[1]!);
+    const variants: Record<string, string> = {
+      'appended SQL': 'CREATE UNIQUE INDEX users_phone_unique ON public.users USING btree (btrim(phone)) WHERE (phone IS NOT NULL); CREATE TABLE pwned(x int)',
+      'expression': 'CREATE UNIQUE INDEX users_phone_unique ON public.users USING btree (lower(phone)) WHERE (phone IS NOT NULL)',
+      'predicate': 'CREATE UNIQUE INDEX users_phone_unique ON public.users USING btree (btrim(phone)) WHERE (phone <> \'\')',
+      'table': 'CREATE UNIQUE INDEX users_phone_unique ON public.orgs USING btree (btrim(phone)) WHERE (phone IS NOT NULL)',
+      'schema': 'CREATE UNIQUE INDEX users_phone_unique ON other.users USING btree (btrim(phone)) WHERE (phone IS NOT NULL)',
+    };
+    for (const [name, def] of Object.entries(variants)) {
+      const h = { ...header, usersPhoneUniqueIndex: { existed: true, definition: def } };
+      const resigned = resign([{ user_id: row.user_id, org_id: row.org_id, email: row.email, phone: row.phone, data: row.data }], h);
+      await expect(restoreUsers(conn, resigned), name).rejects.toThrow(/non-canonical index definition/);
+    }
+    // proof nothing executed: no pwned table, original row intact
+    expect((await conn.query(`SELECT count(*)::int AS n FROM information_schema.tables WHERE table_name='pwned'`)).rows[0]!['n']).toBe(0);
+    expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id='u-s1'`)).rows[0]!['n']).toBe(1);
+  });
+
+  it('canonical compare, not byte compare: a legitimately pg-normalized live definition verifies against the canonical statement', async () => {
+    await insertLegacy(conn, 'u-n1', 'org-1', ' +15550101041 ', '+15550101041');
+    const r = await migrateUsersPhone(conn);
+    expect(r.migrated).toBe(true);
+    if (r.migrated) {
+      expect(r.indexPresent).toBe(true);
+      expect(r.finalPreflight.blocking).toBe(false);
+    }
+  });
+});
+
+pgOnly('real write exclusion (security 2026-09-18 v4)', () => {
+  it('migrateUsersPhone + restoreUsers take the advisory lock AND LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE (recorded query stream)', async () => {
+    const recorded: string[] = [];
+    const rec: Connectable = {
+      query: (text: string, params?: unknown[]) => { recorded.push(text); return conn.query(text, params as never); },
+      connect: async () => {
+        const client = await conn.connect();
+        return { query: (text: string, params?: unknown[]) => { recorded.push(text); return client.query(text, params as never); }, release: () => client.release() };
+      },
+    } as unknown as Connectable;
+    await migrateUsersPhone(rec);
+    expect(recorded.some(q => q.includes(`pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`))).toBe(true);
+    expect(recorded.some(q => q === 'LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE')).toBe(true);
+    recorded.length = 0;
+    const lines: string[] = [];
+    await backupUsers(conn, l => lines.push(l));
+    await restoreUsers(rec, lines);
+    expect(recorded.some(q => q === 'LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE')).toBe(true);
+  });
+
+  const realPgOnly = REPO_IMPL === 'realpg' ? it : it.skip;
+  realPgOnly('two-connection proof: a writer on another connection BLOCKS against the migration lock and fails clean under statement_timeout, then succeeds after commit', async () => {
+    const { Pool } = await import('pg');
+    const poolB = new Pool({ connectionString: process.env['DATABASE_URL'], max: 1 });
+    const clientA = await (conn as unknown as InstanceType<typeof Pool>).connect();
+    try {
+      await conn.query(`DELETE FROM users WHERE user_id='u-w1'`);
+      await clientA.query('BEGIN');
+      await clientA.query('LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE');
+      await poolB.query(`SET statement_timeout = 1500`);
+      await expect(poolB.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-w1','org-1',NULL,'+15550101051','{}')`))
+        .rejects.toThrow(/statement timeout|canceling statement/i);
+      await clientA.query('COMMIT');
+      await poolB.query(`SET statement_timeout = 0`);
+      await poolB.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-w1','org-1',NULL,'+15550101051','{}')`);
+      expect((await conn.query(`SELECT count(*)::int AS n FROM users WHERE user_id='u-w1'`)).rows[0]!['n']).toBe(1);
+    } finally {
+      clientA.release();
+      await poolB.end();
+    }
+  });
+});
+
+pgOnly('CLI v4 (security 2026-09-18)', () => {
+  const realPgOnly = REPO_IMPL === 'realpg' ? it : it.skip;
+  const distReady = () => { try { return readFileSync(new URL('../dist/services/phone-migration.js', import.meta.url), 'utf8').includes('manifestSha256'); } catch { return false; } };
+
+  realPgOnly('CLI --maintenance success output reports ACTUAL index presence and !finalPreflight.blocking', async () => {
+    if (!distReady()) return; // build artifact absent in this lane - reported as skip
+    const { execFileSync } = await import('node:child_process');
+    const backupFile = join(mkdtempSync(join(tmpdir(), 'upm-cli-')), 'backup.jsonl');
+    const out = execFileSync(process.execPath, ['scripts/users-phone-migrate.mjs', '--database-url', process.env['DATABASE_URL'] as string, '--backup', backupFile, '--maintenance'], { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8' });
+    expect(out).toMatch(/index present=true/);
+    expect(out).toMatch(/final preflight clean=true/);
+    expect(await usersPhoneIndexExists(conn)).toBe(true);
+  });
+
+  realPgOnly('CLI --normalize/--create-index are REMOVED: exit 64 with a closure message, nothing mutated', async () => {
+    if (!distReady()) return;
+    const { execFileSync } = await import('node:child_process');
+    const run = (flag: string) => {
+      try {
+        execFileSync(process.execPath, ['scripts/users-phone-migrate.mjs', '--database-url', process.env['DATABASE_URL'] as string, flag], { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', stdio: 'pipe' });
+        return { code: 0, err: '' };
+      } catch (e) {
+        const err = e as { status?: number; stderr?: string };
+        return { code: err.status ?? -1, err: String(err.stderr) };
+      }
+    };
+    for (const flag of ['--normalize', '--create-index']) {
+      const r = run(flag);
+      expect(r.code, flag).toBe(64);
+      expect(r.err, flag).toMatch(/REMOVED in v4/);
+    }
+    expect(await usersPhoneIndexExists(conn)).toBe(false);
   });
 });

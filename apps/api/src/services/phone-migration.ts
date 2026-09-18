@@ -24,6 +24,30 @@
  *    requires an explicit --database-url (no default, no ambient env).
  *  - IDEMPOTENT: normalize/createIndex/restore are safe to re-run.
  *
+ *  v4 (QA + security 2026-09-18):
+ *  - AUTHENTICATED ARTIFACTS: every row carries rowSha256 = sha256 over the
+ *    CANONICAL full row (user_id, org_id, email, phone, data; recursively
+ *    key-sorted JSON); the header carries manifestSha256 binding the header
+ *    fields, the index state AND the ordered row digest set. Both are
+ *    verified BEFORE any mutation and again post-restore inside the tx.
+ *  - CLOSED INDEX SCHEMA: the backup stores the index state as a boolean
+ *    plus the definition as EVIDENCE ONLY. Restore NEVER executes SQL from
+ *    the artifact; it recreates exactly one hardcoded canonical statement
+ *    (CANONICAL_INDEX_SQL) and verifies the live definition against it
+ *    (normalized compare). An artifact whose evidence definition is not the
+ *    canonical shape (appended SQL, different expression/predicate/table/
+ *    schema) is REFUSED before any mutation.
+ *  - REAL WRITE EXCLUSION: restoreUsers and migrateUsersPhone take
+ *    LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE for the whole transaction
+ *    (blocks application INSERT/UPDATE/DELETE, which take ROW EXCLUSIVE),
+ *    plus the advisory lock serializing concurrent migration runs.
+ *  - QUIESCENCE GATE (documented, operator-carried): even with the table
+ *    lock, the migration window REQUIRES application writers quiesced
+ *    (maintenance mode / writers scaled down) - the lock blocks writers
+ *    only for the transaction's duration, and a long queue of blocked
+ *    writers is itself an operational incident. MIGRATION_LOCK_KEY is
+ *    exported for any future writer-side enforcement.
+ *
  *  OPERATOR GATES for later live use (carried; NO live action now):
  *  1. explicit approval to run the read-only preflight against the live DB;
  *  2. an explicit operator decision per collision/inconsistency group
@@ -89,6 +113,43 @@ const norm = (v: string | null): string | null => {
   return t === '' ? null : t;
 };
 const hashData = (data: unknown): string => createHash('sha256').update(JSON.stringify(data)).digest('hex');
+
+/** Deterministic canonical JSON: object keys sorted recursively, so digests
+ *  are stable across JSONB round-trips (jsonb reorders keys). */
+const canonical = (v: unknown): string => {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
+  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o).sort().map(k => `${JSON.stringify(k)}:${canonical(o[k])}`).join(',')}}`;
+};
+const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex');
+
+/** sha256 over the CANONICAL full row: user_id, org_id, email, phone, data. */
+export const rowDigest = (r: { user_id: string; org_id: string; email: string | null; phone: string | null; data: unknown }): string =>
+  sha256(canonical({ user_id: r.user_id, org_id: r.org_id, email: r.email, phone: r.phone, data: r.data }));
+
+/** sha256 binding the header (type/version/createdAt/rowCount/index state)
+ *  AND the ordered row digest set: any header, order, or membership change
+ *  without a recomputed manifest is detected. */
+export const manifestDigest = (
+  h: { type: string; version: number; createdAt: string; rowCount: number; usersPhoneUniqueIndex: { existed: boolean; definition: string | null } },
+  orderedRowDigests: string[],
+): string => sha256(canonical({
+  type: h.type, version: h.version, createdAt: h.createdAt, rowCount: h.rowCount,
+  usersPhoneUniqueIndex: h.usersPhoneUniqueIndex, rowDigests: orderedRowDigests,
+}));
+
+/** THE ONLY index this tool will ever create. Stored artifact SQL is NEVER
+ *  executed (security 2026-09-18): restore recreates this exact statement. */
+export const CANONICAL_INDEX_SQL =
+  `CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users USING btree (btrim(phone)) WHERE phone IS NOT NULL`;
+/** Normalized-compare form (lowercase, no schema qualifier, no parens,
+ *  collapsed whitespace) so a live pg-normalized indexdef compares equal. */
+export const normalizeIndexDef = (def: string): string =>
+  def.toLowerCase().replace(/\bpublic\./g, '').replace(/\bif not exists\b/g, '').replace(/[()]/g, ' ').replace(/\s+/g, ' ').trim();
+const CANONICAL_INDEX_NORMALIZED = normalizeIndexDef(CANONICAL_INDEX_SQL);
+/** Advisory lock key serializing concurrent migration runs. */
+export const MIGRATION_LOCK_KEY = 7263849598301;
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 const bool = (v: unknown): boolean => v === true;
 
@@ -175,11 +236,15 @@ export async function withTx<T>(conn: Connectable, fn: (c: { query: Connectable[
 export interface BackupRow { user_id: string; org_id: string; email: string | null; phone: string | null; data: unknown; }
 export interface BackupHeader {
   type: 'users-phone-backup-header';
-  version: 1;
+  version: 2;
   createdAt: string;
   rowCount: number;
-  /** Index state at backup time, so restore can reverse schema changes too. */
+  /** Index state at backup time. `definition` is EVIDENCE ONLY - never
+   *  executed; restore recreates CANONICAL_INDEX_SQL and refuses artifacts
+   *  whose evidence is not the canonical shape (closed schema). */
   usersPhoneUniqueIndex: { existed: boolean; definition: string | null };
+  /** sha256 manifest binding header + index state + ordered row digests. */
+  manifestSha256: string;
 }
 
 const indexState = async (c: { query: Connectable['query'] }): Promise<{ existed: boolean; definition: string | null }> => {
@@ -193,18 +258,20 @@ const indexState = async (c: { query: Connectable['query'] }): Promise<{ existed
 export async function backupUsers(conn: Connectable, sink: (line: string) => void, now: () => Date = () => new Date()): Promise<number> {
   const r = await conn.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
   const rows = r.rows as unknown as BackupRow[];
-  const header: BackupHeader = {
-    type: 'users-phone-backup-header', version: 1, createdAt: now().toISOString(),
+  const digests = rows.map(rowDigest);
+  const base = {
+    type: 'users-phone-backup-header' as const, version: 2 as const, createdAt: now().toISOString(),
     rowCount: rows.length, usersPhoneUniqueIndex: await indexState(conn),
   };
+  const header: BackupHeader = { ...base, manifestSha256: manifestDigest(base, digests) };
   sink(JSON.stringify(header));
-  for (const row of rows) sink(JSON.stringify({ ...row, sha256: hashData(row.data) }));
+  for (const [i, row] of rows.entries()) sink(JSON.stringify({ ...row, rowSha256: digests[i] }));
   return rows.length;
 }
 
 interface ValidatedArtifact {
   header: BackupHeader;
-  rows: (BackupRow & { sha256: string })[];
+  rows: (BackupRow & { rowSha256: string })[];
 }
 
 /** Validate the FULL backup artifact BEFORE any mutation (security
@@ -218,13 +285,21 @@ export function validateBackupArtifact(lines: string[]): ValidatedArtifact {
   });
   const header = parsed[0] as unknown as BackupHeader | undefined;
   if (!header || header.type !== 'users-phone-backup-header') throw new Error('restore: first line is not a users-phone backup header');
-  if (header.version !== 1) throw new Error(`restore: unsupported backup version ${String(header.version)}`);
+  if (header.version !== 2) throw new Error(`restore: unsupported backup version ${String(header.version)}`);
   if (typeof header.rowCount !== 'number' || header.rowCount < 0) throw new Error('restore: header rowCount missing/invalid');
   if (typeof header.usersPhoneUniqueIndex?.existed !== 'boolean') throw new Error('restore: header index state missing/invalid');
-  if (header.usersPhoneUniqueIndex.existed && (typeof header.usersPhoneUniqueIndex.definition !== 'string' || !/^CREATE UNIQUE INDEX users_phone_unique ON /i.test(header.usersPhoneUniqueIndex.definition))) {
-    throw new Error('restore: header index definition missing/invalid for an existed=true backup');
+  if (header.usersPhoneUniqueIndex.existed && typeof header.usersPhoneUniqueIndex.definition !== 'string') {
+    throw new Error('restore: header index evidence definition missing for an existed=true backup');
   }
-  const rows = parsed.slice(1) as unknown as (BackupRow & { sha256?: string })[];
+  if (header.usersPhoneUniqueIndex.existed &&
+      normalizeIndexDef(header.usersPhoneUniqueIndex.definition as string) !== CANONICAL_INDEX_NORMALIZED) {
+    throw new Error('restore: non-canonical index definition in artifact (appended SQL / different expression, predicate, table, or schema) - closed schema refuses unknown index shapes; artifact SQL is NEVER executed');
+  }
+  if (typeof (header as { manifestSha256?: unknown }).manifestSha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test((header as { manifestSha256?: string }).manifestSha256!)) {
+    throw new Error('restore: header manifestSha256 missing/invalid');
+  }
+  const rows = parsed.slice(1) as unknown as (BackupRow & { rowSha256?: string })[];
   if (rows.length !== header.rowCount) {
     throw new Error(`restore: header rowCount ${header.rowCount} != actual rows ${rows.length} (truncated or tampered artifact)`);
   }
@@ -237,10 +312,14 @@ export function validateBackupArtifact(lines: string[]): ValidatedArtifact {
     if (row.email !== null && typeof row.email !== 'string') throw new Error(`restore: row ${i + 1} (${row.user_id}) email must be string|null`);
     if (row.phone !== null && typeof row.phone !== 'string') throw new Error(`restore: row ${i + 1} (${row.user_id}) phone must be string|null`);
     if (typeof row.data !== 'object' || row.data === null) throw new Error(`restore: row ${i + 1} (${row.user_id}) missing data object`);
-    if (typeof row.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(row.sha256)) throw new Error(`restore: row ${i + 1} (${row.user_id}) missing sha256`);
-    if (hashData(row.data) !== row.sha256) throw new Error(`restore: row ${i + 1} (${row.user_id}) sha256 mismatch - tampered or corrupt artifact`);
+    if (typeof row.rowSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(row.rowSha256)) throw new Error(`restore: row ${i + 1} (${row.user_id}) missing rowSha256`);
+    if (rowDigest(row as BackupRow) !== row.rowSha256) throw new Error(`restore: row ${i + 1} (${row.user_id}) row digest mismatch - tampered or corrupt artifact (canonical full-row digest over user_id/org_id/email/phone/data)`);
   }
-  return { header, rows: rows as (BackupRow & { sha256: string })[] };
+  const { manifestSha256, ...base } = header;
+  if (manifestDigest(base, rows.map(r => (r as unknown as { rowSha256: string }).rowSha256)) !== manifestSha256) {
+    throw new Error('restore: manifest digest mismatch - header, index state, row order, or row set tampered');
+  }
+  return { header, rows: rows as unknown as (BackupRow & { rowSha256: string })[] };
 }
 
 export interface RestoreResult {
@@ -267,12 +346,10 @@ export async function restoreUsers(conn: Connectable, lines: string[]): Promise<
   const { header, rows } = validateBackupArtifact(lines); // BEFORE any mutation
   const artifactIds = new Set(rows.map(r => r.user_id));
   return withTx(conn, async c => {
+    // real write exclusion for the whole restore (blocks app writers)
+    await c.query(`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`);
     // schema first: make the target state reachable
-    if (!header.usersPhoneUniqueIndex.existed) {
-      await c.query(`DROP INDEX IF EXISTS users_phone_unique`); // before colliding rows load
-    } else {
-      await c.query(`DROP INDEX IF EXISTS users_phone_unique`);
-    }
+    await c.query(`DROP INDEX IF EXISTS users_phone_unique`); // before colliding rows load
     for (const row of rows) {
       await c.query(
         `INSERT INTO users(user_id, org_id, email, phone, data) VALUES($1,$2,$3,$4,$5)
@@ -285,9 +362,10 @@ export async function restoreUsers(conn: Connectable, lines: string[]): Promise<
     for (const id of extra) {
       await c.query(`DELETE FROM users WHERE user_id=$1`, [id]);
     }
-    // exact index definition
+    // index recreate: ONLY the hardcoded canonical statement - artifact
+    // SQL is NEVER executed (security 2026-09-18)
     if (header.usersPhoneUniqueIndex.existed) {
-      await c.query(header.usersPhoneUniqueIndex.definition as string); // verbatim stored definition
+      await c.query(CANONICAL_INDEX_SQL);
     }
     // ---- final verification INSIDE the transaction ----
     const all = await c.query(`SELECT user_id, org_id, email, phone, data FROM users ORDER BY user_id`);
@@ -300,13 +378,13 @@ export async function restoreUsers(conn: Connectable, lines: string[]): Promise<
       if (d.org_id !== a.org_id || d.email !== a.email || d.phone !== a.phone) {
         throw new Error(`restore verify: column mismatch for ${d.user_id}`);
       }
-      if (hashData(d.data) !== a.sha256) throw new Error(`restore verify: data hash mismatch for ${d.user_id}`);
+      if (rowDigest(d) !== a.rowSha256) throw new Error(`restore verify: full-row digest mismatch for ${d.user_id}`);
     }
     const idx = await indexState(c);
     if (header.usersPhoneUniqueIndex.existed) {
       if (!idx.existed) throw new Error('restore verify: index missing after recreate');
-      if (idx.definition !== header.usersPhoneUniqueIndex.definition) {
-        throw new Error(`restore verify: index definition mismatch (got ${idx.definition ?? 'null'})`);
+      if (normalizeIndexDef(idx.definition as string) !== CANONICAL_INDEX_NORMALIZED) {
+        throw new Error(`restore verify: live index definition is not the canonical shape (got ${idx.definition ?? 'null'})`);
       }
     } else if (idx.existed) {
       throw new Error('restore verify: index present after verified drop');
@@ -371,7 +449,7 @@ export async function usersPhoneIndexExists(conn: Connectable): Promise<boolean>
 }
 
 export type MaintenanceResult =
-  | { migrated: true; normalized: number; finalPreflight: PreflightReport }
+  | { migrated: true; normalized: number; indexPresent: boolean; finalPreflight: PreflightReport }
   | { migrated: false; reason: string; preflight: PreflightReport };
 
 /** LOCKED maintenance transaction (security 2026-09-18): ONE transaction
@@ -382,17 +460,25 @@ export type MaintenanceResult =
  *  back EVERYTHING (rows and schema unchanged). */
 export async function migrateUsersPhone(conn: Connectable): Promise<MaintenanceResult> {
   return withTx(conn, async c => {
-    await c.query(`SELECT pg_advisory_xact_lock(7263849598301)`); // 'users-phone-migration'
+    await c.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`); // 'users-phone-migration'
+    // REAL write exclusion (security 2026-09-18): blocks application
+    // INSERT/UPDATE/DELETE (ROW EXCLUSIVE) for the whole transaction, so no
+    // writer can slip a collision between preflight and index creation.
+    // Operator quiescence of app writers remains a documented gate.
+    await c.query(`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`);
     const pre = await preflightUsersPhone(c as Connectable);
     if (pre.blocking) return { migrated: false as const, reason: pre.blockingReasons.join('; '), preflight: pre };
     const ids = await normalizeRowsTx(c);
     const mid = await preflightUsersPhone(c as Connectable); // rerun under the same lock
     if (mid.blocking) throw new Error(`maintenance: preflight became blocking mid-transaction: ${mid.blockingReasons.join('; ')}`);
-    await c.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`);
+    await c.query(CANONICAL_INDEX_SQL);
     const fin = await preflightUsersPhone(c as Connectable);
     if (fin.blocking) throw new Error('maintenance: final preflight blocking');
     const idx = await indexState(c);
     if (!idx.existed) throw new Error('maintenance: index missing after creation');
-    return { migrated: true as const, normalized: ids.length, finalPreflight: fin };
+    if (normalizeIndexDef(idx.definition as string) !== CANONICAL_INDEX_NORMALIZED) {
+      throw new Error('maintenance: live index definition is not the canonical shape');
+    }
+    return { migrated: true as const, normalized: ids.length, indexPresent: idx.existed, finalPreflight: fin };
   });
 }
