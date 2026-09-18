@@ -17,6 +17,12 @@ import {
 import { hashPasswordPure } from '../src/auth.js';
 import { scryptSync, timingSafeEqual } from 'node:crypto';
 
+/** Pre-vaulted test credentials (generated per-file, never hardcoded). */
+const CREDS = {
+  adminPassword: `test-admin-${Math.random().toString(36).slice(2)}-pw`,
+  managerPassword: `test-manager-${Math.random().toString(36).slice(2)}-pw`,
+};
+
 const verifyPassword = (password: string, stored: string): boolean => {
   const [salt, hash] = stored.split(':');
   if (!salt || !hash) return false;
@@ -78,26 +84,29 @@ describe('staging synthetic seed', () => {
 
   it('refuses on a non-staging-stamped database', async () => {
     const { pg, conn } = await stagingDb('production-pilot');
-    await expect(runStagingSeed(conn, { marker: '1', emitSecrets: true })).rejects.toThrow(/stamped 'production-pilot'/);
+    await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS })).rejects.toThrow(/stamped 'production-pilot'/);
     await pg.close();
   });
 
-  it('refuses to generate credentials without a capture path', async () => {
+  it('requires pre-vaulted credentials - there is NO generation/emission path', async () => {
     const { pg, conn } = await stagingDb();
-    await expect(runStagingSeed(conn, { marker: '1' })).rejects.toThrow(/capture path/);
+    // @ts-expect-error credentials are required
+    await expect(runStagingSeed(conn, { marker: '1' })).rejects.toThrow();
+    await expect(runStagingSeed(conn, { marker: '1', credentials: { adminPassword: 'short', managerPassword: CREDS.managerPassword } }))
+      .rejects.toThrow(/pre-vaulted admin credential/);
     await pg.close();
   });
 
   it('refuses a dirty database', async () => {
     const { pg, conn } = await stagingDb();
     await conn.query(`INSERT INTO users(user_id, org_id, data) VALUES('someone', 'somewhere', '{}')`);
-    await expect(runStagingSeed(conn, { marker: '1', emitSecrets: true })).rejects.toThrow(/not empty/);
+    await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS })).rejects.toThrow(/not empty/);
     await pg.close();
   });
 
   it('seeds a synthetic, fixture-free dataset with absence proofs and a secret-free inventory', async () => {
     const { pg, conn } = await stagingDb();
-    const r = await runStagingSeed(conn, { marker: '1', emitSecrets: true, forbiddenIdentifiers: ['+972111111111'] });
+    const r = await runStagingSeed(conn, { marker: '1', credentials: CREDS, forbiddenIdentifiers: ['+972111111111'] });
     expect(r.applied).toBe(true);
     const inv = r.inventory;
     expect(inv.seedInstanceId).toMatch(/^stg-seed-[0-9a-f]{12}$/);
@@ -113,17 +122,19 @@ describe('staging synthetic seed', () => {
     for (const g of [inv.orgId, ...inv.userIds, ...inv.emails, ...inv.phones, ...inv.channelAddresses, ...inv.eventIds, ...inv.resourceIds, ...inv.taskIds, ...inv.dependencyIds]) {
       expect(fixtures.has(g), g).toBe(false);
     }
-    // Generated credentials: returned once, never inside the inventory.
-    expect(r.secrets).toHaveLength(2);
+    // Pre-vaulted credentials: never inside the inventory; the result has no
+    // secrets field at all (no emission path exists).
     const invJson = JSON.stringify(inv);
-    for (const s of r.secrets!) {
-      expect(s.value.length).toBeGreaterThanOrEqual(16);
-      expect(invJson).not.toContain(s.value);
-    }
-    // The seeded admin actually authenticates with the generated credential.
+    expect(invJson).not.toContain(CREDS.adminPassword);
+    expect(invJson).not.toContain(CREDS.managerPassword);
+    expect('secrets' in r).toBe(false);
+    // The seeded admin actually authenticates with the pre-vaulted credential.
     const u = await conn.query(`SELECT data FROM users WHERE user_id = $1`, [inv.userIds[0]]);
     const rec = u.rows[0]?.['data'] as { passwordHash?: string };
-    expect(verifyPassword(r.secrets![0]!.value, rec.passwordHash ?? '')).toBe(true);
+    expect(verifyPassword(CREDS.adminPassword, rec.passwordHash ?? '')).toBe(true);
+    // Canonical rerun-integrity manifest: every seeded row, digested.
+    expect(inv.rowDigests).toHaveLength(23);
+    expect(inv.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
     // Whitelist: synthetic worker phones approved for OTP login.
     const wl = await conn.query(`SELECT phone, status FROM whitelist_entries ORDER BY phone`);
     expect(wl.rows).toHaveLength(3);
@@ -133,23 +144,35 @@ describe('staging synthetic seed', () => {
 
   it('re-run is an idempotent no-op bound to the same seed instance', async () => {
     const { pg, conn } = await stagingDb();
-    const r1 = await runStagingSeed(conn, { marker: '1', emitSecrets: true });
-    const r2 = await runStagingSeed(conn, { marker: '1', emitSecrets: true });
+    const r1 = await runStagingSeed(conn, { marker: '1', credentials: CREDS });
+    const r2 = await runStagingSeed(conn, { marker: '1', credentials: CREDS });
     expect(r2.applied).toBe(false);
     expect(r2.alreadyApplied).toBe(true);
     expect(r2.seedInstanceId).toBe(r1.seedInstanceId);
     const n = await conn.query(`SELECT count(*)::int AS n FROM users`);
     expect(Number(n.rows[0]?.['n'])).toBe(5);
+    expect(r2.inventory.manifestSha256).toBe(r1.inventory.manifestSha256);
     await pg.close();
   });
 
-  it('env-supplied pre-vaulted credentials are used and never echoed', async () => {
+  it('rerun integrity: any drift from the seeded manifest is rejected as dirty/foreign', async () => {
+    const { pg, conn } = await stagingDb();
+    await runStagingSeed(conn, { marker: '1', credentials: CREDS });
+    // Drift one seeded row outside the seed transaction.
+    await conn.query(`UPDATE tasks SET data = jsonb_set(data, '{name}', '"mutated"')`);
+    await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS })).rejects.toThrow(/RERUN INTEGRITY/);
+    await pg.close();
+  });
+
+  it('pre-vaulted credentials are used and never echoed anywhere', async () => {
     const { pg, conn } = await stagingDb();
     const r = await runStagingSeed(conn, {
       marker: '1',
       credentials: { adminPassword: 'pre-vaulted-admin-pw-1', managerPassword: 'pre-vaulted-fm-pw-1' },
     });
-    expect(r.secrets).toBeUndefined();
+    expect('secrets' in r).toBe(false);
+    expect(JSON.stringify(r.inventory)).not.toContain('pre-vaulted-admin-pw-1');
+    expect(JSON.stringify(r.inventory)).not.toContain('pre-vaulted-fm-pw-1');
     const u = await conn.query(`SELECT data FROM users WHERE user_id = $1`, [r.inventory.userIds[0]]);
     const rec = u.rows[0]?.['data'] as { passwordHash?: string };
     expect(verifyPassword('pre-vaulted-admin-pw-1', rec.passwordHash ?? '')).toBe(true);
@@ -162,7 +185,7 @@ describe('staging synthetic seed', () => {
     // but is not part of the pre-write identifier set, so the pre-write check
     // passes and the POST-WRITE scan is what fails - after all seed rows were
     // inserted. The single transaction must roll back every one of them.
-    await expect(runStagingSeed(conn, { marker: '1', emitSecrets: true, forbiddenIdentifiers: ['יום סינתטי'] }))
+    await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS, forbiddenIdentifiers: ['יום סינתטי'] }))
       .rejects.toThrow(/POST-WRITE absence proof FAILED/);
     for (const t of ['users', 'channels', 'events', 'tasks', 'resources', 'dependencies', 'whitelist_entries']) {
       const n = await conn.query(`SELECT count(*)::int AS n FROM ${t}`);
@@ -183,11 +206,11 @@ describe('staging synthetic seed', () => {
     };
     const a = await mk();
     const b = await mk();
-    const r1 = await runStagingSeed(a.conn, { marker: '1', emitSecrets: true });
-    const r2 = await runStagingSeed(b.conn, { marker: '1', emitSecrets: true });
+    const r1 = await runStagingSeed(a.conn, { marker: '1', credentials: CREDS });
+    const r2 = await runStagingSeed(b.conn, { marker: '1', credentials: CREDS });
     expect(r1.inventory.orgId).not.toBe(r2.inventory.orgId);
     expect(r1.inventory.phones).not.toEqual(r2.inventory.phones);
-    expect(r1.secrets![0]!.value).not.toBe(r2.secrets![0]!.value);
+    expect(r1.inventory.manifestSha256).not.toBe(r2.inventory.manifestSha256);
     await a.pg.close();
     await b.pg.close();
   });

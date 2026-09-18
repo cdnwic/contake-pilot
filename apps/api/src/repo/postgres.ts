@@ -50,6 +50,9 @@ export function pgliteConnectable(db: { query(text: string, params?: unknown[]):
   return root;
 }
 
+/** FROZEN as migration 0001's artifact (release-migration runner, QA
+ *  2026-09-18): this exact text is hashed into the applied-step integrity
+ *  digest. NEVER edit it - schema changes ship as NEW migration versions. */
 export const GRAPH_DDL = `
 CREATE TABLE IF NOT EXISTS users(user_id text PRIMARY KEY, org_id text NOT NULL, email text, phone text, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS channels(id text PRIMARY KEY, org_id text NOT NULL, address text NOT NULL, data jsonb NOT NULL);
@@ -907,6 +910,7 @@ export function pgDispatchState(db: Queryable): DispatchStateStore {
 
 export type { SeedData };
 
+/** FROZEN as migration 0001's artifact - see GRAPH_DDL warning. */
 export const OTP_DDL = `
 CREATE TABLE IF NOT EXISTS otp_codes(phone text PRIMARY KEY, exp_ms bigint NOT NULL, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS otp_requests(phone text PRIMARY KEY, data jsonb NOT NULL);

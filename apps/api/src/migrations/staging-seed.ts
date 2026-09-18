@@ -1,13 +1,18 @@
-/** Staging-only SYNTHETIC seed (2026-09-18, Chaim-approved synthetic-only
- *  staging scope; architecture: separate idempotent seed, NEVER app startup).
+/** Staging-only SYNTHETIC seed (2026-09-18, synthetic-only staging scope;
+ *  architecture: separate idempotent seed, NEVER app startup; hardened after
+ *  independent QA + security FAIL of f9854cd6).
  *
- *  Why this exists: the repo's demo seeds (seedDemo/campDemoSeed/vertical
- *  seeds) contain PUBLIC fixed passwords, phones and identifiers shipped in a
- *  public repo; the fail-closed hotfix forbids CONTAKE_SEED in any production
- *  boot, and staging runs NODE_ENV=production. Staging data therefore comes
- *  ONLY from this explicit job:
- *  - every credential, phone and ID is generated AT RUNTIME with a CSPRNG
- *    (node:crypto); nothing fixture-derived, nothing hardcoded;
+ *  Why this exists: the repo's demo seeds contain PUBLIC fixed passwords,
+ *  phones and identifiers shipped in a public repo; the fail-closed hotfix
+ *  forbids CONTAKE_SEED in any production boot, and staging runs
+ *  NODE_ENV=production. Staging data therefore comes ONLY from this explicit
+ *  job:
+ *  - every phone and ID is generated AT RUNTIME with a CSPRNG (node:crypto);
+ *    nothing fixture-derived, nothing hardcoded;
+ *  - CREDENTIALS ARE PRE-VAULTED by the operator and arrive via
+ *    opts.credentials; this module NEVER generates, prints, logs, files or
+ *    persists a credential (independent security 2026-09-18: no plaintext
+ *    emission path exists);
  *  - emails live on the guaranteed-non-routable .invalid TLD (RFC 2606) and
  *    phones on the fictional +972-555-xxxxxx pattern;
  *  - ABSENCE PROOFS: the full public-fixture identifier set is derived from
@@ -15,13 +20,11 @@
  *    later is automatically forbidden) and production identifiers arrive via
  *    env (never hardcoded); the generated set AND the final database state
  *    are proven to contain none of them;
- *  - IDEMPOTENT: a staging_seed_state row binds the seed instance; an exact
- *    re-run is a no-op, a dirty or foreign database is refused;
- *  - ONE transaction: any failed gate or proof rolls back EVERYTHING;
- *  - SECRETS: generated credentials leave this module ONLY through the
- *    explicit secrets return (CLI: one-time terminal capture into the vault)
- *    or arrive pre-vaulted via env; they are never written to files,
- *    artifacts, the inventory, or logs. */
+ *  - EXACT RERUN INTEGRITY (independent security): the seed stores a
+ *    canonical per-row digest manifest; a rerun RECOMPUTES the live rows and
+ *    requires exact equality - an exact rerun is a no-op, any drift is
+ *    rejected as dirty/foreign state;
+ *  - ONE transaction: any failed gate or proof rolls back EVERYTHING. */
 import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { PostgresGraphRepository, type Connectable } from '../repo/postgres.js';
 import { applySeed, seedDemo } from '../seed.js';
@@ -91,21 +94,44 @@ export function assertNoForbidden(generated: string[], forbidden: readonly strin
   }
 }
 
+/** Canonical JSON (recursively key-sorted) for stable row digests. */
+export function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(',')}}`;
+}
+
+export const rowDigest = (row: unknown): string => createHash('sha256').update(canonicalJson(row)).digest('hex');
+
+/** Canonical manifest over the ordered (table, pk, digest) row set. */
+export const manifestDigest = (rows: readonly { table: string; pk: string; digest: string }[]): string =>
+  createHash('sha256').update(canonicalJson(rows)).digest('hex');
+
+/** Business tables written by the seed, with their primary-key column, in
+ *  canonical order (rerun-integrity scans use exactly this list). */
+const SEEDED_TABLES: readonly { table: string; pk: string }[] = [
+  { table: 'channels', pk: 'id' },
+  { table: 'dependencies', pk: 'id' },
+  { table: 'events', pk: 'id' },
+  { table: 'resources', pk: 'id' },
+  { table: 'tasks', pk: 'id' },
+  { table: 'users', pk: 'user_id' },
+  { table: 'whitelist_entries', pk: 'phone' },
+];
+
 export interface StagingSeedOptions {
   /** process.env['CONTAKE_STAGING_SEED'] - must be exactly '1'. */
   marker: string | undefined;
   forbiddenIdentifiers?: string[];
-  /** Pre-vaulted credentials (never echoed). When absent, credentials are
-   *  generated here and returned ONCE in the result's secrets field. */
-  credentials?: { adminPassword?: string; managerPassword?: string };
-  /** Must be true when credentials are generated here, so a run never
-   *  produces an uncapturable secret. */
-  emitSecrets?: boolean;
+  /** PRE-VAULTED credentials (REQUIRED; never echoed, generated or persisted
+   *  by this module). */
+  credentials: { adminPassword: string; managerPassword: string };
   now?: () => Date;
 }
 
 export interface StagingInventory {
-  schema: 'contake-staging-inventory/v1';
+  schema: 'contake-staging-inventory/v2';
   seedInstanceId: string;
   deployment: string;
   dbInstanceId: string;
@@ -120,6 +146,9 @@ export interface StagingInventory {
   taskIds: string[];
   dependencyIds: string[];
   counts: Record<string, number>;
+  /** Canonical per-row digests of every seeded row (rerun-integrity proof). */
+  rowDigests: { table: string; pk: string; digest: string }[];
+  manifestSha256: string;
   absenceProof: {
     fixtureIdentifiersChecked: number;
     forbiddenIdentifiersChecked: number;
@@ -134,12 +163,8 @@ export interface StagingSeedResult {
   alreadyApplied: boolean;
   seedInstanceId: string;
   inventory: StagingInventory;
-  /** Present ONLY when credentials were generated here (never for env-supplied
-   *  credentials). CLI prints once for vault capture; nothing else may. */
-  secrets?: { label: string; value: string }[];
 }
 
-const genPassword = (): string => randomBytes(12).toString('base64url'); // 16 chars, CSPRNG
 const rid = (prefix: string): string => `stg-${prefix}-${randomBytes(6).toString('hex')}`;
 
 /** Fictional Israeli-pattern mobile: +972-555-xxxxxx (555 fictional exchange). */
@@ -156,19 +181,33 @@ CREATE TABLE IF NOT EXISTS staging_seed_state(
   id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   seed_instance_id text NOT NULL,
   inventory_sha256 text NOT NULL,
+  manifest_sha256 text NOT NULL,
   applied_at timestamptz NOT NULL DEFAULT now()
 );
 `;
 
-const BUSINESS_TABLES = ['users', 'channels', 'events', 'tasks', 'resources', 'dependencies', 'whitelist_entries'];
+/** Recomputes the canonical row-digest manifest over the LIVE business rows. */
+async function computeLiveManifest(tx: { query(t: string, p?: unknown[]): Promise<{ rows: Record<string, unknown>[] }> }):
+  Promise<{ table: string; pk: string; digest: string }[]> {
+  const rows: { table: string; pk: string; digest: string }[] = [];
+  for (const { table, pk } of SEEDED_TABLES) {
+    const r = await tx.query(`SELECT ${pk}::text AS pk, data FROM ${table} ORDER BY ${pk}`);
+    for (const row of r.rows) {
+      rows.push({ table, pk: String(row['pk']), digest: rowDigest(row['data']) });
+    }
+  }
+  return rows;
+}
 
 export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions): Promise<StagingSeedResult> {
   if (opts.marker !== '1') {
     throw new Error("seed:staging: CONTAKE_STAGING_SEED=1 is required - this job never runs implicitly and never at app startup (fail-closed)");
   }
-  const usingEnvCredentials = Boolean(opts.credentials?.adminPassword && opts.credentials?.managerPassword);
-  if (!usingEnvCredentials && opts.emitSecrets !== true) {
-    throw new Error('seed:staging: refusing to generate credentials without an explicit capture path (emitSecrets) - a generated secret must never be silently discarded');
+  const { adminPassword, managerPassword } = opts.credentials ?? {};
+  for (const [label, pw] of [['admin', adminPassword], ['manager', managerPassword]] as const) {
+    if (typeof pw !== 'string' || pw.length < 16) {
+      throw new Error(`seed:staging: pre-vaulted ${label} credential is required (>= 16 chars) - this job never generates credentials (fail-closed)`);
+    }
   }
 
   const fixtureForbidden = deriveFixtureIdentifiers();
@@ -199,10 +238,18 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
 
     for (const stmt of STATE_DDL.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
 
-    // Gate 3: idempotent re-run OR newly initialized empty DB; nothing else.
-    const state = await client.query(`SELECT seed_instance_id, inventory_sha256 FROM staging_seed_state WHERE id = 1`);
+    // Gate 3: EXACT rerun (canonical live-row digests must match the stored
+    // manifest) or newly initialized empty DB; anything else is dirty/foreign.
+    const state = await client.query(`SELECT seed_instance_id, inventory_sha256, manifest_sha256 FROM staging_seed_state WHERE id = 1`);
     if (state.rows[0]) {
-      // Exact re-run proof: the seeded org still exists, no second seed.
+      const live = await computeLiveManifest(client);
+      const liveManifest = manifestDigest(live);
+      if (liveManifest !== String(state.rows[0]['manifest_sha256'])) {
+        throw new Error(
+          'seed:staging: RERUN INTEGRITY refusal - live rows no longer match the seeded canonical manifest ' +
+          '(drift/dirty/foreign state; investigate or rebuild the staging database) - rolling back',
+        );
+      }
       const org = await client.query(`SELECT org_id FROM users LIMIT 1`);
       await client.query('COMMIT');
       return {
@@ -210,7 +257,7 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
         alreadyApplied: true,
         seedInstanceId: String(state.rows[0]['seed_instance_id']),
         inventory: {
-          schema: 'contake-staging-inventory/v1',
+          schema: 'contake-staging-inventory/v2',
           seedInstanceId: String(state.rows[0]['seed_instance_id']),
           deployment: identity.deploymentLabel,
           dbInstanceId: identity.instanceId,
@@ -219,28 +266,28 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
           userIds: [], emails: [], phones: [], channelAddresses: [],
           eventIds: [], resourceIds: [], taskIds: [], dependencyIds: [],
           counts: {},
+          rowDigests: live,
+          manifestSha256: liveManifest,
           absenceProof: {
             fixtureIdentifiersChecked: fixtureForbidden.length,
             forbiddenIdentifiersChecked: envForbidden.length,
             collisions: [],
-            method: 'idempotent re-run: original post-seed proof stands; staging_seed_state intact',
+            method: 'exact rerun: live canonical row digests recomputed and verified equal to the stored manifest',
           },
           inventorySha256: String(state.rows[0]['inventory_sha256']),
         },
       };
     }
-    for (const t of BUSINESS_TABLES) {
-      const c = await client.query(`SELECT count(*)::int AS n FROM ${t}`);
+    for (const { table } of SEEDED_TABLES) {
+      const c = await client.query(`SELECT count(*)::int AS n FROM ${table}`);
       if (Number(c.rows[0]?.['n'] ?? 0) > 0) {
-        throw new Error(`seed:staging: table ${t} is not empty and no staging_seed_state exists - refusing to seed a database with pre-existing data (fail-closed)`);
+        throw new Error(`seed:staging: table ${table} is not empty and no staging_seed_state exists - refusing to seed a database with pre-existing data (fail-closed)`);
       }
     }
 
     // Generate the synthetic dataset (CSPRNG; no fixture identifiers).
     const orgId = rid('org');
     const taken = new Set<string>(forbidden);
-    const adminPw = opts.credentials?.adminPassword ?? genPassword();
-    const managerPw = opts.credentials?.managerPassword ?? genPassword();
     const adminId = rid('admin');
     const fmId = rid('fm');
     const workers = [0, 1, 2].map(i => ({
@@ -267,8 +314,8 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
     const seed: SeedData = {
       orgId,
       users: [
-        { userId: adminId, orgId, name: 'מנהל סינתטי', role: 'admin', scopes: [], email: emails[0], passwordHash: hashPasswordPure(adminPw), active: true },
-        { userId: fmId, orgId, name: 'רכז סינתטי', role: 'field_manager', scopes: [{ eventId, siteId }], email: emails[1], passwordHash: hashPasswordPure(managerPw), active: true },
+        { userId: adminId, orgId, name: 'מנהל סינתטי', role: 'admin', scopes: [], email: emails[0], passwordHash: hashPasswordPure(adminPassword), active: true },
+        { userId: fmId, orgId, name: 'רכז סינתטי', role: 'field_manager', scopes: [{ eventId, siteId }], email: emails[1], passwordHash: hashPasswordPure(managerPassword), active: true },
         ...workers.map(w => ({
           userId: w.userId, orgId, name: w.name, role: 'focus_worker' as const,
           scopes: [{ eventId }], linkedResourceId: w.resourceId, phone: w.phone, active: true,
@@ -308,12 +355,7 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
       ...channels.flatMap(c => [c.id, c.address]),
       ...seed.resources.map(r => r.id), ...taskIds, ...seed.dependencies.map(d => d.id),
     ];
-    assertNoForbidden(generatedIds, [...forbidden]);
-    // Generated credentials are 16-char CSPRNG base64url: a collision with any
-    // public fixture plaintext is impossible by construction; assert shape.
-    for (const pw of [adminPw, managerPw]) {
-      if (pw.length < 16) throw new Error('seed:staging: generated credential below minimum length - refusing');
-    }
+    assertNoForbidden(generatedIds, forbiddenArr);
 
     // Apply through the repository contract (same semantics as the app).
     const repo = PostgresGraphRepository.connect(txConn);
@@ -351,8 +393,12 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
       throw new Error(`seed:staging: POST-WRITE absence proof FAILED - forbidden identifiers present: ${collisions.join(', ')} (rolling back)`);
     }
 
+    // Canonical row-digest manifest (rerun integrity) over the live written rows.
+    const rowDigests = await computeLiveManifest(client);
+    const manifestSha256 = manifestDigest(rowDigests);
+
     const inventoryBody: Omit<StagingInventory, 'inventorySha256'> = {
-      schema: 'contake-staging-inventory/v1',
+      schema: 'contake-staging-inventory/v2',
       seedInstanceId: rid('seed'),
       deployment: identity.deploymentLabel,
       dbInstanceId: identity.instanceId,
@@ -371,11 +417,13 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
         resources: seed.resources.length, tasks: seed.tasks.length,
         dependencies: seed.dependencies.length, whitelist: workers.length,
       },
+      rowDigests,
+      manifestSha256,
       absenceProof: {
         fixtureIdentifiersChecked: fixtureForbidden.length,
         forbiddenIdentifiersChecked: envForbidden.length,
         collisions: [],
-        method: 'pre-write set intersection + post-write per-table equality and jsonb substring scan over the derived fixture identifier set and env-supplied production identifiers',
+        method: 'pre-write set intersection + post-write per-table equality and boundary-aware jsonb scan over the derived fixture identifier set and env-supplied production identifiers',
       },
     };
     const inventorySha256 = createHash('sha256').update(JSON.stringify(inventoryBody)).digest('hex');
@@ -383,28 +431,17 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
 
     // Final secret-hygiene guard: the inventory must NEVER carry a credential.
     const invJson = JSON.stringify(inventory);
-    for (const pw of [adminPw, managerPw]) {
+    for (const pw of [adminPassword, managerPassword]) {
       if (invJson.includes(pw)) throw new Error('seed:staging: inventory would contain a credential - refusing (rolling back)');
     }
 
     await client.query(
-      `INSERT INTO staging_seed_state(id, seed_instance_id, inventory_sha256) VALUES(1, $1, $2)`,
-      [inventory.seedInstanceId, inventory.inventorySha256],
+      `INSERT INTO staging_seed_state(id, seed_instance_id, inventory_sha256, manifest_sha256) VALUES(1, $1, $2, $3)`,
+      [inventory.seedInstanceId, inventory.inventorySha256, manifestSha256],
     );
     await client.query('COMMIT');
 
-    const result: StagingSeedResult = {
-      applied: true, alreadyApplied: false,
-      seedInstanceId: inventory.seedInstanceId,
-      inventory,
-    };
-    if (!usingEnvCredentials) {
-      result.secrets = [
-        { label: `staging admin (${emails[0]})`, value: adminPw },
-        { label: `staging field manager (${emails[1]})`, value: managerPw },
-      ];
-    }
-    return result;
+    return { applied: true, alreadyApplied: false, seedInstanceId: inventory.seedInstanceId, inventory };
   } catch (e) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw e;

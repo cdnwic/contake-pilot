@@ -2,40 +2,48 @@
  *
  *  Usage:
  *    DATABASE_URL=<direct schema-owner url> \
- *      pnpm --filter @contake/api migrate:release -- --deployment <label> [--by <actor>]
+ *      pnpm --filter @contake/api migrate:release -- \
+ *        --deployment <label> --expect-host <host> --expect-db <db> [--by <actor>]
  *
- *  - Requires the DIRECT endpoint ('-pooler' hosts are refused: pooled is the
- *    runtime role). DATABASE_URL is never printed; only host/database.
- *  - --deployment must match the database's stamped identity (first run stamps
- *    it). Staging uses `--deployment staging`.
- *  - Forward-only: unknown/gapped history refuses; nothing is ever skipped.
- *  - Runs zero seeding. Boot verifies versions via assertSchemaCurrent. */
+ *  Security contract (independent review, 2026-09-18):
+ *  - closed parser: unknown/duplicate/bare/missing flags are rejected;
+ *  - ONE deliberate URL source (--database-url XOR env);
+ *  - the OPERATOR-PROVISIONED TARGET TUPLE (--expect-host/--expect-db) must
+ *    match the URL AND the actually-connected database BEFORE any DDL;
+ *  - the deployment label must match the database's stamped identity (first
+ *    run stamps it); staging uses `--deployment staging`;
+ *  - requires the DIRECT endpoint ('-pooler' hosts are refused: pooled is the
+ *    runtime role); DATABASE_URL is never printed;
+ *  - forward-only + applied-step integrity digests; runs zero seeding. */
 import { runMigrations, assertDirectDatabaseUrl } from './runner.js';
+import { parseCliArgs, resolveDatabaseUrl, validateActor } from './cli-args.js';
 
-const arg = (name: string): string | undefined => {
-  const i = process.argv.indexOf(name);
-  return i >= 0 ? process.argv[i + 1] : undefined;
-};
-
-const databaseUrl = arg('--database-url') ?? process.env['DATABASE_URL'];
-if (!databaseUrl) {
-  console.error('release-migrations: DATABASE_URL (or --database-url) is required - direct schema-owner endpoint, never logged');
-  process.exit(2);
-}
-const deployment = arg('--deployment');
-if (!deployment) {
-  console.error('release-migrations: --deployment <label> is required (e.g. staging, production-pilot) and must match the stamped database identity');
-  process.exit(2);
-}
-const appliedBy = arg('--by') ?? 'release-job';
+const args = parseCliArgs(process.argv.slice(2), {
+  required: ['--deployment', '--expect-host', '--expect-db'],
+  optional: ['--by', '--database-url'],
+});
+const databaseUrl = resolveDatabaseUrl(args['--database-url'], process.env['DATABASE_URL']);
+const appliedBy = validateActor(args['--by'] ?? 'release-job');
 
 const target = assertDirectDatabaseUrl(databaseUrl); // throws on pooled/invalid
-console.log(`release-migrations: target ${target.host}/${target.database} deployment=${deployment} by=${appliedBy}`);
+if (target.host !== args['--expect-host'] || target.database !== args['--expect-db']) {
+  console.error(
+    `release-migrations: TARGET TUPLE mismatch - operator expected ${args['--expect-host']}/${args['--expect-db']} ` +
+    `but the URL resolves to ${target.host}/${target.database}. Refusing before any connection (fail-closed).`,
+  );
+  process.exit(2);
+}
+console.log(`release-migrations: target ${target.host}/${target.database} deployment=${args['--deployment']} by=${appliedBy}`);
 
 const { Pool } = await import('pg');
 const pool = new Pool({ connectionString: databaseUrl });
 try {
-  const result = await runMigrations(pool, { deployment, appliedBy });
+  // Bind the ACTUALLY-CONNECTED database to the expected tuple before any DDL.
+  const c = await pool.query(`SELECT current_database() AS db, inet_server_port() AS port`);
+  if (String(c.rows[0]?.['db']) !== args['--expect-db']) {
+    throw new Error(`release-migrations: connected database '${String(c.rows[0]?.['db'])}' is not the expected '${args['--expect-db']}' - refusing (fail-closed)`);
+  }
+  const result = await runMigrations(pool, { deployment: args['--deployment']!, appliedBy });
   console.log(JSON.stringify({
     ok: true,
     deployment: result.identity.deploymentLabel,
