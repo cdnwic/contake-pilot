@@ -79,108 +79,350 @@ const ARTIFACT_ALLOWLIST: ReadonlySet<string> = new Set([
   'comment', 'insert', 'update', 'delete',
 ]);
 
-/** PURE-FUNCTION allowlist (independent QA, 2026-09-18): the ONLY function
- *  calls permitted anywhere inside a migration artifact. Immutable string/
- *  math/logic helpers needed by declarative DDL+DML (SA's canonical index
- *  uses btrim). Everything else - side-effecting, volatile, session, lock,
- *  config, sequence, system - is rejected by absence from this list. This is
- *  an allowlist, not a growing forbidden-list. */
-const PURE_FUNCTION_ALLOWLIST: ReadonlySet<string> = new Set([
-  'btrim', 'trim', 'ltrim', 'rtrim', 'lower', 'upper', 'length', 'char_length',
-  'character_length', 'coalesce', 'nullif', 'replace', 'substring', 'left',
-  'right', 'concat', 'concat_ws', 'abs', 'round', 'floor', 'ceil', 'ceiling',
-  'greatest', 'least',
-  // STABLE timestamp for declarative column DEFAULTs (schema_migrations,
-  // auth_audit) - transaction-consistent, non-side-effecting, no system or
-  // session capability.
-  'now',
+/** SEMANTIC LAYER (TL architecture ruling + security closures, 2026-09-18 -
+ *  replaces every syntactic name allowlist):
+ *  1. The migration session runs with search_path PINNED EMPTY; pg_catalog is
+ *     implicitly searched first, so unqualified built-ins resolve to
+ *     pg_catalog and NOTHING ELSE can be shadowed in.
+ *  2. Every artifact identifier is canonically FULLY QUALIFIED by the runner:
+ *     relation names to the controlled schema 'public', function calls to
+ *     'pg_catalog'. A caller-supplied schema other than the controlled one
+ *     (attacker.lower, public.btrim for a function) is REFUSED - resolution
+ *     is provably impossible outside {public, pg_catalog}.
+ *  3. RECURSIVELY CLOSED shapes: no WITH/CTEs anywhere, no nested SELECT
+ *     (subqueries) anywhere, no code/object-bearing statements (function/
+ *     procedure/operator/cast/trigger/rule/aggregate/type/DO/CALL/COPY /
+ *     owner/security-definer) - the statement allowlist plus an explicit
+ *     ALTER-action allowlist close these.
+ *  4. Runner-owned CATALOG SNAPSHOTS before/after every step assert ZERO
+ *     delta of functions/operators/casts/triggers/rules; any delta rolls the
+ *     step back. Execution is digest-bound to the canonical qualified
+ *     serialization that actually runs. */
+const CONTROLLED_SCHEMA = 'public';
+const CATALOG_SCHEMA = 'pg_catalog';
+
+/** CTL-DDL-CONFINEMENT condition 4: extensions that give in-transaction code
+ *  an external side-effect channel (remote writes, filesystem, untrusted
+ *  languages) break rollback containment and are refused at the baseline. */
+const SIDE_EFFECT_EXTENSIONS: ReadonlySet<string> = new Set([
+  'dblink', 'postgres_fdw', 'file_fdw', 'plpythonu', 'plpython3u', 'plpython2u',
+  'plperlu', 'pltclu', 'pljava', 'plr', 'http', 'pg_cron', 'aws_s3',
 ]);
 
-/** Recursively collects function call names from an AST (parser-normalized:
- *  quoted identifiers and schema qualification resolve to the same shape). */
-function collectCalls(node: unknown, acc: string[]): void {
+/** Exact-shape name node: {name: string} or {name, schema} and nothing else. */
+const isNameNode = (o: Record<string, unknown>): boolean => {
+  const keys = Object.keys(o).sort();
+  return typeof o['name'] === 'string' &&
+    (keys.length === 1 || (keys.length === 2 && keys[1] === 'schema' && typeof o['schema'] === 'string'));
+};
+
+/** ALTER TABLE actions that remain declarative schema evolution. OWNER,
+ *  SET SCHEMA, trigger/constraint-creation of code objects and everything
+ *  else is refused. */
+const ALTER_ACTION_ALLOWLIST: ReadonlySet<string> = new Set([
+  'add column', 'drop column', 'alter column', 'rename column',
+  'add constraint', 'drop constraint', 'rename constraint', 'rename table',
+]);
+
+function artifactRefusal(why: string): never {
+  throw new Error(`release-migrations: ARTIFACT refusal - ${why}`);
+}
+
+/** Qualifies one relation name node to the controlled schema (fail-closed). */
+function qualifyRelation(n: unknown, ctx: string): void {
+  if (!n || typeof n !== 'object' || !isNameNode(n as Record<string, unknown>)) {
+    artifactRefusal(`unexpected relation shape in ${ctx} (closed AST shapes only)`);
+  }
+  const o = n as { name: string; schema?: string };
+  const schema = o.schema ?? CONTROLLED_SCHEMA;
+  if (schema !== CONTROLLED_SCHEMA) {
+    artifactRefusal(`relation "${schema}"."${o.name}" in ${ctx} is outside the controlled schema '${CONTROLLED_SCHEMA}' - every identifier must resolve to ${CONTROLLED_SCHEMA} (search_path is pinned empty)`);
+  }
+  o.schema = CONTROLLED_SCHEMA;
+}
+
+/** Recursively closes expression shapes and qualifies every function call to
+ *  pg_catalog. Refuses CTEs, nested SELECTs/subqueries and any non-pg_catalog
+ *  call target (attacker.lower can never resolve). */
+function closeExpressions(node: unknown): void {
   if (!node || typeof node !== 'object') return;
-  if (Array.isArray(node)) { for (const n of node) collectCalls(n, acc); return; }
+  if (Array.isArray(node)) { for (const n of node) closeExpressions(n); return; }
   const o = node as Record<string, unknown>;
+  if (o['type'] === 'select') artifactRefusal('nested SELECT/subquery is not a permitted artifact shape');
+  if (o['with'] !== undefined) artifactRefusal('WITH/CTE is not a permitted artifact shape');
+  if (o['securityDefiner'] !== undefined || o['security'] !== undefined) artifactRefusal('SECURITY DEFINER is not a permitted artifact shape');
   if (o['type'] === 'call') {
-    const fn = o['function'] as { name?: string } | undefined;
-    if (fn?.name) acc.push(fn.name.toLowerCase());
+    const fn = o['function'] as Record<string, unknown>;
+    if (!fn || !isNameNode(fn)) artifactRefusal('unexpected function-call shape (closed AST shapes only)');
+    const f = fn as { name: string; schema?: string };
+    const schema = f.schema ?? CATALOG_SCHEMA;
+    if (schema !== CATALOG_SCHEMA) {
+      artifactRefusal(`function call "${schema}"."${f.name}" targets a non-pg_catalog schema - with search_path pinned empty only pg_catalog functions can resolve`);
+    }
+    f.schema = CATALOG_SCHEMA;
   }
-  for (const v of Object.values(o)) collectCalls(v, acc);
+  for (const [k, v] of Object.entries(o)) {
+    if (k === 'name' || k === 'schema') continue; // handled at their owning nodes
+    closeExpressions(v);
+  }
 }
 
-const IDENT = /^[a-z_][a-z0-9_]{0,62}$/i;
+/** Canonicalizes one parsed statement: closed shapes + fully qualified
+ *  identifiers, in place. The re-serialized result is what executes AND what
+ *  the digest binds. */
+function canonicalizeStatement(st: Record<string, unknown>): void {
+  const t = String(st['type']);
+  if (!ARTIFACT_ALLOWLIST.has(t)) {
+    artifactRefusal(`statement type '${t}' is not declarative DDL+DML (allowed: ${[...ARTIFACT_ALLOWLIST].join(', ')}; code/object-bearing statements, transaction control, SELECT/CALL/DO and locks are runner-owned or forbidden)`);
+  }
+  // CTL-DDL-CONFINEMENT condition 1: rollback equals prevention ONLY inside
+  // one transaction - every non-transactional class is refused outright.
+  if (st['concurrently']) {
+    artifactRefusal(`'${t} CONCURRENTLY' is non-transactional - it cannot roll back, so it can never run inside a governed step`);
+  }
+  switch (t) {
+    case 'create table': qualifyRelation(st['name'], 'CREATE TABLE'); break;
+    case 'create index':
+      qualifyRelation(st['table'], 'CREATE INDEX ... ON');
+      break;
+    case 'alter table': {
+      qualifyRelation(st['table'], 'ALTER TABLE');
+      const changes = st['changes'];
+      if (!Array.isArray(changes)) artifactRefusal('unexpected ALTER TABLE shape');
+      for (const a of changes as Record<string, unknown>[]) {
+        if (!ALTER_ACTION_ALLOWLIST.has(String(a['type']))) {
+          artifactRefusal(`ALTER TABLE action '${String(a['type'])}' is not in the closed declarative set (no OWNER/SET SCHEMA/code-object actions)`);
+        }
+      }
+      break;
+    }
+    case 'drop table': for (const n of (st['names'] ?? []) as unknown[]) qualifyRelation(n, 'DROP TABLE'); break;
+    case 'drop index': for (const n of (st['names'] ?? []) as unknown[]) qualifyRelation(n, 'DROP INDEX'); break;
+    case 'comment': {
+      const on = st['on'] as Record<string, unknown> | undefined;
+      if (on && (on['type'] === 'table' || on['type'] === 'column')) qualifyRelation(on['name'], 'COMMENT ON');
+      break;
+    }
+    case 'insert': qualifyRelation(st['into'], 'INSERT INTO'); break;
+    case 'update': qualifyRelation(st['table'], 'UPDATE'); break;
+    case 'delete': qualifyRelation(st['from'], 'DELETE FROM'); break;
+    default: break; // drop index carries no relation schema
+  }
+  closeExpressions(st);
+}
 
-/** Registration-time artifact gate: real-parser AST allowlist. Throws
- *  (fail-closed) on unparseable text, non-declarative statement types,
- *  transaction control, or forbidden function calls. */
-export function validateMigrationArtifact(sql: string): void {
-  let stmts: { type: string }[];
+/** Registration-time artifact gate + canonicalizer (one object): parses with
+ *  the real parser (fail-closed on garbage), closes shapes recursively and
+ *  fully qualifies every identifier. Returns the canonical executed
+ *  serializations - one per driver call. Execution runs EXACTLY these and the
+ *  digest hashes EXACTLY their join. */
+export function artifactStatements(sql: string): string[] {
+  let stmts: Record<string, unknown>[];
   try {
-    stmts = parseSql(sql) as { type: string }[];
+    stmts = parseSql(sql) as unknown as Record<string, unknown>[];
   } catch (e) {
-    throw new Error(`release-migrations: ARTIFACT refusal - unparsable SQL (fail-closed): ${(e as Error).message.split('\n')[0]}`);
+    artifactRefusal(`unparsable SQL (fail-closed): ${(e as Error).message.split('\n')[0]}`);
   }
-  if (stmts.length === 0) throw new Error('release-migrations: ARTIFACT refusal - empty artifact');
-  for (const s of stmts) {
-    if (!ARTIFACT_ALLOWLIST.has(s.type)) {
-      throw new Error(
-        `release-migrations: ARTIFACT refusal - statement type '${s.type}' is not declarative DDL+DML ` +
-        `(allowed: ${[...ARTIFACT_ALLOWLIST].join(', ')}; transaction control, SELECT/CALL/DO and locks are runner-owned or forbidden)`,
-      );
+  if (stmts.length === 0) artifactRefusal('empty artifact');
+  for (const st of stmts) canonicalizeStatement(st);
+  return stmts.map(st => toSql.statement(st as never));
+}
+export const canonicalArtifactSql = (sql: string): string => artifactStatements(sql).join(';\n');
+export function validateMigrationArtifact(sql: string): void {
+  artifactStatements(sql); // throws on any refusal; validation IS canonicalization
+}
+
+/** Runner-owned CATALOG SNAPSHOT assertion (TL semantic layer): the identity
+ *  set of user functions/operators/casts/triggers/rules visible to the
+ *  migration role. A step must produce ZERO delta; any delta rolls the step
+ *  back, so no artifact can leave code/objects behind even through a parser
+ *  blind spot. Extension-owned and catalog objects are excluded. */
+const CATALOG_SNAPSHOT_SQL = `
+SELECT id FROM (
+  -- ABSOLUTE code/security classes: any delta is a violation.
+  SELECT 'function:' || n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' ||
+         ':secdef=' || p.prosecdef AS id
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+     AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid)
+  UNION ALL
+  SELECT 'operator:' || n.nspname || '.' || o.oprname
+    FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace
+   WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'opclass:' || n.nspname || '.' || c.opcname
+    FROM pg_opclass c JOIN pg_namespace n ON n.oid = c.opcnamespace
+   WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'cast:' || c.castsource::regclass::text || '->' || c.casttarget::regclass::text
+    FROM pg_cast c
+   WHERE c.castfunc <> 0
+     AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                      WHERE p.oid = c.castfunc AND n.nspname LIKE 'pg\\_%' ESCAPE '\\')
+  UNION ALL
+  SELECT 'trigger:' || t.tgrelid::regclass::text || '.' || t.tgname FROM pg_trigger t WHERE NOT t.tgisinternal
+  UNION ALL
+  SELECT 'rule:' || r.ev_class::regclass::text || '.' || r.rulename FROM pg_rewrite r WHERE r.rulename <> '_RETURN'
+  UNION ALL
+  SELECT 'extension:' || e.extname FROM pg_extension e
+  UNION ALL
+  SELECT 'event_trigger:' || et.evtname FROM pg_event_trigger et
+  UNION ALL
+  SELECT 'policy:' || pol.polrelid::regclass::text || '.' || pol.polname || ':' || coalesce(pol.polqual::text, '') || ':' || coalesce(pol.polwithcheck::text, '')
+    FROM pg_policy pol
+  UNION ALL
+  SELECT 'default_acl:' || d.defaclrole::regrole::text || ':' || d.defaclnamespace::regnamespace::text || ':' || d.defaclobjtype::text || ':' || coalesce(d.defaclacl::text, '')
+    FROM pg_default_acl d
+  UNION ALL
+  SELECT 'role_setting:' || s.setdatabase::regclass::text || ':' || s.setrole::regclass::text || ':' || coalesce(s.setconfig::text, '')
+    FROM pg_db_role_setting s
+  UNION ALL
+  -- VALUE-CHANGE maps on PRE-EXISTING objects: ownership and ACL drift on
+  -- objects that existed before the step (new data objects are legal).
+  SELECT 'owner:rel:' || c.oid::text || ':' || c.relowner::regrole::text
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'owner:nsp:' || n.oid::text || ':' || n.nspowner::regrole::text
+    FROM pg_namespace n WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'acl:rel:' || c.oid::text || ':' || coalesce(c.relacl::text, '')
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+  UNION ALL
+  SELECT 'acl:nsp:' || n.oid::text || ':' || coalesce(n.nspacl::text, '')
+    FROM pg_namespace n WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND n.nspname <> 'information_schema'
+  UNION ALL
+  -- Non-transactional state: sequence values NEVER roll back (condition 6).
+  -- Keyed by sequence name so a step-created sequence is excluded by the
+  -- new-object filter below; a value drift on a PRE-EXISTING sequence is caught.
+  SELECT 'seqval:' || seq.schemaname || '.' || seq.sequencename || ':' || coalesce(seq.last_value::text, 'unused')
+    FROM pg_sequences seq
+   WHERE seq.schemaname NOT LIKE 'pg\\_%' ESCAPE '\\' AND seq.schemaname <> 'information_schema'
+) objs ORDER BY 1`;
+
+export async function catalogSnapshot(conn: Queryable): Promise<string[]> {
+  const r = await conn.query(CATALOG_SNAPSHOT_SQL);
+  return r.rows.map(row => String(row['id']));
+}
+
+/** CTL-DDL-CONFINEMENT condition 6: sequence values are NON-TRANSACTIONAL -
+ *  rollback never restores them. The runner captures pre-step sequence state
+ *  and ACTIVELY RESTORES any drifted value after rolling a step back, then
+ *  hard-fails; restoration (not just detection) is what makes the step's
+ *  aftermath exactly equal. */
+interface SeqVal { lastValue: string; isCalled: boolean }
+async function sequenceValues(conn: Queryable): Promise<Map<string, SeqVal>> {
+  const seqs = await conn.query(
+    `SELECT schemaname, sequencename FROM pg_sequences WHERE schemaname NOT LIKE 'pg\\_%' ESCAPE '\\' AND schemaname <> 'information_schema'`,
+  );
+  const m = new Map<string, SeqVal>();
+  for (const r of seqs.rows) {
+    const sch = String(r['schemaname']); const seq = String(r['sequencename']);
+    const v = await conn.query(`SELECT last_value::text AS lv, is_called AS ic FROM "${sch}"."${seq}"`);
+    m.set(`${sch}.${seq}`, { lastValue: String(v.rows[0]?.['lv']), isCalled: Boolean(v.rows[0]?.['ic']) });
+  }
+  return m;
+}
+async function restoreSequenceValues(conn: Queryable, before: Map<string, SeqVal>): Promise<string[]> {
+  const now = await sequenceValues(conn);
+  const restored: string[] = [];
+  for (const [name, bv] of before) {
+    const nv = now.get(name);
+    if (nv && (nv.lastValue !== bv.lastValue || nv.isCalled !== bv.isCalled)) {
+      const [sch, seq] = name.split('.') as [string, string];
+      await conn.query(`SELECT pg_catalog.setval('"${sch}"."${seq}"', $1, $2)`, [Number(bv.lastValue), bv.isCalled]);
+      restored.push(name);
     }
   }
-  // Closed recursive grammar: every function call anywhere in the AST
-  // (expressions, defaults, index predicates, DML bodies, CTEs) must be a
-  // pure allowlisted function. SELECT/DO/CALL/UDF/extension statement types
-  // are already excluded above; this closes what remains.
-  const calls: string[] = [];
-  collectCalls(stmts, calls);
-  for (const c of calls) {
-    if (!PURE_FUNCTION_ALLOWLIST.has(c)) {
-      throw new Error(
-        `release-migrations: ARTIFACT refusal - function call '${c}' is not in the pure-function allowlist ` +
-        `(declarative artifacts carry no side-effecting/volatile/session calls)`,
-      );
-    }
+  return restored;
+}
+
+/** Absolute classes: ANY delta (add or remove) is a violation - a governed
+ *  step never creates, alters, or drops code/security objects. Value-map
+ *  classes (owner:/acl:/seqval:): only a VALUE change on an object present in
+ *  BOTH snapshots is a violation; entries appearing/disappearing with
+ *  created/dropped data objects are legal declarative DDL. */
+const ABSOLUTE_PREFIX = /^(function|operator|opclass|cast|trigger|rule|extension|event_trigger|policy|default_acl|role_setting):/;
+const valueKey = (id: string): string => id.slice(0, id.lastIndexOf(':'));
+
+export function assertZeroCatalogDelta(before: string[], after: string[], version: string): void {
+  const violations: string[] = [];
+  const bAbs = new Set(before.filter(x => ABSOLUTE_PREFIX.test(x)));
+  const aAbs = new Set(after.filter(x => ABSOLUTE_PREFIX.test(x)));
+  for (const x of after) if (ABSOLUTE_PREFIX.test(x) && !bAbs.has(x)) violations.push(`added ${x}`);
+  for (const x of before) if (ABSOLUTE_PREFIX.test(x) && !aAbs.has(x)) violations.push(`removed ${x}`);
+  const bVal = new Map(before.filter(x => !ABSOLUTE_PREFIX.test(x)).map(x => [valueKey(x), x]));
+  const aVal = new Map(after.filter(x => !ABSOLUTE_PREFIX.test(x)).map(x => [valueKey(x), x]));
+  for (const [k, bv] of bVal) {
+    const av = aVal.get(k);
+    if (av !== undefined && av !== bv) violations.push(`changed ${bv} -> ${av}`);
+  }
+  if (violations.length > 0) {
+    throw new Error(
+      `release-migrations: CATALOG DELTA refusal - step '${version}' changed the database code/privilege/ownership ` +
+      `surface inside its transaction (${violations.join('; ')}). CTL-DDL-CONFINEMENT: zero function/operator/opclass/` +
+      `cast/trigger/rule/extension/event-trigger/policy/default-ACL/role-setting deltas and zero ownership/ACL/` +
+      `sequence-value drift on pre-existing objects are permitted - rolling back BEFORE COMMIT (fail-closed)`,
+    );
   }
 }
 
-/** Validates a named guard's identifiers and returns the runner-GENERATED
- *  guard SQL. Identifiers are validated and double-quoted by the runner;
- *  every other byte of the generated statement is a fixed runner template. */
+/** STRICT guard-object validation (independent security, 2026-09-18): exact
+ *  own-key sets per kind, exact enums/booleans, canonical identifiers -
+ *  validated BEFORE digest and BEFORE execution, so neither a smuggled key
+ *  nor a coerced value can ride through either path. */
+const IDENT_STRICT = /^[a-z_][a-z0-9_]{0,62}$/;
+function strictIdent(v: unknown, what: string): string {
+  if (typeof v !== 'string' || !IDENT_STRICT.test(v)) {
+    throw new Error(`release-migrations: invalid assertion ${what} ${JSON.stringify(v)} (canonical identifier required)`);
+  }
+  return v;
+}
+function strictKeys(a: object, allowed: readonly string[], kind: string): void {
+  const keys = Object.keys(a);
+  for (const k of keys) {
+    if (!allowed.includes(k)) throw new Error(`release-migrations: assertion kind '${kind}' carries unexpected key ${JSON.stringify(k)} (exact own-key set required)`);
+  }
+}
+
+/** Validates a named guard and returns the runner-GENERATED guard SQL.
+ *  Identifiers are strictly validated and double-quoted by the runner; every
+ *  other byte of the generated statement is a fixed runner template with
+ *  fully-qualified relations and pg_catalog functions. */
 export function buildAssertionQuery(a: MigrationAssertion): string {
+  if (!a || typeof a !== 'object') throw new Error('release-migrations: assertion must be an object');
   switch (a.kind) {
     case 'table-empty': {
-      if (!IDENT.test(a.table)) throw new Error(`release-migrations: invalid assertion table ${JSON.stringify(a.table)}`);
-      return `SELECT 1 AS violation FROM "${a.table}" LIMIT 1`;
+      strictKeys(a, ['kind', 'table'], a.kind);
+      const t = strictIdent(a.table, 'table');
+      return `SELECT 1 AS violation FROM "${CONTROLLED_SCHEMA}"."${t}" LIMIT 1`;
     }
     case 'no-nulls': {
-      if (!IDENT.test(a.table) || !IDENT.test(a.column)) throw new Error('release-migrations: invalid assertion identifier');
-      return `SELECT 1 AS violation FROM "${a.table}" WHERE "${a.column}" IS NULL LIMIT 1`;
+      strictKeys(a, ['kind', 'table', 'column'], a.kind);
+      const t = strictIdent(a.table, 'table'); const c = strictIdent(a.column, 'column');
+      return `SELECT 1 AS violation FROM "${CONTROLLED_SCHEMA}"."${t}" WHERE "${c}" IS NULL LIMIT 1`;
     }
     case 'no-duplicates': {
-      if (!IDENT.test(a.table) || !IDENT.test(a.column)) throw new Error('release-migrations: invalid assertion identifier');
-      const key = a.normalize === 'btrim' ? `btrim("${a.column}")` : `"${a.column}"`;
-      const where = a.skipNulls === false ? '' : ` WHERE "${a.column}" IS NOT NULL`;
-      return `SELECT 1 AS violation FROM "${a.table}"${where} GROUP BY ${key} HAVING count(*) > 1 LIMIT 1`;
+      strictKeys(a, ['kind', 'table', 'column', 'normalize', 'skipNulls'], a.kind);
+      const t = strictIdent(a.table, 'table'); const c = strictIdent(a.column, 'column');
+      if (a.normalize !== undefined && a.normalize !== 'btrim' && a.normalize !== 'none') {
+        throw new Error(`release-migrations: assertion normalize must be exactly 'btrim' or 'none', got ${JSON.stringify(a.normalize)}`);
+      }
+      if (a.skipNulls !== undefined && typeof a.skipNulls !== 'boolean') {
+        throw new Error(`release-migrations: assertion skipNulls must be an exact boolean, got ${JSON.stringify(a.skipNulls)}`);
+      }
+      const key = a.normalize === 'btrim' ? `pg_catalog.btrim("${c}")` : `"${c}"`;
+      const where = a.skipNulls === false ? '' : ` WHERE "${c}" IS NOT NULL`;
+      return `SELECT 1 AS violation FROM "${CONTROLLED_SCHEMA}"."${t}"${where} GROUP BY ${key} HAVING pg_catalog.count(*) > 1 LIMIT 1`;
     }
     default:
       throw new Error(`release-migrations: unknown assertion kind ${JSON.stringify((a as { kind?: string }).kind)} - named runner-owned kinds only`);
   }
 }
 export function validateAssertion(a: MigrationAssertion): void {
-  buildAssertionQuery(a); // throws on invalid identifiers/kinds
+  buildAssertionQuery(a); // throws on invalid identifiers/kinds/keys
 }
-
-/** The canonical executed form of an artifact: parsed statements re-serialized
- *  by the AST printer, one per driver call. Execution runs EXACTLY these
- *  serializations and the digest hashes EXACTLY this joined serialization -
- *  executed bytes and hashed bytes are the same object by construction. */
-export function artifactStatements(sql: string): string[] {
-  return parseSql(sql).map(st => toSql.statement(st));
-}
-export const canonicalArtifactSql = (sql: string): string => artifactStatements(sql).join(';\n');
 
 /** Key-sorted canonical JSON for the declared-primitive digest component. */
 const canonicalJson = (v: unknown): string => {
@@ -195,12 +437,22 @@ const canonicalJson = (v: unknown): string => {
  *  that executes changes the digest and FAILS the runner/boot history check.
  *  `description` is operator display metadata and is deliberately NOT
  *  integrity-protected; only executed content is. */
-export const stepDigest = (m: MigrationStep): string =>
-  createHash('sha256').update(
-    `contake-migration/v5\n${m.version}\n${m.name}\n${canonicalArtifactSql(m.sql)}\n${canonicalJson({
+export const stepDigest = (m: MigrationStep): string => {
+  // Strict validation precedes hashing: an invalid guard object cannot be
+  // digested (and therefore can never match an applied row or execute).
+  for (const a of m.assertions ?? []) validateAssertion(a);
+  for (const t of m.lockTables ?? []) {
+    if (typeof t !== 'string' || !IDENT_STRICT.test(t)) throw new Error(`release-migrations: invalid lockTables identifier ${JSON.stringify(t)}`);
+  }
+  if (m.xactLockKey !== undefined && (!Number.isSafeInteger(m.xactLockKey) || m.xactLockKey < 0)) {
+    throw new Error('release-migrations: xactLockKey must be a non-negative safe integer');
+  }
+  return createHash('sha256').update(
+    `contake-migration/v6\n${m.version}\n${m.name}\n${canonicalArtifactSql(m.sql)}\n${canonicalJson({
       assertions: m.assertions ?? [], lockTables: m.lockTables ?? [], xactLockKey: m.xactLockKey ?? null,
     })}`,
   ).digest('hex');
+};
 
 /** 0001: the schema that used to be applied implicitly at server boot,
  *  extracted as a declarative artifact (frozen GRAPH_DDL/OTP_DDL - never edit
@@ -238,7 +490,7 @@ export const EXPECTED_SCHEMA_VERSIONS: readonly string[] = MIGRATIONS.map(m => m
 const RUNNER_LOCK_KEY = 841_000_001;
 
 const RUNNER_DDL = `
-CREATE TABLE IF NOT EXISTS schema_migrations(
+CREATE TABLE IF NOT EXISTS public.schema_migrations(
   seq bigserial PRIMARY KEY,
   version text NOT NULL,
   name text NOT NULL,
@@ -247,7 +499,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations(
   applied_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE(version)
 );
-CREATE TABLE IF NOT EXISTS contake_db_identity(
+CREATE TABLE IF NOT EXISTS public.contake_db_identity(
   id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   deployment_label text NOT NULL,
   instance_id text NOT NULL,
@@ -262,9 +514,9 @@ export interface AppliedMigrationRow { version: string; name: string; sha256: st
 const DEPLOYMENT_LABEL = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 export async function readDbIdentity(conn: Connectable | Queryable): Promise<DbIdentity | undefined> {
-  const t = await conn.query(`SELECT to_regclass('contake_db_identity') AS r`);
+  const t = await conn.query(`SELECT to_regclass('public.contake_db_identity') AS r`);
   if (!t.rows[0]?.['r']) return undefined;
-  const r = await conn.query(`SELECT deployment_label, instance_id FROM contake_db_identity WHERE id = 1`);
+  const r = await conn.query(`SELECT deployment_label, instance_id FROM public.contake_db_identity WHERE id = 1`);
   const row = r.rows[0];
   return row ? { deploymentLabel: String(row['deployment_label']), instanceId: String(row['instance_id']) } : undefined;
 }
@@ -308,9 +560,9 @@ export async function verifyTargetPreconditions(
 }
 
 async function readAppliedRows(conn: Queryable): Promise<AppliedMigrationRow[]> {
-  const t = await conn.query(`SELECT to_regclass('schema_migrations') AS r`);
+  const t = await conn.query(`SELECT to_regclass('public.schema_migrations') AS r`);
   if (!t.rows[0]?.['r']) return [];
-  const r = await conn.query(`SELECT version, name, sha256 FROM schema_migrations ORDER BY seq`);
+  const r = await conn.query(`SELECT version, name, sha256 FROM public.schema_migrations ORDER BY seq`);
   return r.rows.map(row => ({ version: String(row['version']), name: String(row['name']), sha256: String(row['sha256']) }));
 }
 
@@ -344,7 +596,7 @@ export function validateRegistry(migrations: readonly MigrationStep[]): void {
     validateMigrationArtifact(m.sql);
     for (const a of m.assertions ?? []) validateAssertion(a);
     for (const t of m.lockTables ?? []) {
-      if (!IDENT.test(t)) throw new Error(`release-migrations: invalid lockTables identifier ${JSON.stringify(t)}`);
+      if (typeof t !== 'string' || !IDENT_STRICT.test(t)) throw new Error(`release-migrations: invalid lockTables identifier ${JSON.stringify(t)}`);
     }
     if (m.xactLockKey !== undefined && (!Number.isSafeInteger(m.xactLockKey) || m.xactLockKey < 0)) {
       throw new Error('release-migrations: xactLockKey must be a non-negative safe integer');
@@ -366,7 +618,22 @@ export async function runMigrations(
   let applied: AppliedMigrationRow[];
   const appliedNow: string[] = [];
   try {
-    await client.query(`SELECT pg_advisory_lock(${RUNNER_LOCK_KEY})`);
+    // TL semantic layer: pin the migration session's search_path EMPTY for
+    // the whole run - unqualified built-ins resolve to pg_catalog only and no
+    // schema can be shadowed in. Re-pinned per step below.
+    await client.query(`SET search_path = ''`);
+    // CTL-DDL-CONFINEMENT condition 4: rollback containment fails if an
+    // installed extension gives an in-transaction object an EXTERNAL side
+    // effect channel. The extension baseline must be free of them.
+    const ext = await client.query(`SELECT extname FROM pg_extension`);
+    const bad = ext.rows.map(r => String(r['extname'])).filter(x => SIDE_EFFECT_EXTENSIONS.has(x));
+    if (bad.length > 0) {
+      throw new Error(
+        `release-migrations: EXTENSION BASELINE refusal - external-side-effect extension(s) installed: ${bad.join(', ')}. ` +
+        `Detect-and-rollback cannot contain out-of-transaction effects (dblink/fdw/plpython/...); remove them before running migrations (fail-closed)`,
+      );
+    }
+    await client.query(`SELECT pg_catalog.pg_advisory_lock(${RUNNER_LOCK_KEY})`);
     try {
       await client.query('BEGIN');
       try {
@@ -379,7 +646,7 @@ export async function runMigrations(
           identity = { deploymentLabel: opts.deployment, instanceId: randomBytes(8).toString('hex') };
           stampedNow = true;
           await client.query(
-            `INSERT INTO contake_db_identity(id, deployment_label, instance_id) VALUES(1, $1, $2)`,
+            `INSERT INTO public.contake_db_identity(id, deployment_label, instance_id) VALUES(1, $1, $2)`,
             [identity.deploymentLabel, identity.instanceId],
           );
         } else {
@@ -398,9 +665,16 @@ export async function runMigrations(
       // together or roll back together.
       for (const m of migrations.slice(applied.length)) {
         await client.query('BEGIN');
+        // Captured inside the step; hoisted so the catch path can actively
+        // restore non-transactional sequence state after ROLLBACK.
+        let sequencesBefore: Map<string, SeqVal> | undefined;
         try {
-          if (m.xactLockKey !== undefined) await client.query(`SELECT pg_advisory_xact_lock(${m.xactLockKey})`);
-          for (const t of m.lockTables ?? []) await client.query(`LOCK TABLE "${t}" IN SHARE ROW EXCLUSIVE MODE`);
+          // Re-pin search_path INSIDE the step transaction (and again before
+          // every artifact statement) so even a set_config smuggled through
+          // any blind spot cannot redirect name resolution mid-step.
+          await client.query(`SELECT pg_catalog.set_config('search_path', '', true)`);
+          if (m.xactLockKey !== undefined) await client.query(`SELECT pg_catalog.pg_advisory_xact_lock(${m.xactLockKey})`);
+          for (const t of m.lockTables ?? []) await client.query(`LOCK TABLE "${CONTROLLED_SCHEMA}"."${t}" IN SHARE ROW EXCLUSIVE MODE`);
           for (const a of m.assertions ?? []) {
             const guard = await client.query(buildAssertionQuery(a));
             if (guard.rows.length > 0) {
@@ -410,9 +684,24 @@ export async function runMigrations(
               );
             }
           }
-          for (const stmt of artifactStatements(m.sql)) await client.query(stmt);
+          const catalogBefore = await catalogSnapshot(client);
+          sequencesBefore = await sequenceValues(client);
+          for (const stmt of artifactStatements(m.sql)) {
+            await client.query(`SELECT pg_catalog.set_config('search_path', '', true)`);
+            await client.query(stmt);
+          }
+          // Zero function/operator/cast/trigger/rule delta across the step.
+          assertZeroCatalogDelta(catalogBefore, await catalogSnapshot(client), m.version);
+          // The whole-run session advisory lock must still be held (no
+          // smuggled unlock): session-state assertion, not a name filter.
+          const held = await client.query(
+            `SELECT pg_catalog.count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() AND granted`,
+          );
+          if (Number(held.rows[0]?.['n'] ?? 0) < 1) {
+            throw new Error(`release-migrations: SESSION LOCK refusal - the whole-run advisory lock was lost inside step '${m.version}' - rolling back (fail-closed)`);
+          }
           const ins = await client.query(
-            `INSERT INTO schema_migrations(version, name, sha256, applied_by) VALUES($1, $2, $3, $4)
+            `INSERT INTO public.schema_migrations(version, name, sha256, applied_by) VALUES($1, $2, $3, $4)
              ON CONFLICT (version) DO NOTHING`,
             [m.version, m.name, stepDigest(m), opts.appliedBy ?? 'release-job'],
           );
@@ -426,11 +715,23 @@ export async function runMigrations(
           appliedNow.push(m.version);
         } catch (e) {
           await client.query('ROLLBACK').catch(() => undefined);
+          // Condition 6: rollback cannot restore sequence state - do it
+          // actively, then hard-fail with the original error retained.
+          const restored = sequencesBefore ? await restoreSequenceValues(client, sequencesBefore).catch(() => [] as string[]) : [];
+          if (restored.length > 0 && e instanceof Error) {
+            e.message += ` [non-transactional sequence state actively restored: ${restored.join(', ')}]`;
+          }
           throw e;
         }
       }
     } finally {
-      await client.query(`SELECT pg_advisory_unlock(${RUNNER_LOCK_KEY})`).catch(() => undefined);
+      await client.query(`SELECT pg_catalog.pg_advisory_unlock(${RUNNER_LOCK_KEY})`).catch(() => undefined);
+      // The pin is scoped to the migration session - never leak it onto a
+      // pooled connection's next tenant.
+      // The pin (and any smuggled session GUC) is scoped to the migration
+      // session - never leak session state onto a pooled connection's next
+      // tenant.
+      await client.query(`RESET ALL`).catch(() => undefined);
     }
   } finally {
     client.release();
@@ -464,7 +765,7 @@ export async function assertSchemaCurrent(
   expected: readonly MigrationStep[] = MIGRATIONS,
   opts?: { deployment?: string; instanceId?: string },
 ): Promise<void> {
-  const t = await conn.query(`SELECT to_regclass('schema_migrations') AS r`);
+  const t = await conn.query(`SELECT to_regclass('public.schema_migrations') AS r`);
   if (!t.rows[0]?.['r']) {
     throw new Error(
       'release-migrations: schema_migrations is missing - this database was never initialized by the release-migration job. ' +

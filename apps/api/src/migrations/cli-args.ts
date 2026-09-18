@@ -108,25 +108,37 @@ export function durablePublish(path: string, contents: string): void {
     const dfd = openSync(dir, constants.O_RDONLY);
     try { fsyncSync(dfd); } finally { closeSync(dfd); }
   };
+  // Security closure (2026-09-18): every publication failure retains BOTH the
+  // original failure (message + cause) AND the exact temp/reconciliation
+  // state, so an operator never has to guess what exists on disk.
   try {
     dirFsync();
   } catch (e) {
     throw new Error(
-      `cli: inventory linked at ${JSON.stringify(path)} but the directory fsync FAILED - the publication is ` +
-      `INDETERMINATE (the file exists; its durability is unconfirmed). Reconcile explicitly before relying on it: ${String(e)}`,
+      `cli: inventory linked at ${JSON.stringify(path)} but the directory fsync FAILED - the publication is INDETERMINATE. ` +
+      `State: published file EXISTS at ${JSON.stringify(path)} (durability unconfirmed); temp RETAINED at ${JSON.stringify(tmp)}. ` +
+      `Reconcile explicitly before relying on either. Original failure: ${String(e)}`,
+      { cause: e } as ErrorOptions,
     );
   }
   try {
     unlinkSync(tmp);
-  } catch {
-    throw new Error(`cli: inventory published to ${JSON.stringify(path)} but temp cleanup failed - reconcile manually: ${JSON.stringify(tmp)}`);
+  } catch (e) {
+    throw new Error(
+      `cli: inventory published to ${JSON.stringify(path)} but temp cleanup FAILED. ` +
+      `State: published file EXISTS at ${JSON.stringify(path)} (fsynced); temp RETAINED at ${JSON.stringify(tmp)} - reconcile manually. ` +
+      `Original failure: ${String(e)}`,
+      { cause: e } as ErrorOptions,
+    );
   }
   try {
     dirFsync();
   } catch (e) {
     throw new Error(
-      `cli: inventory published to ${JSON.stringify(path)} but the post-cleanup directory fsync FAILED - temp-removal ` +
-      `durability is unconfirmed; reconcile ${JSON.stringify(tmp)} explicitly: ${String(e)}`,
+      `cli: inventory published to ${JSON.stringify(path)} but the post-cleanup directory fsync FAILED. ` +
+      `State: published file EXISTS at ${JSON.stringify(path)}; temp REMOVED from ${JSON.stringify(tmp)} (removal durability unconfirmed). ` +
+      `Original failure: ${String(e)}`,
+      { cause: e } as ErrorOptions,
     );
   }
 }

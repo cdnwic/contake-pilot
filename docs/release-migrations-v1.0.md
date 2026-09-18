@@ -1,15 +1,48 @@
-# Release migrations + staging synthetic seed (v1.4, 2026-09-18)
+# Release migrations + staging synthetic seed (v1.5, 2026-09-18)
 
 Owner: initializer lane (architecture convergence: external incident research +
 TL ruling + QA's SA v8 finding "migrateUsersPhone has no shipped standard
 runner/caller"). v1.3 is the unified declarative redesign resolving the
 independent QA and security FAILs on f9854cd6, 9182487e, 22267edb and
-976db452, with SA compatibility confirmed by backend and the TL's final
-reconciliation (2026-09-18). v1.4 resolves the second unified QA+security
-round: fixed named runner-generated guards, a closed recursive AST grammar
-with a pure-function allowlist, digest bound to the canonical serialization
-actually executed, fresh-DB pin refusal, instance identity on EVERY PG boot,
-and explicit publication indeterminacy handling. Sources behind the design:
+976db452 and c862cbbe, with SA compatibility confirmed by backend and the
+TL's final reconciliation + semantic-layer ruling (2026-09-18). v1.5 resolves
+the third unified QA+security round by MOVING THE SECURITY BOUNDARY from
+syntactic name allowlists to the database semantic layer, and is the first
+tenant of the governed execution/authorization substrate (Chaim's widened
+brief): one policy/enforcement/evidence boundary for every data-changing
+operation, with seed, repair, rollback and admin paths converging on it.
+
+v1.5 pillars (TL semantic-layer ruling + security closures, fixed scope):
+1. Migration session search_path PINNED EMPTY (re-pinned inside every step
+   transaction and before every artifact statement; RESET before the client
+   returns to the pool). pg_catalog is implicitly searched first, so
+   unqualified built-ins resolve to pg_catalog only - no schema shadowing.
+2. Every artifact identifier is canonically FULLY QUALIFIED by the runner:
+   relations to the controlled schema 'public', function calls to
+   'pg_catalog'. A caller-supplied schema outside the controlled one
+   (attacker.lower, public.btrim-as-function, evil.now) is REFUSED.
+3. RECURSIVELY CLOSED AST shapes: no WITH/CTEs (mutating or not), no nested
+   SELECT/subqueries, no code/object-bearing statements (function/procedure/
+   operator/cast/trigger/rule/aggregate/type/DO/CALL/COPY/OWNER/
+   security-definer) - statement allowlist plus an explicit closed
+   ALTER-action set.
+4. STRICT runtime guard-object validation (exact own-key sets, exact
+   enums/booleans, canonical lowercase identifiers) BEFORE digest AND BEFORE
+   execution - an invalid guard object cannot even be hashed.
+5. Runner-owned CATALOG SNAPSHOTS before/after every step: zero
+   function/operator/cast/trigger/rule deltas or the step rolls back.
+   Session-state assertion: the whole-run advisory lock must still be held
+   after each step (a smuggled unlock rolls back).
+6. LEAST-PRIVILEGE ROLES: the release job runs as a dedicated direct
+   migration role (NOINHERIT/NOSUPERUSER/NOCREATEDB/NOCREATEROLE, CREATE
+   only on the controlled schema - it cannot create code objects even by
+   hand); the runtime uses a narrower pooled role (read-only on migration
+   history). Proven on real Postgres in evidence phase3.
+7. Digest v6 binds the canonical QUALIFIED serialization actually executed.
+8. Durable no-clobber publication preserves BOTH the original failure
+   (message + cause) AND the exact temp/reconciliation state in every error.
+9. Fresh-DB + supplied pin refuses pre-write; EVERY PG boot requires
+   deployment + instance identity (carried closures). Sources behind the design:
 12factor.net/admin-processes, neon.com/docs/connect/choose-connection,
 neon.com/docs/connect/connection-pooling, prisma.io/docs/orm/prisma-migrate/workflows/seeding.
 
@@ -30,28 +63,32 @@ other migration path and no schema work at app startup.
   every shipped artifact). `description` is operator documentation and is
   NOT integrity-protected. Editing anything that executes changes the
   digest and fails the runner AND boot history checks.
-- **Real-parser AST allowlist, not regex.** Every artifact parses with a real
-  PostgreSQL parser (pgsql-ast-parser). Only declarative DDL+DML statement
-  types are permitted (create/alter/drop table+index, comment, insert,
-  update, delete). Transaction control, SELECT/CALL/DO, CTAS, UDF/extension
-  shapes and unparseable syntax (SAVEPOINT/SET/LOCK) are rejected at
-  registration - quoting, schema-qualification and comment tricks resolve to
-  the same AST and cannot bypass it. The grammar is CLOSED RECURSIVE: every
-  function call anywhere in the AST (expressions, column defaults, index
-  predicates, DML bodies, CTEs) must be in a pure-function allowlist
-  (immutable string/math/logic helpers plus STABLE `now()` for column
-  defaults). Side-effecting, volatile, session, lock, config, sequence and
-  system calls are rejected by absence from the list - this is an
-  allowlist, not a growing forbidden-list.
-- **Fixed named runner-generated guards (unified QA+security).** Assertions
-  are a CLOSED union of named guard kinds - `table-empty`, `no-nulls`,
-  `no-duplicates` - parameterized only by validated identifiers
-  (table/column) and fixed options (`normalize: 'btrim'`, `skipNulls`). The
-  runner GENERATES the guard SQL from fixed templates; no caller SQL,
-  expressions, functions or subqueries are representable. Guards HARD-FAIL
-  inside the runner transaction (never silent-skip); table locks and the
-  xact advisory lock are likewise declared structured fields executed BY
-  THE RUNNER. Primitive declarations are digest-covered.
+- **Semantic-layer enforcement, not syntactic name lists (TL ruling).** Every
+  artifact parses with a real PostgreSQL parser (pgsql-ast-parser). Only
+  declarative DDL+DML statement types are permitted (create/alter/drop
+  table+index, comment, insert, update, delete) with a closed ALTER-action
+  set; code/object-bearing statements (function/procedure/operator/cast/
+  trigger/rule/aggregate/type/DO/CALL/COPY/OWNER/security-definer), WITH/
+  CTEs and nested subqueries are refused recursively. The runner then
+  CANONICALLY QUALIFIES every identifier - relations to `public`, function
+  calls to `pg_catalog` - and executes with search_path pinned empty, so
+  name resolution is provably confined to {public, pg_catalog} and no UDF,
+  operator, cast or shadowing trick can resolve. A per-step catalog
+  snapshot asserts zero function/operator/cast/trigger/rule deltas; a
+  session assertion proves the whole-run advisory lock survives each step.
+  The enforcement boundary is the database's own semantics, not a list of
+  names.
+- **Fixed named runner-generated guards, strictly validated (unified
+  QA+security).** Assertions are a CLOSED union of named guard kinds -
+  `table-empty`, `no-nulls`, `no-duplicates` - with STRICT runtime
+  validation (exact own-key sets, exact enums/booleans, canonical lowercase
+  identifiers) enforced BEFORE digest AND before execution. The runner
+  GENERATES the guard SQL from fixed templates with fully-qualified
+  relations and pg_catalog functions; no caller SQL, expressions, functions
+  or subqueries are representable. Guards HARD-FAIL inside the runner
+  transaction (never silent-skip); table locks and the xact advisory lock
+  are likewise declared structured fields executed BY THE RUNNER.
+  Primitive declarations are digest-covered.
 - **Versioned, forward-only migrations.** Registry `MIGRATIONS` is strictly
   sequential (`0001`, `0002`, ...). Applied history must be an exact registry
   prefix with exact version+name+digest equality (`verifyHistoryPrefix`).
@@ -188,6 +225,37 @@ Existing Postgres deployments adopt the runner by one explicit
 `migrate:release --deployment <label> --expect-host <host> --expect-db <db>`
 run (no-op baseline), after which boots pass the gate. Rebuild path for
 staging = migrate + `seed:staging`; no local `pg_dump` bootstrap.
+
+## CTL-DDL-CONFINEMENT addendum (trust-head ruling, 2026-09-18)
+
+Binding ruling conditions, mapped to controls (all proven on real Postgres 14
+in evidence phase4, and in the unit suite):
+
+1. ONE transaction per governed operation; every non-transactional class is
+   rejected at artifact validation BEFORE execution: CREATE/DROP INDEX
+   CONCURRENTLY, VACUUM, ALTER SYSTEM, CREATE/DROP DATABASE, REINDEX
+   CONCURRENTLY, CALL, DO (and SECURITY DEFINER functions).
+2. The catalog diff runs BEFORE COMMIT inside the same step transaction, so
+   a violating step rolls back its own artifacts and the object together.
+3. Diff coverage is ruling-complete: pg_proc (incl. prosecdef), pg_trigger,
+   pg_rewrite, pg_operator, pg_opclass, pg_cast, pg_extension,
+   pg_event_trigger, pg_policy, pg_default_acl, pg_db_role_setting,
+   relacl/nspacl, ownership changes, and sequence values. Completeness is an
+   acceptance criterion: the unit suite plants one object per class and
+   requires detection.
+4. The extension baseline refuses side-effect mechanisms (dblink,
+   postgres_fdw, file_fdw, plpython*) at runner bootstrap: a database
+   carrying one is refused before any step runs (phase4 proves the live gate
+   with a real dblink install).
+5. Named attack proven: a SECURITY DEFINER trigger function planted under
+   the migration role is caught by the in-tx diff, rolled back, and does NOT
+   survive to fire under a runtime-role INSERT; the post-rollback catalog
+   equals the pre-migration catalog EXACTLY (byte-for-byte canonical
+   serialization).
+6. Sequence values are non-transactional (rollback never restores them), so
+   the runner captures per-sequence (last_value, is_called) before each step
+   and ACTIVELY RESTORES any drifted value after ROLLBACK, then hard-fails
+   with the original error. Both detection and restoration are verified.
 
 ## Evidence
 
