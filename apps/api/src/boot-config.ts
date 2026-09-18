@@ -19,8 +19,18 @@
  *  first), and it is on the denylist if pasted into env. */
 export const LOCAL_DEV_AUTH_SECRET = 'contake-local-dev-secret-NOT-DEPLOYABLE';
 
-/** Defensible minimum for an HMAC signing secret: 32 chars. */
+/** Defensible minimum for an HMAC signing secret: 32 chars. NOTE: length alone
+ *  is NOT sufficient - the encoding policy below is the real gate. */
 export const MIN_AUTH_SECRET_LENGTH = 32;
+
+/** Random-encoding policy (independent security review, 2026-09-18): a real
+ *  secret is exactly 32 random bytes, represented as either 64 lowercase/upper
+ *  hex chars (`openssl rand -hex 32`) or 43 unpadded base64url chars
+ *  (`openssl rand -base64 32 | tr '+/' '-_' | tr -d '='`). Anything else -
+ *  passphrases, words, padded/truncated encodings, repeated patterns - fails
+ *  closed. Generate with the commands above, never by hand. */
+const SECRET_HEX64 = /^[0-9a-fA-F]{64}$/;
+const SECRET_B64URL43 = /^[A-Za-z0-9_-]{43}$/;
 
 /** Values that must NEVER authenticate anything, anywhere. */
 const KNOWN_FALLBACK_SECRETS: ReadonlySet<string> = new Set([
@@ -41,6 +51,17 @@ export function resolveAuthSecret(env: NodeJS.ProcessEnv = process.env): string 
     }
     if (s.length < MIN_AUTH_SECRET_LENGTH) {
       throw new Error(`CONTAKE_AUTH_SECRET is shorter than ${MIN_AUTH_SECRET_LENGTH} characters - refusing to boot (fail-closed)`);
+    }
+    if (/^(.)\1+$/.test(s)) {
+      throw new Error('CONTAKE_AUTH_SECRET is a single repeated character - refusing to boot (fail-closed)');
+    }
+    if (!SECRET_HEX64.test(s) && !SECRET_B64URL43.test(s)) {
+      throw new Error('CONTAKE_AUTH_SECRET must be exactly 32 random bytes as 64 hex or 43 unpadded base64url chars (openssl rand -hex 32) - refusing to boot (fail-closed)');
+    }
+    // Encoding shape alone is not entropy: 'abab...ab' is valid 64-hex and
+    // still a placeholder. Reject low-diversity values outright.
+    if (new Set(s.toLowerCase()).size < 12) {
+      throw new Error('CONTAKE_AUTH_SECRET has too little character diversity (placeholder-grade, e.g. a short cycle repeated) - refusing to boot (fail-closed)');
     }
     return s;
   }

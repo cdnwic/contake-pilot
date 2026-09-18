@@ -2,8 +2,8 @@
 /** Post-deploy auth black-box probe v2 (fail-closed hotfix, 2026-09-17).
  *  Cryptographic assurance against a REAL existing user - a nonexistent sub
  *  proves nothing, so the real-secret positive control is mandatory:
- *    node apps/api/scripts/post-deploy-auth-negative.mjs --base https://<host> \
- *         --secret <deployed CONTAKE_AUTH_SECRET> --user <existing userId>
+ *    CONTAKE_PROBE_SECRET=<deployed CONTAKE_AUTH_SECRET> \
+ *      node apps/api/scripts/post-deploy-auth-negative.mjs --base https://<host> --user <existing userId>
  *  Checks (ALL must pass; any failure = rollback candidate):
  *   1. POSITIVE CONTROL: a token signed with the REAL deployed secret for the
  *      REAL existing user is ACCEPTED (proves the probe tests a live identity
@@ -18,11 +18,33 @@
  *  local HMAC and is never sent, logged, or persisted. */
 import { createHmac } from 'node:crypto';
 
+// The real secret NEVER travels on argv (world-readable via ps): it comes from
+// the CONTAKE_PROBE_SECRET environment variable, or interactively from stdin
+// (fd 0) when attached to a terminal. It is used only to mint a local HMAC and
+// is never logged or persisted.
 const args = process.argv.slice(2);
 const arg = (name) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
-const base = arg('base'), secret = arg('secret'), userId = arg('user');
+if (arg('secret') !== undefined) {
+  console.error('refusing --secret on argv (visible in process lists); use the CONTAKE_PROBE_SECRET env var or stdin');
+  process.exit(2);
+}
+const base = arg('base'), userId = arg('user');
+let secret = process.env['CONTAKE_PROBE_SECRET'];
+if (!secret && process.stdin.isTTY) {
+  process.stdout.write('deployed CONTAKE_AUTH_SECRET (not echoed, not logged): ');
+  secret = await new Promise((res) => {
+    let buf = '';
+    process.stdin.setRawMode?.(true);
+    process.stdin.on('data', (d) => {
+      const c = String(d);
+      if (c === '\n' || c === '\r') { process.stdin.setRawMode?.(false); process.stdout.write('\n'); res(buf); }
+      else if (c === '\u0003') process.exit(2);
+      else buf += c;
+    });
+  });
+}
 if (!base || !secret || !userId) {
-  console.error('usage: post-deploy-auth-negative.mjs --base <url> --secret <deployed-auth-secret> --user <existing-userId>');
+  console.error('usage: CONTAKE_PROBE_SECRET=<deployed-auth-secret> post-deploy-auth-negative.mjs --base <url> --user <existing-userId>');
   process.exit(2);
 }
 let origin;

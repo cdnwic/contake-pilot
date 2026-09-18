@@ -14,7 +14,8 @@ import { LOCAL_DEV_AUTH_SECRET, MIN_AUTH_SECRET_LENGTH, assertBootPolicy, devOtp
 import { makeTestRepo } from './helpers/repo.js';
 
 describe('resolveAuthSecret (fail-closed)', () => {
-  const STRONG = 'a'.repeat(MIN_AUTH_SECRET_LENGTH);
+  const STRONG = '37115fa1d12be597cd6c1aba5cbf92508072d305edfc59082cc6c963e1d0a674'; // 64 hex (openssl rand -hex 32 shape)
+  const STRONG_B64 = 'aKhvRtkVHp1roRMXlvPw6QamCfBEPoeRt107EaxlDH8'; // 43 base64url, 32 random bytes
   it('returns the configured secret when non-empty, trimmed, and strong enough', () => {
     expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG, DATABASE_URL: 'postgres://x' })).toBe(STRONG);
     expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: `  ${STRONG}  ` })).toBe(STRONG); // trimmed
@@ -26,7 +27,26 @@ describe('resolveAuthSecret (fail-closed)', () => {
     }
   });
   it('REJECTS secrets shorter than the minimum length', () => {
-    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'a'.repeat(MIN_AUTH_SECRET_LENGTH - 1) })).toThrow(/shorter/);
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG.slice(0, 31) })).toThrow(/shorter/);
+  });
+  it('accepts both sanctioned encodings (64 hex / 43 base64url)', () => {
+    expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG })).toBe(STRONG);
+    expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG_B64 })).toBe(STRONG_B64);
+  });
+  it('REJECTS secrets failing the random-encoding policy even at sufficient length/diversity', () => {
+    // 32-char mixed passphrase: long and diverse, but NOT 32 random bytes encoded.
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'Kx9$mQ2vR7nW4pLzT8bYcJ5dFhG3sA6e' })).toThrow(/refusing to boot/);
+    // hex but 63/65 chars (truncated/padded).
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG.slice(0, 63) })).toThrow();
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG + 'f' })).toThrow();
+    // base64url but 44 with padding or standard-b64 alphabet.
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG_B64 + '=' })).toThrow();
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: STRONG_B64.slice(0, 42) + '+' })).toThrow();
+  });
+  it('REJECTS trivially repeated placeholder secrets (no real entropy)', () => {
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'a'.repeat(40) })).toThrow(/repeated|encoding|hex|base64url/);
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: 'ab'.repeat(32) })).toThrow(/refusing to boot/);
+    expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: '0123456789'.repeat(7) })).toThrow(/refusing to boot/);
   });
   it('REQUIRES a secret for NODE_ENV=production even WITHOUT DATABASE_URL (adapter-independent)', () => {
     expect(() => resolveAuthSecret({ NODE_ENV: 'production' })).toThrow(/CONTAKE_AUTH_SECRET/);

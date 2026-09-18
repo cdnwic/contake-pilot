@@ -30,8 +30,18 @@
   atomic `INSERT .. ON CONFLICT .. RETURNING`, so concurrent instances cannot
   overshoot the threshold.
 
-## #3 devCode deploy flag
+## #3 devCode deploy flag (fail-closed hotfix, 2026-09-17/18)
 
-- `/v1/auth/otp/request` returns the OTP in the response body (`devCode`) unless
-  `CONTAKE_DEV_OTP=false` (`apps/api/src/app.ts`, otp/request route). In the pilot
-  environment `CONTAKE_DEV_OTP=false` is **mandatory** (deploy config; no code).
+- `/v1/auth/otp/request` returns the OTP in the response body (`devCode`) ONLY
+  when `CONTAKE_DEV_OTP` is exactly `true` AND the boot is not production
+  (`apps/api/src/boot-config.js`, `devOtpEnabled`). Unset, empty, or any other
+  value is closed; a production boot (`NODE_ENV=production`) refuses to start
+  with `CONTAKE_DEV_OTP=true` at all (`assertBootPolicy`).
+- The auth signing secret is fail-closed: `CONTAKE_AUTH_SECRET` is required
+  (trimmed, >= 32 chars, no known fallback/dev values, no trivially repeated
+  placeholders) whenever `DATABASE_URL` is set OR `NODE_ENV=production`;
+  memory/test dev boots fall back to an explicit non-deployable local
+  constant. Production also requires `DATABASE_URL`, forbids
+  `CONTAKE_TEST_MODE=true`, and boots seed-free (`CONTAKE_SEED` forbidden).
+  Render declares the secret as a managed `sync:false` env var (no value in
+  the repo); generate it with e.g. `openssl rand -base64 32`.
