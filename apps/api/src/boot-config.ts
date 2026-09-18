@@ -45,8 +45,12 @@ const KNOWN_FALLBACK_SECRETS: ReadonlySet<string> = new Set([
   'aKhvRtkVHp1roRMXlvPw6QamCfBEPoeRt107EaxlDH8',
 ]);
 
-/** Exported for the denial regression test: every entry must be refused. */
-export const DENIED_SECRETS: ReadonlySet<string> = KNOWN_FALLBACK_SECRETS;
+/** Exported for the denial regression test: every entry must be refused.
+ *  DETACHED, FROZEN copy (QA 2026-09-18): a ReadonlySet ALIAS of the backing
+ *  Set would let any importer mutate the resolver's live denylist
+ *  (delete/clear through a cast) and re-enable a denied secret. The backing
+ *  Set stays module-private; only this frozen snapshot leaves the module. */
+export const DENIED_SECRETS: readonly string[] = Object.freeze([...KNOWN_FALLBACK_SECRETS]);
 
 export function isProductionBoot(env: NodeJS.ProcessEnv = process.env): boolean {
   return env['NODE_ENV'] === 'production';

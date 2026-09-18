@@ -26,12 +26,38 @@ describe('resolveAuthSecret (fail-closed)', () => {
     expect(resolveAuthSecret({ CONTAKE_AUTH_SECRET: `  ${STRONG}  ` })).toBe(STRONG); // trimmed
   });
   it('REFUSES every permanently denied secret (fallbacks + exposed public fixtures)', () => {
-    expect(DENIED_SECRETS.size).toBeGreaterThanOrEqual(4); // 2 fallbacks + 2 exposed
+    expect(DENIED_SECRETS.length).toBeGreaterThanOrEqual(4); // 2 fallbacks + 2 exposed
     for (const denied of DENIED_SECRETS) {
       expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: denied })).toThrow(/refusing to boot|fallback/);
       expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: denied, DATABASE_URL: 'postgres://x' })).toThrow(/refusing to boot|fallback/);
     }
   });
+  it('the exported denylist is a DETACHED FROZEN copy: external mutation attempts cannot alter resolver denial', () => {
+    const members = [...DENIED_SECRETS];
+    expect(Object.isFrozen(DENIED_SECRETS)).toBe(true);
+    const mutable = DENIED_SECRETS as unknown as string[];
+    // every mutation attempt on the export fails loud (frozen, strict mode) ...
+    expect(() => { mutable.push('injected'); }).toThrow(TypeError);
+    expect(() => { mutable.length = 0; }).toThrow(TypeError);
+    expect(() => { mutable.pop(); }).toThrow(TypeError);
+    expect(() => { mutable.splice(0, 1); }).toThrow(TypeError);
+    expect(() => { delete mutable[0]; }).toThrow(TypeError);
+    expect(() => { mutable[0] = 'overwritten'; }).toThrow(TypeError);
+    expect(() => { mutable.reverse(); }).toThrow(TypeError);
+    expect(() => { mutable.sort(); }).toThrow(TypeError);
+    expect(() => { mutable.fill('x'); }).toThrow(TypeError);
+    expect(() => { mutable.copyWithin(0, 1); }).toThrow(TypeError);
+    // ... the export is unchanged ...
+    expect([...DENIED_SECRETS]).toEqual(members);
+    // ... and the resolver still refuses EVERY denied member, both shapes.
+    for (const denied of members) {
+      expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: denied })).toThrow(/refusing to boot|fallback/);
+      expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: denied, DATABASE_URL: 'postgres://x' })).toThrow(/refusing to boot|fallback/);
+    }
+    // No aliasing back door: the export shares no identity with any Set.
+    expect(DENIED_SECRETS instanceof Set).toBe(false);
+  });
+
   it('REJECTS known fallback values even when explicitly configured', () => {
     for (const bad of ['contake-dev-secret', LOCAL_DEV_AUTH_SECRET]) {
       expect(() => resolveAuthSecret({ CONTAKE_AUTH_SECRET: bad })).toThrow(/fallback/);
