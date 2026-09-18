@@ -10,7 +10,9 @@
     "seed": "tsx src/seed.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "seed:camp-demo": "tsx src/demo/load-camp-demo.ts"
+    "seed:camp-demo": "tsx src/demo/load-camp-demo.ts",
+    "migrate:release": "tsx src/migrations/cli.ts",
+    "seed:staging": "tsx src/migrations/staging-seed-cli.ts"
   },
   "dependencies": {
     "@contake/core": "workspace:*",

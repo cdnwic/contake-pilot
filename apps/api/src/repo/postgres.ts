@@ -50,7 +50,7 @@ export function pgliteConnectable(db: { query(text: string, params?: unknown[]):
   return root;
 }
 
-const DDL = `
+export const GRAPH_DDL = `
 CREATE TABLE IF NOT EXISTS users(user_id text PRIMARY KEY, org_id text NOT NULL, email text, phone text, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS channels(id text PRIMARY KEY, org_id text NOT NULL, address text NOT NULL, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id text PRIMARY KEY, org_id text NOT NULL, version integer NOT NULL, data jsonb NOT NULL);
@@ -109,7 +109,16 @@ export class PostgresGraphRepository implements GraphRepository {
   private constructor(private readonly db: Connectable) {}
 
   static async create(db: Connectable): Promise<PostgresGraphRepository> {
-    for (const stmt of DDL.split(';').map(s => s.trim()).filter(Boolean)) await db.query(stmt);
+    for (const stmt of GRAPH_DDL.split(';').map(s => s.trim()).filter(Boolean)) await db.query(stmt);
+    return new PostgresGraphRepository(db);
+  }
+
+  /** Runtime constructor WITHOUT bootstrap DDL (release-migration architecture,
+   *  2026-09-18): schema is owned by the versioned release-migration runner
+   *  (src/migrations/), never by app startup. Server boots call
+   *  assertSchemaCurrent() first and then connect(). create() remains for the
+   *  hermetic test harness and local bootstrap only. */
+  static connect(db: Connectable): PostgresGraphRepository {
     return new PostgresGraphRepository(db);
   }
 
@@ -898,7 +907,7 @@ export function pgDispatchState(db: Queryable): DispatchStateStore {
 
 export type { SeedData };
 
-const OTP_DDL = `
+export const OTP_DDL = `
 CREATE TABLE IF NOT EXISTS otp_codes(phone text PRIMARY KEY, exp_ms bigint NOT NULL, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS otp_requests(phone text PRIMARY KEY, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS otp_verify_state(phone text PRIMARY KEY, attempts integer NOT NULL, locked_until_ms bigint);
@@ -910,8 +919,12 @@ CREATE TABLE IF NOT EXISTS auth_audit(seq bigserial PRIMARY KEY, phone text NOT 
  *  the verify-attempt counter is an atomic INSERT .. ON CONFLICT .. RETURNING,
  *  so two instances racing wrong attempts still reach the lockout threshold
  *  exactly once. */
-export async function createPgOtpState(db: Queryable): Promise<OtpStateStore> {
-  for (const stmt of OTP_DDL.split(';').map(x => x.trim()).filter(Boolean)) await db.query(stmt);
+export async function createPgOtpState(db: Queryable, opts?: { applyDdl?: boolean }): Promise<OtpStateStore> {
+  // Release-migration architecture (2026-09-18): OTP DDL is owned by migration
+  // 0001; the server boot path passes applyDdl:false after assertSchemaCurrent.
+  if (opts?.applyDdl !== false) {
+    for (const stmt of OTP_DDL.split(';').map(x => x.trim()).filter(Boolean)) await db.query(stmt);
+  }
   return {
     async getCode(phone) {
       const r = await db.query(`SELECT data, exp_ms FROM otp_codes WHERE phone=$1`, [phone]);
