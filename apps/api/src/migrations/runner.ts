@@ -73,7 +73,7 @@ import { GRAPH_DDL, OTP_DDL, type Connectable, type Queryable } from '../repo/po
 export type MigrationAssertion =
   | { readonly kind: 'table-empty'; readonly table: string }
   | { readonly kind: 'no-nulls'; readonly table: string; readonly column: string }
-  | { readonly kind: 'no-duplicates'; readonly table: string; readonly column: string; readonly normalize?: 'btrim' | 'none'; readonly skipNulls?: boolean };
+  | { readonly kind: 'no-duplicates'; readonly table: string; readonly column: string; readonly normalize?: 'btrim' | 'btrim-nullif-empty' | 'none'; readonly skipNulls?: boolean };
 
 /** R3: a migration step is INERT DATA - a registry template name plus
  *  strictly typed params. No caller SQL exists anywhere in the system. */
@@ -113,6 +113,20 @@ const NAMED_PREDICATES: Readonly<Record<string, string>> = {
   PRED_NONE: '',
 };
 
+/** Named NORMALIZATION forms (SA1 ruling 2026-09-19): the ONLY way a row-data
+ *  normalization enters a DATA statement. Inert literal text; the {column} /
+ *  {jsonColumn} / {jsonKey} references are bound through the SAME closed
+ *  assembly passes as every other placeholder - no free text exists.
+ *  NORM_*_NULLIF_EMPTY: blank is ABSENCE, not identity - trim, then empty
+ *  becomes NULL, so the partial unique index excludes absent phones by
+ *  construction. */
+const NAMED_NORMALIZATIONS: Readonly<Record<string, string>> = {
+  NORM_COL_BTRIM_NULLIF_EMPTY: `NULLIF(pg_catalog.btrim({column}), '')`,
+  NORM_COL_BTRIM: `pg_catalog.btrim({column})`,
+  NORM_JSON_BTRIM_NULLIF_EMPTY: `NULLIF(pg_catalog.btrim({jsonColumn}->>{jsonKey}), '')`,
+  NORM_JSON_BTRIM: `pg_catalog.btrim({jsonColumn}->>{jsonKey})`,
+};
+
 export type TemplateParamKind = 'identifier' | 'enum' | 'expression';
 export interface RenderedStatement { text: string; values: unknown[] }
 
@@ -123,7 +137,7 @@ export interface IdentifierParamDecl { readonly kind: 'identifier'; readonly quo
 export interface EnumParamDecl { readonly kind: 'enum'; readonly values: readonly string[]; readonly fragments: Readonly<Record<string, string>> }
 export interface ExpressionParamDecl {
   readonly kind: 'expression';
-  readonly forms: 'expressions' | 'predicates';
+  readonly forms: 'expressions' | 'predicates' | 'normalizations';
   /** Fragment patterns; {form} is the named-form text, {param} references
    *  another declared param (resolved by the assembly mechanism). */
   readonly nonEmpty: string;
@@ -229,7 +243,7 @@ const TEMPLATES: readonly TemplateEntry[] = [
   {
     name: 'data.normalize-users-phone',
     description:
-      'SA lane DATA family: trim users.phone AND the embedded data.phone JSON key, each to its OWN btrim value ' +
+      'SA lane DATA family: normalize users.phone AND the embedded data.phone JSON key via NAMED closed forms ' +
       '(value-preserving; never picks a representation winner, never deletes). Writes ROW DATA only - no catalog classes.',
     params: {
       table: { kind: 'identifier', quote: 'schema' },
@@ -237,17 +251,20 @@ const TEMPLATES: readonly TemplateEntry[] = [
       jsonColumn: { kind: 'identifier', quote: 'bare' },
       // The JSON key enters ONLY as this closed enum literal (no free text):
       jsonKey: { kind: 'enum', values: ['phone'], fragments: { phone: `'phone'` } },
+      // SA1 ruling: the normalizations enter ONLY as named closed forms:
+      columnNorm: { kind: 'expression', forms: 'normalizations', nonEmpty: '{form}', empty: '{column}' },
+      jsonNorm: { kind: 'expression', forms: 'normalizations', nonEmpty: '{form}', empty: '{jsonColumn}->>{jsonKey}' },
     },
     writesCatalogs: [],
     shapes: [
-      'UPDATE {table} SET {column} = pg_catalog.btrim({column}), ' +
+      'UPDATE {table} SET {column} = {columnNorm}, ' +
       '{jsonColumn} = CASE WHEN ({jsonColumn}->>{jsonKey}) IS NOT NULL ' +
-      'THEN pg_catalog.jsonb_set({jsonColumn}, ARRAY[{jsonKey}], pg_catalog.to_jsonb(pg_catalog.btrim({jsonColumn}->>{jsonKey})), false) ' +
+      'THEN pg_catalog.jsonb_set({jsonColumn}, ARRAY[{jsonKey}], coalesce(pg_catalog.to_jsonb({jsonNorm}), ' + "'null'::jsonb" + '), false) ' +
       'ELSE {jsonColumn} END ' +
-      'WHERE ({column} IS NOT NULL AND {column} <> pg_catalog.btrim({column})) ' +
-      'OR (({jsonColumn}->>{jsonKey}) IS NOT NULL AND ({jsonColumn}->>{jsonKey}) <> pg_catalog.btrim({jsonColumn}->>{jsonKey}))',
+      'WHERE ({column} IS DISTINCT FROM {columnNorm}) ' +
+      'OR (({jsonColumn}->>{jsonKey}) IS NOT NULL AND ({jsonColumn}->>{jsonKey}) IS DISTINCT FROM {jsonNorm})',
     ],
-    sample: { table: 'users', column: 'phone', jsonColumn: 'data', jsonKey: 'phone' },
+    sample: { table: 'users', column: 'phone', jsonColumn: 'data', jsonKey: 'phone', columnNorm: 'NORM_COL_BTRIM_NULLIF_EMPTY', jsonNorm: 'NORM_JSON_BTRIM_NULLIF_EMPTY' },
   },
 ];
 
@@ -269,7 +286,7 @@ function fragmentFor(decl: ParamDecl, value: unknown, paramName: string): string
       return f;
     }
     case 'expression': {
-      const forms = decl.forms === 'expressions' ? NAMED_EXPRESSIONS : NAMED_PREDICATES;
+      const forms = decl.forms === 'expressions' ? NAMED_EXPRESSIONS : decl.forms === 'predicates' ? NAMED_PREDICATES : NAMED_NORMALIZATIONS;
       const form = bindExpression(value, paramName, forms);
       return (form === '' ? decl.empty : decl.nonEmpty).replaceAll('{form}', form);
     }
@@ -462,6 +479,7 @@ const deepFreeze = <T>(o: T): T => {
 };
 deepFreeze(NAMED_EXPRESSIONS);
 deepFreeze(NAMED_PREDICATES);
+deepFreeze(NAMED_NORMALIZATIONS);
 deepFreeze(TEMPLATES);
 
 /** R4 section 1: ONE canonical serialization of the full frozen blueprint,
@@ -506,6 +524,7 @@ export function assertSingleStatementForms(forms: readonly string[], ctx: string
   }
   assertSingleStatementForms(Object.values(NAMED_EXPRESSIONS), 'NAMED_EXPRESSIONS');
   assertSingleStatementForms(Object.values(NAMED_PREDICATES), 'NAMED_PREDICATES');
+  assertSingleStatementForms(Object.values(NAMED_NORMALIZATIONS), 'NAMED_NORMALIZATIONS');
 }
 
 const STATEMENT_CATALOG_MATRIX: Readonly<Record<string, readonly string[]>> = Object.fromEntries(
@@ -669,14 +688,20 @@ export function buildAssertionQuery(a: MigrationAssertion): string {
     case 'no-duplicates': {
       strictKeys(a, ['kind', 'table', 'column', 'normalize', 'skipNulls'], a.kind);
       const t = strictIdent(a.table, 'table'); const c = strictIdent(a.column, 'column');
-      if (a.normalize !== undefined && a.normalize !== 'btrim' && a.normalize !== 'none') {
-        throw new Error(`release-migrations: assertion normalize must be exactly 'btrim' or 'none', got ${JSON.stringify(a.normalize)}`);
+      if (a.normalize !== undefined && a.normalize !== 'btrim' && a.normalize !== 'btrim-nullif-empty' && a.normalize !== 'none') {
+        throw new Error(`release-migrations: assertion normalize must be exactly 'btrim', 'btrim-nullif-empty' or 'none', got ${JSON.stringify(a.normalize)}`);
       }
       if (a.skipNulls !== undefined && typeof a.skipNulls !== 'boolean') {
         throw new Error(`release-migrations: assertion skipNulls must be an exact boolean, got ${JSON.stringify(a.skipNulls)}`);
       }
-      const key = a.normalize === 'btrim' ? `pg_catalog.btrim("${c}")` : `"${c}"`;
-      const where = a.skipNulls === false ? '' : ` WHERE "${c}" IS NOT NULL`;
+      // SA1 ruling (2026-09-19): 'btrim-nullif-empty' treats blank as ABSENCE -
+      // the grouping key is NULLIF(btrim,'') and NULL keys never collide
+      // (two absent phones are not the same phone).
+      const key = a.normalize === 'btrim-nullif-empty' ? `NULLIF(pg_catalog.btrim("${c}"), '')`
+        : a.normalize === 'btrim' ? `pg_catalog.btrim("${c}")` : `"${c}"`;
+      const where = a.normalize === 'btrim-nullif-empty'
+        ? (a.skipNulls === false ? '' : ` WHERE ${key} IS NOT NULL`)
+        : (a.skipNulls === false ? '' : ` WHERE "${c}" IS NOT NULL`);
       return `SELECT 1 AS violation FROM "${CONTROLLED_SCHEMA}"."${t}"${where} GROUP BY ${key} HAVING pg_catalog.count(*) > 1 LIMIT 1`;
     }
     default:
@@ -746,13 +771,14 @@ export const MIGRATIONS: readonly MigrationStep[] = [
     version: '0002',
     name: 'users-phone-normalize',
     description:
-      'SA lane: trim users.phone and data.phone JSON to their own btrim values ' +
-      '(fail-loud on normalized column-phone collisions; never deletes, never picks a representation winner).',
+      'SA lane (SA1 ruling 2026-09-19): trim users.phone and data.phone JSON to their own values ' +
+      "with blank-as-ABSENCE (NULLIF(btrim(x),'') -> NULL; the partial index then excludes absent phones " +
+      'by construction). Fail-loud on normalized REAL-phone collisions; never deletes, never picks a representation winner.',
     template: 'data.normalize-users-phone',
-    params: { table: 'users', column: 'phone', jsonColumn: 'data', jsonKey: 'phone' },
+    params: { table: 'users', column: 'phone', jsonColumn: 'data', jsonKey: 'phone', columnNorm: 'NORM_COL_BTRIM_NULLIF_EMPTY', jsonNorm: 'NORM_JSON_BTRIM_NULLIF_EMPTY' },
     xactLockKey: 7263849598301, // 'users-phone-migration'
     lockTables: ['users'],
-    assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim', skipNulls: true }],
+    assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim-nullif-empty', skipNulls: true }],
   },
   {
     version: '0003',
@@ -762,7 +788,8 @@ export const MIGRATIONS: readonly MigrationStep[] = [
     params: { index: 'users_phone_unique', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
     xactLockKey: 7263849598301, // 'users-phone-migration'
     lockTables: ['users'],
-    assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim', skipNulls: true }],
+    // SA1 ruling: guard re-fires AFTER normalization with blank-as-absence.
+    assertions: [{ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim-nullif-empty', skipNulls: true }],
   },
 ];
 

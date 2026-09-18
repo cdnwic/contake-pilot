@@ -130,6 +130,41 @@ pgOnly('declarative users-phone migration (0002 normalize + 0003 index)', () => 
     expect(row.rows[0]!['jp']).toBe('+15550100008'); // its OWN value preserved - the operator preflight owns the decision
   });
 
+  it("SA1 acceptance: blank phones ('' and whitespace-only) normalize to NULL and the index builds - absence, not identity", async () => {
+    const conn = await freshConn();
+    await runMigrations(conn, { deployment: 'test', migrations: MIGRATIONS.slice(0, 1) });
+    await insertUser(conn, 'u-blank-1', '');
+    await insertUser(conn, 'u-blank-2', '   ');
+    await insertUser(conn, 'u-blank-json', null, '  ');
+    await insertUser(conn, 'u-real', '+15550100009');
+    const r = await runMigrations(conn, { deployment: 'test' });
+    // two absent phones are NOT a collision: no guard refusal, both steps apply
+    expect(r.appliedNow).toEqual(['0002', '0003']);
+    const rows = await conn.query(`SELECT user_id, phone, data->>'phone' AS jp FROM users ORDER BY user_id`);
+    const byId = Object.fromEntries(rows.rows.map(x => [String(x['user_id']), x]));
+    expect(byId['u-blank-1']!['phone']).toBeNull();
+    expect(byId['u-blank-2']!['phone']).toBeNull();
+    expect(byId['u-blank-json']!['jp']).toBeNull(); // jsonb null - key preserved, value absent
+    expect(byId['u-real']!['phone']).toBe('+15550100009');
+    // the partial index excludes absent phones by construction and BUILDS:
+    expect((await conn.query(`SELECT to_regclass('public.users_phone_unique') AS r`)).rows[0]!['r']).not.toBeNull();
+  });
+
+  it('SA1 acceptance: login-by-phone can never match a NULL phone (findUserByPhone semantics)', async () => {
+    const conn = await freshConn();
+    await runMigrations(conn, { deployment: 'test', migrations: MIGRATIONS.slice(0, 1) });
+    await insertUser(conn, 'u-blank-login', '');
+    await insertUser(conn, 'u-real-login', ' +15550100010 ');
+    await runMigrations(conn, { deployment: 'test' });
+    // the EXACT lookup statement PostgresGraphRepository.findUserByPhone issues:
+    const blank = await conn.query(`SELECT data FROM users WHERE phone=$1 LIMIT 1`, [''.trim()]);
+    expect(blank.rows.length).toBe(0); // SQL NULL never equals '' - absence is not identity
+    const ws = await conn.query(`SELECT data FROM users WHERE phone=$1 LIMIT 1`, ['   '.trim()]);
+    expect(ws.rows.length).toBe(0);
+    const real = await conn.query(`SELECT data FROM users WHERE phone=$1 LIMIT 1`, [' +15550100010 '.trim()]);
+    expect(real.rows.length).toBe(1); // a real phone still resolves after trimming
+  });
+
   it('idempotent: a second full run applies nothing and keeps the index', async () => {
     const conn = await freshConn();
     await runMigrations(conn, { deployment: 'test' });

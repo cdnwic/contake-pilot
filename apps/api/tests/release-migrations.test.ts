@@ -89,7 +89,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     // R4 section 1: the registry, named forms and render capability no longer
     // exist on the module surface - external tamper is impossible by type and
     // at runtime (OBSERVED: each name resolves to undefined).
-    for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'getTemplate', 'renderStepStatements', 'templateHash', 'STATEMENT_CATALOG_MATRIX', 'bindIdentifier', 'bindLiteral']) {
+    for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'NAMED_NORMALIZATIONS', 'getTemplate', 'renderStepStatements', 'templateHash', 'STATEMENT_CATALOG_MATRIX', 'bindIdentifier', 'bindLiteral']) {
       const surfaced = (runnerModule as Record<string, unknown>)[name];
       console.log(`OBSERVED[confined surface ${name}]: ${typeof surfaced}`);
       expect(surfaced, name).toBeUndefined();
@@ -154,7 +154,7 @@ describe('R4 confined-registry contract (module-private frozen registry; anchore
     // exact enums/booleans, canonical identifiers
     expect(() => validateAssertion({ kind: 'table-empty', table: 'users', extra: 1 } as never)).toThrow(/unexpected key/);
     expect(() => validateAssertion({ kind: 'no-nulls', table: 'users', column: 'phone', normalize: 'none' } as never)).toThrow(/unexpected key/);
-    expect(() => validateAssertion({ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'BTRIM' } as never)).toThrow(/exactly 'btrim' or 'none'/);
+    expect(() => validateAssertion({ kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'BTRIM' } as never)).toThrow(/exactly 'btrim', 'btrim-nullif-empty' or 'none'/);
     expect(() => validateAssertion({ kind: 'no-duplicates', table: 'users', column: 'phone', skipNulls: 'yes' } as never)).toThrow(/exact boolean/);
     expect(() => validateAssertion({ kind: 'no-duplicates', table: 'Users', column: 'phone' } as never)).toThrow(/invalid assertion/);
     expect(() => validateAssertion({ kind: 'no-duplicates', table: 'public.users', column: 'phone' } as never)).toThrow(/invalid assertion/);

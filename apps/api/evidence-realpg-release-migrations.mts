@@ -15,7 +15,9 @@
  *  construction-impossibility sweep, sequence restore contract, default
  *  privilege lockdown.
  *
- *  Usage: tsx evidence-realpg-release-migrations.mts <phase1|phase2|phase3|phase4> <socketDirOrHost> <port>
+ *  Usage: tsx evidence-realpg-release-migrations.mts <phase1|phase2|phase3|phase4|phase5> <socketDirOrHost> <port>
+ *  phase5 (SA1 attended-TOFU): requires OPERATOR_ACK=ack:<preflight listDigest>;
+ *  run once WITHOUT it to obtain the digest (gate refuses, digest printed).
  */
 import { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
@@ -329,7 +331,7 @@ if (phase === 'phase1') {
   check('R4 anchor A: a wrong expected digest is detectably different', REGISTRY_DIGEST !== 'deadbeef'.repeat(8));
   // R4 section 1: the registry/named forms/render capability are not on the
   // module surface - external mutation is IMPOSSIBLE (OBSERVED undefined).
-  for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'getTemplate', 'renderStepStatements', 'templateHash', 'bindIdentifier', 'bindLiteral']) {
+  for (const name of ['TEMPLATES', 'NAMED_EXPRESSIONS', 'NAMED_PREDICATES', 'NAMED_NORMALIZATIONS', 'getTemplate', 'renderStepStatements', 'templateHash', 'bindIdentifier', 'bindLiteral']) {
     const surfaced = (runnerModule as Record<string, unknown>)[name];
     console.error(`OBSERVED[confined surface ${name}]: ${typeof surfaced}`);
     check(`R4: registry surface confined - ${name} not exported`, surfaced === undefined, typeof surfaced);
@@ -608,8 +610,91 @@ if (phase === 'phase1') {
   await run.end(); await mig.end(); await adminC.end();
   await admin.query(`DROP DATABASE contake_conf WITH (FORCE)`);
   await admin.query(`DROP ROLE conf_runtime`); await admin.query(`DROP ROLE conf_migrator`);
+} else if (phase === 'phase5') {
+  // SA1 ruling (2026-09-19): attended-TOFU operator gate. The read-only
+  // preflight runs FIRST; its inconsistency list is recorded; the migration
+  // executes ONLY after explicit operator acknowledgment of the list digest.
+  const { execFileSync } = await import('node:child_process');
+  await admin.query(`DROP DATABASE IF EXISTS contake_tofu WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_tofu`);
+  const tofu = mk('contake_tofu');
+  await runMigrations(tofu, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  const ins = (id: string, phone: string | null, jp?: string) =>
+    tofu.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES($1, 'org-1', $2, $3, $4::jsonb)`,
+      [id, `${id}@example.com`, phone, JSON.stringify(jp === undefined ? {} : { phone: jp })]);
+  await ins('u-blank-1', '');
+  await ins('u-blank-2', '   ');
+  await ins('u-inconsistent', ' +972555000111 ', '+972555000222'); // cross-representation
+  await ins('u-padded', '  +972555000333  ');
+  const url = `postgres://postgres@${host}:${port}/contake_tofu`;
+  const before = await tofu.query(`SELECT count(*)::int AS n FROM users`);
+
+  // 1) preflight FIRST, read-only (session forced default_transaction_read_only).
+  const preflightJson = execFileSync('npx', ['tsx', 'scripts/users-phone-preflight.mts', '--database-url', url], { encoding: 'utf8' });
+  const preflight = JSON.parse(preflightJson) as { listDigest: string; crossRepresentationInconsistencies: unknown[]; blankPhoneUsers: unknown[]; collisionGroups: unknown[]; operatorDecisionRequired: boolean };
+  out['preflight'] = preflight;
+  console.error(`OBSERVED[preflight listDigest]: ${preflight.listDigest}`);
+  console.error(`OBSERVED[preflight inconsistencies]: ${JSON.stringify(preflight.crossRepresentationInconsistencies)}`);
+  check('preflight ran FIRST and recorded the inconsistency list', preflight.crossRepresentationInconsistencies.length === 1
+    && JSON.stringify(preflight.crossRepresentationInconsistencies).includes('u-inconsistent'), preflight.crossRepresentationInconsistencies);
+  check('preflight recorded both blank phones', preflight.blankPhoneUsers.length === 2, preflight.blankPhoneUsers);
+  check('preflight flagged operator decision', preflight.operatorDecisionRequired === true);
+  const after = await tofu.query(`SELECT count(*)::int AS n FROM users`);
+  check('preflight was read-only (row data untouched)', Number(before.rows[0]?.['n']) === Number(after.rows[0]?.['n']));
+
+  // 2) the gate: NO execution without an exact acknowledgment of THIS list.
+  const requiredAck = `ack:${preflight.listDigest}`;
+  console.error(`OBSERVED[required ack]: ${requiredAck}`);
+  const supplied = process.env['OPERATOR_ACK'] ?? '';
+  if (supplied !== requiredAck) {
+    // The refusal IS the evidence for a no-ack run: the migration does not
+    // execute; the exact required acknowledgment is printed for the operator.
+    console.error(`CHECK PASS attended-TOFU gate refuses without the exact operator acknowledgment (supplied=${supplied === '' ? '(none)' : 'mismatch'})`);
+    console.error(`GATE: to execute, the operator reviews the list above and re-runs with OPERATOR_ACK=${requiredAck}`);
+    (out.checks as unknown[]).push({ name: 'attended-TOFU gate refuses without the exact operator acknowledgment', ok: true, detail: `REFUSED as designed; required ${requiredAck}` });
+    out['gateOutcome'] = 'REFUSED-no-ack';
+    console.log(JSON.stringify(out, null, 2));
+    await tofu.end();
+    await admin.query(`DROP DATABASE contake_tofu WITH (FORCE)`);
+    await admin.end();
+    process.exit(0);
+  }
+  out['operatorAcknowledgment'] = { ack: supplied, listDigest: preflight.listDigest, ordering: 'preflight-before-migration' };
+  check('explicit operator acknowledgment recorded before execution', supplied === requiredAck);
+
+  // 3) execution AFTER acknowledgment: SA1 semantics on REAL PG.
+  const r = await runMigrations(tofu, { deployment: 'staging' }); // full registry; 0001 already recorded
+  check('tofu: 0002+0003 applied after acknowledgment', r.appliedNow.join(',') === '0002,0003', r.appliedNow);
+  const rows = await tofu.query(`SELECT user_id, phone, data->>'phone' AS jp FROM users ORDER BY user_id`);
+  const byId = Object.fromEntries(rows.rows.map(x => [String(x['user_id']), x]));
+  check('tofu: two blank phones normalize to NULL (absence, not identity)',
+    byId['u-blank-1']?.['phone'] === null && byId['u-blank-2']?.['phone'] === null, [byId['u-blank-1'], byId['u-blank-2']]);
+  check('tofu: padded real phone trimmed to its own value', byId['u-padded']?.['phone'] === '+972555000333', byId['u-padded']);
+  check('tofu: cross-representation inconsistency preserved per-representation (operator boundary)',
+    byId['u-inconsistent']?.['phone'] === '+972555000111' && byId['u-inconsistent']?.['jp'] === '+972555000222', byId['u-inconsistent']);
+  const tIdx = await tofu.query(`SELECT to_regclass('users_phone_unique') AS r`);
+  check('tofu: canonical index BUILT with absent phones excluded', tIdx.rows[0]?.['r'] !== null);
+  const noMatch = await tofu.query(`SELECT count(*)::int AS n FROM users WHERE phone = ''`);
+  check('tofu: login-by-phone can never match a NULL phone', Number(noMatch.rows[0]?.['n']) === 0);
+
+  // 4) a REAL cross-tenant phone collision still blocks loudly.
+  await admin.query(`DROP DATABASE IF EXISTS contake_tofu2 WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_tofu2`);
+  const tofu2 = mk('contake_tofu2');
+  await runMigrations(tofu2, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  await tofu2.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u-a', 'org-1', '+972555000444', '{}')`);
+  await tofu2.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u-b', 'org-2', '  +972555000444 ', '{}')`);
+  let blocked = false;
+  try { await runMigrations(tofu2, { deployment: 'staging' }); }
+  catch (e) { blocked = /ASSERTION refusal - guard 'no-duplicates' in '0002'/.test(String(e)); }
+  check('tofu: a real cross-tenant phone collision still BLOCKS loudly', blocked);
+  const t2 = await tofu2.query(`SELECT to_regclass('users_phone_unique') AS r`);
+  check('tofu: blocked run built nothing', t2.rows[0]?.['r'] === null);
+  await tofu2.end(); await tofu.end();
+  await admin.query(`DROP DATABASE contake_tofu2 WITH (FORCE)`);
+  await admin.query(`DROP DATABASE contake_tofu WITH (FORCE)`);
 } else {
-  throw new Error('phase1|phase2|phase3|phase4 required');
+  throw new Error('phase1|phase2|phase3|phase4|phase5 required');
 }
 await admin.end();
 console.log(JSON.stringify(out, null, 2));
