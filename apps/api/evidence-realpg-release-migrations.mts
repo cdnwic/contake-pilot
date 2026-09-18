@@ -32,7 +32,7 @@ const R = await import(RUNNER_PATH) as typeof import('./src/migrations/runner.js
 const S = await import(SEED_PATH) as typeof import('./src/migrations/staging-seed.js');
 const {
   MIGRATIONS, REGISTRY_DIGEST, assertDirectDatabaseUrl, assertSchemaCurrent, assertSingleStatementForms, assertZeroCatalogDelta, catalogSnapshot,
-  computeUsersPhonePreflight, operatorAckFor, restoreSequenceValues, runMigrations, sequenceValues, stepDigest,
+  computeUsersPhonePreflight, operatorAckFor, operatorListDigestForReview, restoreSequenceValues, runMigrations, sequenceValues, stepDigest,
 } = R;
 /** SA2: evidence lanes mint the attended-TOFU ack from the runner's canonical
  *  preflight against the CURRENT state (the runner recomputes in-transaction). */
@@ -693,9 +693,39 @@ if (phase === 'phase1') {
   console.error(`OBSERVED[cli replayed-ack]: status=${replayed.status}`);
   check('REAL CLI refuses a REPLAYED ack (minted against another target)', replayed.status !== 0 && replayed.stderr.includes('OPERATOR GATE refusal'), { status: replayed.status });
 
-  const fabricated = cli(['--database-url', url, '--deployment', 'staging', '--ack', `ack:${'0'.repeat(64)}`]);
+  const fabricated = cli(['--database-url', url, '--deployment', 'staging', '--ack', `ack:${'f'.repeat(16)}:${'0'.repeat(64)}`]);
   check('REAL CLI refuses a fabricated ack (no preflight ever produced it)', fabricated.status !== 0 && fabricated.stderr.includes('OPERATOR GATE refusal'), { status: fabricated.status });
   check('all refusals applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+
+  // SA2-A acceptance: PLAN-MISMATCH presentation (ack minted for 0002-only / 0003-alone)
+  const tamperedPlanAck = (keep: string) => `ack:${pf.nonce}:${operatorListDigestForReview({
+    target: pf.target, deployment: pf.deployment, nonce: pf.nonce, plan: pf.plan.filter((x: { version: string }) => x.version === keep),
+    collisionGroups: pf.collisionGroups, crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies, blankPhoneUsers: pf.blankPhoneUsers,
+  })}`;
+  const planMismatch2 = cli(['--database-url', url, '--deployment', 'staging', '--ack', tamperedPlanAck('0002')]);
+  const planMismatch3 = cli(['--database-url', url, '--deployment', 'staging', '--ack', tamperedPlanAck('0003')]);
+  check('REAL CLI refuses PLAN-MISMATCH presentations (0002-only / 0003-alone)',
+    planMismatch2.status !== 0 && planMismatch2.stderr.includes('OPERATOR GATE refusal')
+    && planMismatch3.status !== 0 && planMismatch3.stderr.includes('OPERATOR GATE refusal'), { s2: planMismatch2.status, s3: planMismatch3.status });
+  check('plan-mismatch refusals applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+
+  // SA2-A acceptance: POST-ABORT reuse. A gated 0003 variant whose guard
+  // always fires aborts the plan AFTER the ack was accepted at 0002; the
+  // invalidation is recorded append-only and the same ack can never return.
+  const failingPlan = [...MIGRATIONS.slice(0, 2), { ...MIGRATIONS[2]!, assertions: [{ kind: 'table-empty', table: 'users' }] }];
+  const pfAbort = preflight(url); // plan binding: default registry... mint against the failing plan via the runner seam instead
+  void pfAbort;
+  const pfAbortReal = await computeUsersPhonePreflight(tofu, { deployment: 'staging', migrations: failingPlan });
+  const abortAck = operatorAckFor(pfAbortReal);
+  let aborted = '';
+  try { await runMigrations(tofu, { deployment: 'staging', migrations: failingPlan, operatorAck: abortAck }); } catch (e) { aborted = String(e); }
+  check('abort injection: failing guarded 0003 aborts the plan after the ack was accepted', /ASSERTION refusal - guard 'table-empty'/.test(aborted), aborted.slice(0, 160));
+  check('abort rolled the WHOLE plan back (nothing past 0001)', JSON.stringify(await applied()) === '["0001"]', await applied());
+  const invRows = (await tofu.query(`SELECT kind FROM public.schema_migration_evidence WHERE kind = 'attended-tofu-invalidated'`)).rows;
+  check('abort INVALIDATED the ack (append-only evidence survives the rollback)', invRows.length === 1, invRows);
+  let replayRefused = '';
+  try { await runMigrations(tofu, { deployment: 'staging', migrations: failingPlan, operatorAck: abortAck }); } catch (e) { replayRefused = String(e); }
+  check('POST-ABORT REPLAY of the exact same ack refuses (single-use attended authorization)', /REPLAY/.test(replayRefused), replayRefused.slice(0, 200));
 
   // 3) GREEN PATH: operator reviews the preflight, supplies THIS target+state ack.
   const green = cli(['--database-url', url, '--deployment', 'staging', '--ack', pf.requiredAck]);
@@ -714,16 +744,22 @@ if (phase === 'phase1') {
   check('tofu: login-by-phone can never match a NULL phone', Number(noMatch.rows[0]?.['n']) === 0);
 
   // 4) the acknowledged report + digest PERSISTED as migration evidence.
-  const ev = await tofu.query(`SELECT version, list_digest, target, report FROM public.schema_migration_evidence ORDER BY version`);
+  const ev = await tofu.query(`SELECT version, list_digest, target, report FROM public.schema_migration_evidence WHERE kind = 'attended-tofu' ORDER BY version`);
   // 0002 persists the ACKED digest (pre-execution lists); 0003 persists its
   // OWN in-transaction recompute (post-normalization lists) - both carry the
-  // same operator ack string in their report.
+  // same operator ack string + plan + per-step pre/post state digests, and
+  // each step's post digest EQUALS its pre digest (canonical derivation over
+  // the idempotent normalized projection; SA2-A 2(c)).
   check('acknowledged report/digest persisted with the migration evidence (0002 + 0003)',
     JSON.stringify(ev.rows.map(x => String(x['version']))) === '["0002","0003"]'
     && String(ev.rows[0]!['list_digest']) === pf.listDigest
     && String(ev.rows[1]!['list_digest']) !== pf.listDigest
     && ev.rows.every(x => String(x['target']) === 'contake_tofu')
-    && ev.rows.every(x => String((x['report'] as { ack?: string }).ack) === pf.requiredAck), ev.rows.map(x => ({ version: x['version'], list_digest: String(x['list_digest']).slice(0, 16), target: x['target'] })));
+    && ev.rows.every(x => String((x['report'] as { ack?: string }).ack) === pf.requiredAck)
+    && ev.rows.every(x => (x['report'] as { preStateDigest?: string }).preStateDigest === (x['report'] as { postStateDigest?: string }).postStateDigest)
+    && ev.rows.every(x => Array.isArray((x['report'] as { plan?: unknown[] }).plan)), ev.rows.map(x => ({ version: x['version'], list_digest: String(x['list_digest']).slice(0, 16), target: x['target'] })));
+  const bootRow = (await tofu.query(`SELECT version, list_digest FROM public.schema_migration_evidence WHERE kind = 'runner-bootstrap'`)).rows;
+  check('evidence-table bootstrap creation self-recorded once (SA2-A 3(c))', bootRow.length === 1 && String(bootRow[0]!['version']) === '0000', bootRow);
 
   // 5) a REAL cross-tenant phone collision still blocks loudly WITH a valid ack
   //    (the ack is a precondition, never an override).

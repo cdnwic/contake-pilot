@@ -24,6 +24,7 @@ try {
   const report = {
     tool: 'users-phone-preflight', readOnly: true, generatedAt: new Date().toISOString(),
     target: pf.target, deployment: pf.deployment,
+    plan: pf.plan, nonce: pf.nonce,
     collisionGroups: pf.collisionGroups,
     crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies,
     blankPhoneUsers: pf.blankPhoneUsers,

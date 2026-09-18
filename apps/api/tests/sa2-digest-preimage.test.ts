@@ -21,6 +21,8 @@ import {
  *  without updating this test fails loudly here (drift alarm). */
 const EXPECTED_INVENTORY = [
   'frozen-baseline:0001-baseline',
+  'runner-ddl:runner-ddl.schema-migrations+identity',
+  'runner-ddl:runner-ddl.schema-migration-evidence',
   'template:init.schema-baseline.0001',
   'template:ddl.create-index',
   'template:data.normalize-users-phone',

@@ -22,7 +22,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { pgliteConnectable, type Connectable } from '../src/repo/postgres.js';
 import {
   EXPECTED_SCHEMA_VERSIONS, MIGRATIONS, assertSchemaCurrent, runMigrations,
-  computeUsersPhonePreflight, operatorAckFor, runMigrations } from '../src/migrations/runner.js';
+  computeUsersPhonePreflight, operatorAckFor, operatorListDigestForReview, runMigrations } from '../src/migrations/runner.js';
 
 const pgOnly = process.env['REPO_IMPL'] === 'memory' ? describe.skip : describe;
 
@@ -205,9 +205,14 @@ describe('SA2 operator gate (runner-enforced, recomputed under lock)', () => {
       const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
       const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) });
       expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
-      const ev = await db.query(`SELECT version, kind, list_digest, target FROM public.schema_migration_evidence ORDER BY version`);
+      const ev = await db.query(`SELECT version, kind, list_digest, target FROM public.schema_migration_evidence WHERE kind = 'attended-tofu' ORDER BY version`);
       expect(ev.rows.map(x => x['version'])).toEqual(['0002', '0003']);
       expect(ev.rows[0]!['list_digest']).toMatch(/^[0-9a-f]{64}$/);
+      // SA2-A 3(c): the evidence table's own bootstrap creation is self-recorded once.
+      const boot = await db.query(`SELECT version, kind, list_digest FROM public.schema_migration_evidence WHERE kind = 'runner-bootstrap'`);
+      expect(boot.rows.length).toBe(1);
+      expect(boot.rows[0]!['version']).toBe('0000');
+      expect(boot.rows[0]!['list_digest']).toMatch(/^[0-9a-f]{64}$/);
     } finally { await raw.close(); }
   });
   it('stale ack refuses: state changed after the ack was minted', async () => {
@@ -271,9 +276,13 @@ describe('SA2 operator gate (runner-enforced, recomputed under lock)', () => {
       expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
       // the recomputed post-0002 lists differ from the acked ones; evidence
       // records the recomputed digest per step.
-      const ev = await db.query(`SELECT version, list_digest FROM public.schema_migration_evidence ORDER BY version`);
+      const ev = await db.query(`SELECT version, list_digest FROM public.schema_migration_evidence WHERE kind = 'attended-tofu' ORDER BY version`);
       expect(ev.rows.length).toBe(2);
       expect(ev.rows[0]!['list_digest']).not.toBe(ev.rows[1]!['list_digest']);
+      // SA2-A 2(c): per-step pre/post state digests persisted, equal per step
+      // (canonical derivation over the idempotent normalized projection).
+      const dig = await db.query(`SELECT version, report->>'preStateDigest' AS pre, report->>'postStateDigest' AS post FROM public.schema_migration_evidence WHERE kind = 'attended-tofu' ORDER BY version`);
+      for (const row of dig.rows) { expect(row['post']).toBe(row['pre']); expect(String(row['pre'])).toMatch(/^[0-9a-f]{64}$/); }
     } finally { await raw.close(); }
   });
   it('the accepted ack does NOT leak across runs: a later gated step demands a FRESH ack', async () => {
@@ -291,9 +300,75 @@ describe('SA2 operator gate (runner-enforced, recomputed under lock)', () => {
       // recompute must match - the old ack covers nothing new.
       await expect(runMigrations(db, { deployment: STAGING, migrations: [...MIGRATIONS, late], operatorAck: 'ack:' + '0'.repeat(64) }))
         .rejects.toThrow('OPERATOR GATE refusal');
-      const pfNow = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      const pfNow = await computeUsersPhonePreflight(db, { deployment: STAGING, migrations: [...MIGRATIONS, late] });
       const ok = await runMigrations(db, { deployment: STAGING, migrations: [...MIGRATIONS, late], operatorAck: operatorAckFor(pfNow) });
       expect(ok.appliedNow).toEqual(['0004']);
+    } finally { await raw.close(); }
+  });
+  it('SA2-A acceptance: PLAN-MISMATCH presentation refuses (ack minted for 0002-only or 0003-alone)', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      expect(pf.plan.map(x => x.version)).toEqual(['0002', '0003']);
+      const tamperedPlan = (keep: string) => operatorListDigestForReview({
+        target: pf.target, deployment: pf.deployment, nonce: pf.nonce,
+        plan: pf.plan.filter(x => x.version === keep),
+        collisionGroups: pf.collisionGroups, crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies, blankPhoneUsers: pf.blankPhoneUsers,
+      });
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: `ack:${pf.nonce}:${tamperedPlan('0002')}` })).rejects.toThrow('OPERATOR GATE refusal');
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: `ack:${pf.nonce}:${tamperedPlan('0003')}` })).rejects.toThrow('OPERATOR GATE refusal');
+    } finally { await raw.close(); }
+  });
+  it('SA2-A acceptance: POST-ABORT reuse refuses; the abort invalidates the ack (append-only evidence); a fresh mint succeeds', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      await seedClean(db);
+      // gated 0003 whose guard always fires on seeded data -> aborts the plan
+      // AFTER the ack was accepted at 0002.
+      const failing0003: typeof MIGRATIONS[number] = {
+        ...MIGRATIONS[2]!,
+        assertions: [{ kind: 'table-empty', table: 'users' }],
+      };
+      const plan = [...MIGRATIONS.slice(0, 2), failing0003];
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING, migrations: plan });
+      const ack = operatorAckFor(pf);
+      await expect(runMigrations(db, { deployment: STAGING, migrations: plan, operatorAck: ack }))
+        .rejects.toThrow(/ASSERTION refusal - guard 'table-empty'/);
+      // whole plan rolled back: nothing applied past 0001
+      const applied = await db.query(`SELECT version FROM public.schema_migrations ORDER BY seq`);
+      expect(applied.rows.map(x => x['version'])).toEqual(['0001']);
+      // the invalidation is recorded append-only and survives the rollback
+      const inv = await db.query(`SELECT kind, report->>'ack' AS ack FROM public.schema_migration_evidence WHERE kind = 'attended-tofu-invalidated'`);
+      expect(inv.rows.length).toBe(1);
+      expect(inv.rows[0]!['ack']).toBe(ack);
+      // REPLAY of the exact same ack (same plan, unchanged state) refuses on
+      // the single-use evidence trail even though plan+lists+nonce all match
+      await expect(runMigrations(db, { deployment: STAGING, migrations: plan, operatorAck: ack })).rejects.toThrow(/REPLAY/);
+      // a FRESH attended ack (new nonce) over the unchanged state succeeds
+      const pf2 = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      expect(operatorAckFor(pf2)).not.toBe(ack);
+      const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf2) });
+      expect(r.appliedNow).toEqual(['0002', '0003']);
+    } finally { await raw.close(); }
+  });
+  it('SA2-A acceptance: a CONSUMED ack authorizes nothing further (later gated step refuses the old string; applied plan is an idempotent no-op)', async () => {
+    const raw = new PGlite(); const db = pgliteConnectable(raw);
+    try {
+      const pf = await computeUsersPhonePreflight(db, { deployment: STAGING });
+      const ack = operatorAckFor(pf);
+      await runMigrations(db, { deployment: STAGING, operatorAck: ack });
+      // nothing pending: the same run is a plain no-op (gate never engages)
+      const again = await runMigrations(db, { deployment: STAGING, operatorAck: ack });
+      expect(again.appliedNow).toEqual([]);
+      // a LATER gated step presented with the CONSUMED ack: plan binding
+      // refuses it (the ack names 0002+0003, not 0004)
+      const late: typeof MIGRATIONS[number] = {
+        version: '0004', name: 'later-gated', description: 'later gated step', template: 'ddl.create-index',
+        params: { index: 'users_phone_org_idx', table: 'users', unique: 'unique', expression: 'EXPR_NORM_PHONE', predicate: 'PRED_PHONE_NOT_NULL', ifNotExists: 'if-not-exists' },
+        requiresOperatorAck: true,
+      };
+      await expect(runMigrations(db, { deployment: STAGING, migrations: [...MIGRATIONS, late], operatorAck: ack }))
+        .rejects.toThrow('OPERATOR GATE refusal');
     } finally { await raw.close(); }
   });
   it("test deployments stay gate-exempt (hermetic synthetic lanes)", async () => {
