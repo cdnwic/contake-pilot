@@ -49,6 +49,18 @@ describe('canonical MAC key + bounded ids (v6)', () => {
       catch (e) { expect((e as Error).message).not.toContain(bad.slice(0, 8)); } // never logs the key
     }
   });
+  it('Buffer/non-string key forms are REJECTED outright (single canonical string path): all-zero, sequential, even random Buffers', async () => {
+    const { requireAuth } = await import('../src/services/phone-migration.js');
+    for (const buf of [Buffer.alloc(32, 0), Buffer.from(Array.from({ length: 32 }, (_, i) => i)), randomBytes(32)]) {
+      expect(() => requireAuth({ key: buf as unknown as string, keyId: 'test-key-v1', env: 'test-deploy-01' }))
+        .toThrow(/canonical STRING form/);
+    }
+    // string/Buffer equivalence is therefore VACUOUS: only the canonical
+    // string decodes and passes the one decoded-byte weakness check
+    const good = generateBackupMacKey();
+    expect(requireAuth({ key: good, keyId: 'test-key-v1', env: 'test-deploy-01' }).key).toBe(good);
+  });
+
   it('bounded canonical keyId; unique deployment env IDs (generic labels refused)', () => {
     expect(parseBackupKeyId('bkp-2026-09-v1')).toBe('bkp-2026-09-v1');
     expect(() => parseBackupKeyId('UPPER')).toThrow(/keyId/);
@@ -62,6 +74,17 @@ describe('canonical MAC key + bounded ids (v6)', () => {
   });
 });
 
+describe('authoritative deployment/key allowlist gate (v7)', () => {
+  it('accepts allowlisted env + key version; rejects non-allowlisted and empty lists', async () => {
+    const { assertAuthAllowed } = await import('../src/services/phone-migration.js');
+    const a = auth();
+    assertAuthAllowed(a, { allowedEnvs: ['test-deploy-01', 'test-deploy-02'], allowedKeyIds: ['test-key-v1'] });
+    expect(() => assertAuthAllowed(a, { allowedEnvs: ['other-deploy'], allowedKeyIds: ['test-key-v1'] })).toThrow(/NOT in the authoritative allowlist/);
+    expect(() => assertAuthAllowed(a, { allowedEnvs: ['test-deploy-01'], allowedKeyIds: ['test-key-v9'] })).toThrow(/NOT in the authoritative allowlist/);
+    expect(() => assertAuthAllowed(a, { allowedEnvs: [], allowedKeyIds: [] })).toThrow(/allowlist is EMPTY/);
+  });
+});
+
 describe('durable race-safe publication (v6)', () => {
   it('publishes: temp 0600 + fsync + temp readback validation + atomic no-clobber link + dir fsync; valid final file', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'pub-'));
@@ -69,7 +92,7 @@ describe('durable race-safe publication (v6)', () => {
     const a = auth();
     const lines = await makeLines(a);
     let dirFsynced = '';
-    const n = await publishBackupFile(file, lines, { overwrite: false, auth: a }, { fsyncDir: async d => { dirFsynced = d; } });
+    const n = await publishBackupFile(file, lines, { auth: a }, { fsyncDir: async d => { dirFsynced = d; } });
     expect(n).toBe(1);
     expect(dirFsynced).toBe(dir);
     const { statSync } = await import('node:fs');
@@ -83,8 +106,8 @@ describe('durable race-safe publication (v6)', () => {
     const file = join(dir, 'b.jsonl');
     const a = auth();
     const [r1, r2] = await Promise.allSettled([
-      publishBackupFile(file, await makeLines(a), { overwrite: false, auth: a }),
-      publishBackupFile(file, await makeLines(a), { overwrite: false, auth: a }),
+      publishBackupFile(file, await makeLines(a), { auth: a }),
+      publishBackupFile(file, await makeLines(a), { auth: a }),
     ]);
     const outcomes = [r1, r2].map(r => r.status);
     expect(outcomes.sort()).toEqual(['fulfilled', 'rejected']);
@@ -99,7 +122,7 @@ describe('durable race-safe publication (v6)', () => {
     const file = join(dir, 'b.jsonl');
     const a = auth();
     const bad = ['{"type":"users-phone-backup-header","version":2}', '{"user_id":"u-1"}'];
-    await expect(publishBackupFile(file, bad, { overwrite: false, auth: a })).rejects.toThrow();
+    await expect(publishBackupFile(file, bad, { auth: a })).rejects.toThrow();
     expect(existsSync(file)).toBe(false);
     expect(readdirSync(dir).filter(f => f.includes('.tmp-')).length).toBe(0);
   });
@@ -109,7 +132,7 @@ describe('durable race-safe publication (v6)', () => {
     const file = join(dir, 'b.jsonl');
     const a = auth();
     const lines = await makeLines(a);
-    await expect(publishBackupFile(file, lines, { overwrite: false, auth: a }, { link: async () => { throw new Error('injected link failure'); } })).rejects.toThrow(/injected link failure/);
+    await expect(publishBackupFile(file, lines, { auth: a }, { link: async () => { throw new Error('injected link failure'); } })).rejects.toThrow(/injected link failure/);
     expect(existsSync(file)).toBe(false);
     expect(readdirSync(dir).filter(f => f.includes('.tmp-')).length).toBe(0);
   });
@@ -120,27 +143,27 @@ describe('durable race-safe publication (v6)', () => {
     const a = auth();
     const lines = await makeLines(a);
     // crash right at the publish primitive
-    await expect(publishBackupFile(file, lines, { overwrite: false, auth: a }, {
+    await expect(publishBackupFile(file, lines, { auth: a }, {
       link: async () => { const e = new Error('simulated crash') as NodeJS.ErrnoException; e.code = 'EIO'; throw e; },
     })).rejects.toThrow(/simulated crash/);
     expect(existsSync(file)).toBe(false);
     expect(readdirSync(dir).length).toBe(0);
   });
 
-  it('no-clobber refuses an existing destination even with valid content; overwrite atomically replaces and keeps old on failure', async () => {
+  it('no-clobber ONLY (overwrite removed in v7): existing destination always EEXIST, old bytes preserved exactly, temp cleaned; fresh publish after manual removal', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'pub-ow-'));
     const file = join(dir, 'b.jsonl');
     writeFileSync(file, 'OLD-CONTENT');
     const a = auth();
     const lines = await makeLines(a);
-    await expect(publishBackupFile(file, lines, { overwrite: false, auth: a })).rejects.toThrow(/EEXIST/);
-    expect(readFileSync(file, 'utf8')).toBe('OLD-CONTENT');
-    // overwrite path: injected rename failure keeps the OLD content, temp cleaned
-    await expect(publishBackupFile(file, lines, { overwrite: true, auth: a }, { rename: async () => { throw new Error('injected rename failure'); } })).rejects.toThrow(/injected rename failure/);
-    expect(readFileSync(file, 'utf8')).toBe('OLD-CONTENT');
+    await expect(publishBackupFile(file, lines, { auth: a })).rejects.toThrow(/EEXIST/);
+    expect(readFileSync(file, 'utf8')).toBe('OLD-CONTENT'); // exact old bytes, never an ambiguous failed-new state
     expect(readdirSync(dir).filter(f => f.includes('.tmp-')).length).toBe(0);
-    // real overwrite succeeds
-    await publishBackupFile(file, lines, { overwrite: true, auth: a });
+    expect((publishBackupFile as unknown as { length: number }).length).toBeGreaterThanOrEqual(2);
+    // the deliberate rotation path: operator removes the old file, fresh publish succeeds
+    const { unlinkSync } = await import('node:fs');
+    unlinkSync(file);
+    await publishBackupFile(file, lines, { auth: a });
     expect(readFileSync(file, 'utf8')).toBe(lines.join('\n') + '\n');
   });
 
@@ -149,10 +172,10 @@ describe('durable race-safe publication (v6)', () => {
     const file = join(dir, 'b.jsonl');
     const a = auth();
     const lines = await makeLines(a);
-    await publishBackupFile(file, lines, { overwrite: false, auth: a }, { fsyncDir: async () => { const e = new Error('x') as NodeJS.ErrnoException; e.code = 'EINVAL'; throw e; } });
+    await publishBackupFile(file, lines, { auth: a }, { fsyncDir: async () => { const e = new Error('x') as NodeJS.ErrnoException; e.code = 'EINVAL'; throw e; } });
     expect(existsSync(file)).toBe(true);
     const file2 = join(dir, 'c.jsonl');
-    await expect(publishBackupFile(file2, lines, { overwrite: false, auth: a }, { fsyncDir: async () => { const e = new Error('disk gone') as NodeJS.ErrnoException; e.code = 'EIO'; throw e; } })).rejects.toThrow(/disk gone/);
+    await expect(publishBackupFile(file2, lines, { auth: a }, { fsyncDir: async () => { const e = new Error('disk gone') as NodeJS.ErrnoException; e.code = 'EIO'; throw e; } })).rejects.toThrow(/disk gone/);
     expect(existsSync(file2)).toBe(false);
     expect(readdirSync(dir).filter(f => f.includes('.tmp-')).length).toBe(0);
   });

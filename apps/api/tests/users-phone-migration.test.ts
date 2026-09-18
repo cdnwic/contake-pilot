@@ -27,6 +27,12 @@ import { generateBackupMacKey } from '../src/services/phone-migration.js';
  *  secret store per CLI custody rules. env is a UNIQUE deployment ID. */
 const TEST_AUTH: ArtifactAuth = { key: generateBackupMacKey(), keyId: 'test-key-v1', env: 'test-deploy-01' };
 const TEST_AUTH_V2: ArtifactAuth = { ...TEST_AUTH, keyId: 'test-key-v2' };
+// CLI child env: test MAC credentials + the authoritative per-deployment
+// allowlists the CLI checks against (v7 operator gate).
+const cliEnv = () => ({ ...process.env,
+  CONTAKE_BACKUP_MAC_KEY: TEST_AUTH.key, CONTAKE_BACKUP_KEY_ID: TEST_AUTH.keyId, CONTAKE_BACKUP_ENV: TEST_AUTH.env,
+  CONTAKE_BACKUP_ALLOWED_ENVS: `${TEST_AUTH.env},staging-pg-a,production-pg-a,staging-pg-b`,
+  CONTAKE_BACKUP_ALLOWED_KEY_IDS: `${TEST_AUTH.keyId},test-key-v2` });
 
 /** Re-MAC a (possibly tampered) artifact with the TEST key: produces a
  *  MAC-AUTHENTIC artifact so the INNER verification layers (row digests,
@@ -538,7 +544,7 @@ pgOnly('CLI v4 (security 2026-09-18)', () => {
     const backupFile = join(mkdtempSync(join(tmpdir(), 'upm-cli-')), 'backup.jsonl');
     const out = execFileSync(process.execPath, ['scripts/users-phone-migrate.mjs', '--database-url', process.env['DATABASE_URL'] as string, '--backup', backupFile, '--maintenance'],
       { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8',
-        env: { ...process.env, CONTAKE_BACKUP_MAC_KEY: TEST_AUTH.key, CONTAKE_BACKUP_KEY_ID: TEST_AUTH.keyId, CONTAKE_BACKUP_ENV: TEST_AUTH.env } });
+        env: cliEnv() });
     expect(out).toMatch(/index present=true/);
     expect(out).toMatch(/final preflight clean=true/);
     expect(out).toMatch(/readback verified/);
@@ -617,6 +623,16 @@ pgOnly('artifact MAC authentication (QA/security 2026-09-18 v5)', () => {
     const lines = await backupNow({ ...TEST_AUTH, env: 'staging-pg-a' });
     await expect(restoreUsers(conn, lines, { ...TEST_AUTH, env: 'staging-pg-b' }))
       .rejects.toThrow(/cross-environment replay/);
+  });
+
+  it('createdAt must be a finite canonical timestamp: impossible dates and non-canonical values refused pre-mutation', async () => {
+    await insertLegacy(conn, 'u-ct1', 'org-1', '+15550102041', '+15550102041');
+    const lines = await backupNow();
+    for (const bad of ['2026-02-30T00:00:00.000Z', 'yesterday', '2026-09-18 10:00:00', '2026-13-01T00:00:00.000Z']) {
+      const h = { ...JSON.parse(lines[0]!), createdAt: bad };
+      await expect(restoreUsers(conn, reMac([JSON.stringify(h), ...lines.slice(1)]), TEST_AUTH), bad)
+        .rejects.toThrow(/finite canonical timestamp/);
+    }
   });
 
   it('key-version mismatch: artifact keyId v1 refused against provided keyId v2', async () => {
@@ -746,7 +762,6 @@ pgOnly('backup snapshot consistency + publication (QA/security 2026-09-18 v5)', 
 pgOnly('CLI durable publication (QA/security 2026-09-18 v5)', () => {
   const realPgOnly = REPO_IMPL === 'realpg' ? it : it.skip;
   const distReady = () => { try { return readFileSync(new URL('../dist/services/phone-migration.js', import.meta.url), 'utf8').includes('macSha256'); } catch { return false; } };
-  const cliEnv = () => ({ ...process.env, CONTAKE_BACKUP_MAC_KEY: TEST_AUTH.key, CONTAKE_BACKUP_KEY_ID: TEST_AUTH.keyId, CONTAKE_BACKUP_ENV: TEST_AUTH.env });
   const runCli = async (argv: string[], env: NodeJS.ProcessEnv = cliEnv()) => {
     const { execFileSync } = await import('node:child_process');
     try {
@@ -772,7 +787,7 @@ pgOnly('CLI durable publication (QA/security 2026-09-18 v5)', () => {
     await conn.query(`DELETE FROM users WHERE user_id='u-p1'`);
   });
 
-  realPgOnly('no overwrite without --overwrite-backup; no partial publication on failure', async () => {
+  realPgOnly('no-clobber only (overwrite removed v7): existing file preserved exactly, --overwrite-backup rejected; no partial publication on failure', async () => {
     if (!distReady()) return;
     const dir = mkdtempSync(join(tmpdir(), 'upm-ow-'));
     const file = join(dir, 'backup.jsonl');
@@ -780,9 +795,11 @@ pgOnly('CLI durable publication (QA/security 2026-09-18 v5)', () => {
     const r1 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file]);
     expect(r1.code).toBe(64);
     expect(r1.err).toMatch(/already exists/);
-    expect(readFileSync(file, 'utf8')).toBe('PRE-EXISTING');
+    expect(readFileSync(file, 'utf8')).toBe('PRE-EXISTING'); // exact old bytes
     const r2 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file, '--overwrite-backup']);
-    expect(r2.code).toBe(0);
+    expect(r2.code).toBe(64);
+    expect(r2.err).toMatch(/REMOVED in v7/);
+    expect(readFileSync(file, 'utf8')).toBe('PRE-EXISTING');
     // failure path: unreachable DB leaves NO final file
     const dead = join(dir, 'dead.jsonl');
     const r3 = await runCli(['--database-url', 'postgres://postgres@127.0.0.1:1/postgres', '--backup', dead]);
@@ -801,5 +818,44 @@ pgOnly('CLI durable publication (QA/security 2026-09-18 v5)', () => {
     expect(r.err).toMatch(/managed secret store/);
     const { existsSync } = await import('node:fs');
     expect(existsSync(file)).toBe(false);
+  });
+
+  realPgOnly('authoritative allowlist gate (v7): non-allowlisted env or key version -> exit 64, nothing written', async () => {
+    if (!distReady()) return;
+    const file = join(mkdtempSync(join(tmpdir(), 'upm-al-')), 'backup.jsonl');
+    const base = cliEnv();
+    const badEnv = { ...base, CONTAKE_BACKUP_ALLOWED_ENVS: 'some-other-deploy' };
+    const r1 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file], badEnv);
+    expect(r1.code).toBe(64);
+    expect(r1.err).toMatch(/NOT in the authoritative allowlist/);
+    const badKey = { ...base, CONTAKE_BACKUP_ALLOWED_KEY_IDS: 'some-other-version' };
+    const r2 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file], badKey);
+    expect(r2.code).toBe(64);
+    expect(r2.err).toMatch(/NOT in the authoritative allowlist/);
+    const missing = { ...base };
+    delete missing['CONTAKE_BACKUP_ALLOWED_ENVS'];
+    const r3 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', file], missing);
+    expect(r3.code).toBe(64);
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(file)).toBe(false);
+  });
+
+  realPgOnly('path canonicalization (v7): symlink restore input and alias-colliding backup/restore refused', async () => {
+    if (!distReady()) return;
+    const dir = mkdtempSync(join(tmpdir(), 'upm-path-'));
+    const real = join(dir, 'real.jsonl');
+    // produce a real artifact first
+    const r0 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', real]);
+    expect(r0.code).toBe(0);
+    const { symlinkSync } = await import('node:fs');
+    const alias = join(dir, 'alias.jsonl');
+    symlinkSync(real, alias);
+    // symlink restore input: refused
+    const r1 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', join(dir, 'b2.jsonl'), '--restore', alias]);
+    expect(r1.code).toBe(64);
+    expect(r1.err).toMatch(/symlink\/alias/);
+    // relative-alias collision: --restore ./real.jsonl resolved vs --backup pointing at the same actual file via ..
+    const r2 = await runCli(['--database-url', process.env['DATABASE_URL'] as string, '--backup', join(dir, 'sub', '..', 'real.jsonl'), '--restore', real]);
+    expect(r2.code).toBe(64);
   });
 });

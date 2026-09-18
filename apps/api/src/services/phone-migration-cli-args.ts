@@ -14,20 +14,22 @@ export interface MigrateCliArgs {
   backup?: string;
   restore?: string;
   maintenance: boolean;
-  overwriteBackup: boolean;
 }
 
 const VALUE_FLAGS = new Set(['--database-url', '--backup', '--restore']);
-const BOOL_FLAGS = new Set(['--maintenance', '--overwrite-backup']);
-const REMOVED_FLAGS = new Set(['--normalize', '--create-index']);
+const BOOL_FLAGS = new Set(['--maintenance']);
+const REMOVED_FLAGS = new Set(['--normalize', '--create-index', '--overwrite-backup']);
 
 export function parseMigrateCliArgs(argv: string[]): MigrateCliArgs {
-  const out: { databaseUrl?: string; backup?: string; restore?: string; maintenance: boolean; overwriteBackup: boolean } =
-    { maintenance: false, overwriteBackup: false };
+  const out: { databaseUrl?: string; backup?: string; restore?: string; maintenance: boolean } =
+    { maintenance: false };
   const seen = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (REMOVED_FLAGS.has(a)) {
+      if (a === '--overwrite-backup') {
+        throw new CliUsageError(`${a} was REMOVED in v7 (overwrite support removed entirely - no indeterminate post-fsync/rollback states). No-clobber is sufficient: remove an old artifact manually after operator approval, then publish fresh.`);
+      }
       throw new CliUsageError(`${a} was REMOVED in v4 (split mutating paths closed). Mutations go through --maintenance only.`);
     }
     if (VALUE_FLAGS.has(a)) {
@@ -44,8 +46,7 @@ export function parseMigrateCliArgs(argv: string[]): MigrateCliArgs {
     if (BOOL_FLAGS.has(a)) {
       if (seen.has(a)) throw new CliUsageError(`duplicate flag: ${a} (singleton flags may appear at most once)`);
       seen.add(a);
-      if (a === '--maintenance') out.maintenance = true;
-      else out.overwriteBackup = true;
+      out.maintenance = true;
       continue;
     }
     throw new CliUsageError(`unknown flag or argument: ${a}`);

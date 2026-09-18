@@ -66,15 +66,21 @@
  *    validation BEFORE publish, atomic no-clobber hard-link (EEXIST if the
  *    destination appeared) or explicit overwrite via atomic rename-replace,
  *    containing-directory fsync, temp/final cleanup on every failure.
- *  - REPLAY/FRESHNESS POLICY (documented, operator-approved): every backup
- *    carries a unique backupId + createdAt bound into the MAC. A restore
- *    is legitimate ONLY for an operator-approved recovery against the SAME
- *    deployment/database ID the artifact was MACed for; operators review
- *    backupId + createdAt (printed by the CLI on restore) before applying.
- *    Same-env-class cross-database replay is refused by the env binding;
- *    stale-artifact application is a human gate, not automatic.
+ *  - REPLAY/FRESHNESS is exposed ONLY as an EXPLICIT MANDATORY OPERATOR
+ *    GATE (security 2026-09-18): backupId + createdAt are validated
+ *    (shape + canonical finite timestamp) and bound into the MAC so the
+ *    evidence is trustworthy, and the CLI prints them before applying a
+ *    restore - but NO mechanical freshness/replay prevention is claimed:
+ *    a human operator MUST approve every restore against the SAME
+ *    deployment/database ID the artifact was MACed for.
+ *  - AUTHORITATIVE DEPLOYMENT/KEY CONFIG is a LIVE OPERATOR GATE: the
+ *    deployment ID and key version are verified at run time against the
+ *    managed per-deployment allowlists (CONTAKE_BACKUP_ALLOWED_ENVS /
+ *    CONTAKE_BACKUP_ALLOWED_KEY_IDS) - a runtime gate, not a source claim.
  *  - PER-DEPLOYMENT KEYS: each deployed database gets its OWN managed MAC
  *    key + keyId + unique env ID; keys are never shared across deployments.
+ *  - NO OVERWRITE (v7): backup publication is no-clobber only; overwrite
+ *    support was removed entirely (no indeterminate post-fsync states).
  *
  *  OPERATOR GATES for later live use (carried; NO live action now):
  *  1. explicit approval to run the read-only preflight against the live DB;
@@ -185,7 +191,10 @@ export const MIGRATION_LOCK_KEY = 7263849598301;
  *  keyId identifies the key VERSION (rotation); env binds the artifact to
  *  one environment/domain (cross-env replay is refused). */
 export interface ArtifactAuth {
-  key: string | Buffer;
+  /** Canonical form ONLY: exactly 64 lowercase hex chars (32 bytes). Buffers
+   *  and every other representation are REJECTED, so the decoded-byte
+   *  weakness checks below are the single code path for every caller. */
+  key: string;
   keyId: string;
   env: string;
 }
@@ -256,20 +265,38 @@ export const parseBackupEnv = (env: string): string => {
  *  any migration path. */
 export const generateBackupMacKey = (): string => randomBytes(32).toString('hex');
 
-const requireAuth = (auth: ArtifactAuth | undefined): ArtifactAuth => {
+export const requireAuth = (auth: ArtifactAuth | undefined): ArtifactAuth => {
   if (!auth || auth.key === undefined || auth.key === null) {
     throw new Error('artifact auth: external MAC key, keyId and env are REQUIRED (key from managed secrets only - never committed, never argv, never stored in the artifact)');
   }
-  if (typeof auth.key === 'string') parseBackupMacKey(auth.key); // canonical + strength (throws weak)
-  else if (!(auth.key.length === 32)) throw new Error('artifact auth: MAC key Buffer must be exactly 32 bytes');
+  if (typeof auth.key !== 'string') {
+    throw new Error('artifact auth: MAC key must be the canonical STRING form (64 lowercase hex); Buffer/other representations are rejected so all callers share one decoded-byte weakness check');
+  }
+  parseBackupMacKey(auth.key); // canonical + strength (throws weak)
   parseBackupKeyId(auth.keyId);
   parseBackupEnv(auth.env);
   return auth;
 };
 
+/** Authoritative allowlist gate (QA 2026-09-18 v7): the deployment ID and
+ *  key VERSION must be explicitly allowlisted for the RESOLVED deployment
+ *  (managed per-deployment config), not merely syntactically valid. The
+ *  CLI provisions both lists from the managed secret store. */
+export const assertAuthAllowed = (auth: ArtifactAuth, allowed: { allowedEnvs: readonly string[]; allowedKeyIds: readonly string[] }): void => {
+  if (allowed.allowedEnvs.length === 0 || allowed.allowedKeyIds.length === 0) {
+    throw new Error('artifact auth: authoritative allowlist is EMPTY - provision the per-deployment allowed env IDs and key versions from the managed secret store');
+  }
+  if (!allowed.allowedEnvs.includes(auth.env)) {
+    throw new Error(`artifact auth: deployment ID "${auth.env}" is NOT in the authoritative allowlist for the resolved database - refused`);
+  }
+  if (!allowed.allowedKeyIds.includes(auth.keyId)) {
+    throw new Error(`artifact auth: key version "${auth.keyId}" is NOT in the authoritative allowlist for the resolved database - refused`);
+  }
+};
+
 /** HMAC-SHA256 over the FULL canonical artifact content: the header
  *  without its MAC field plus every row line, in order. */
-export const artifactMac = (key: string | Buffer, headerSansMac: Record<string, unknown>, rows: Record<string, unknown>[]): string =>
+export const artifactMac = (key: string, headerSansMac: Record<string, unknown>, rows: Record<string, unknown>[]): string =>
   createHmac('sha256', key).update(canonical({ header: headerSansMac, rows })).digest('hex');
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 const bool = (v: unknown): boolean => v === true;
@@ -438,6 +465,14 @@ export function validateBackupArtifact(lines: string[], auth: ArtifactAuth): Val
   }
   if (typeof header.backupId !== 'string' || !/^bkp-\S{10,80}$/.test(header.backupId)) {
     throw new Error('restore: backupId missing/invalid (freshness/replay evidence) - refused');
+  }
+  // createdAt must be a FINITE CANONICAL timestamp (exact ISO-8601 UTC
+  // round-trip): freshness evidence the operator gate can rely on.
+  if (typeof header.createdAt !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(header.createdAt) ||
+      !Number.isFinite(Date.parse(header.createdAt)) ||
+      new Date(header.createdAt).toISOString() !== header.createdAt) {
+    throw new Error('restore: createdAt is not a finite canonical timestamp (freshness evidence untrustworthy) - refused');
   }
   requireAuth(auth);
   if (header.keyId !== auth.keyId) throw new Error(`restore: key version mismatch (artifact keyId "${header.keyId}" != provided "${auth.keyId}")`);

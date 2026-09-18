@@ -10,7 +10,7 @@ const URL = 'postgres://postgres@localhost:55432/postgres';
 describe('parseMigrateCliArgs (closed grammar)', () => {
   it('accepts --backup alone', () => {
     const a = parseMigrateCliArgs(['--database-url', URL, '--backup', '/tmp/b.jsonl']);
-    expect(a).toEqual({ databaseUrl: URL, backup: '/tmp/b.jsonl', maintenance: false, overwriteBackup: false });
+    expect(a).toEqual({ databaseUrl: URL, backup: '/tmp/b.jsonl', maintenance: false });
   });
   it('accepts --maintenance with --backup; --restore with a DISTINCT --backup', () => {
     expect(parseMigrateCliArgs(['--database-url', URL, '--backup', '/tmp/b.jsonl', '--maintenance']).maintenance).toBe(true);
@@ -45,15 +45,15 @@ describe('parseMigrateCliArgs (closed grammar)', () => {
     expect(() => parseMigrateCliArgs(['--database-url', URL, '--backup'])).toThrow(/requires a value/);
     expect(() => parseMigrateCliArgs(['--database-url', URL, '--backup', '--maintenance'])).toThrow(/requires a value/);
   });
-  it('parses --overwrite-backup as the explicit safe option', () => {
-    expect(parseMigrateCliArgs(['--database-url', URL, '--backup', '/tmp/b.jsonl', '--overwrite-backup']).overwriteBackup).toBe(true);
+  it('--overwrite-backup is REMOVED (v7): rejected with the removal message', () => {
+    expect(() => parseMigrateCliArgs(['--database-url', URL, '--backup', '/tmp/b.jsonl', '--overwrite-backup']))
+      .toThrow(/REMOVED in v7/);
   });
   it('REJECTS duplicate singleton flags (no last-wins)', () => {
     expect(() => parseMigrateCliArgs(['--database-url', URL, '--database-url', URL, '--backup', '/tmp/b.jsonl'])).toThrow(/duplicate flag: --database-url/);
     expect(() => parseMigrateCliArgs(['--database-url', URL, '--backup', '/tmp/a.jsonl', '--backup', '/tmp/b.jsonl'])).toThrow(/duplicate flag: --backup/);
     expect(() => parseMigrateCliArgs(['--database-url', URL, '--backup', '/tmp/b.jsonl', '--restore', '/tmp/o.jsonl', '--restore', '/tmp/p.jsonl'])).toThrow(/duplicate flag: --restore/);
     expect(() => parseMigrateCliArgs(['--database-url', URL, '--backup', '/tmp/b.jsonl', '--maintenance', '--maintenance'])).toThrow(/duplicate flag: --maintenance/);
-    expect(() => parseMigrateCliArgs(['--database-url', URL, '--backup', '/tmp/b.jsonl', '--overwrite-backup', '--overwrite-backup'])).toThrow(/duplicate flag: --overwrite-backup/);
   });
   it('every rejection carries exit code 64', () => {
     try { parseMigrateCliArgs([]); expect.unreachable(); }
