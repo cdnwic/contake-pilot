@@ -111,7 +111,7 @@ if (phase === 'phase1') {
       migrations: [...MIGRATIONS, {
         version: '0002', name: 'guarded', description: 'x',
         xactLockKey: 4242, lockTables: ['users'],
-        assertions: [{ name: 'no_users_yet', query: 'SELECT user_id FROM users' }],
+        assertions: [{ kind: 'table-empty', table: 'users' }],
         sql: 'CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL',
       }],
     });
@@ -126,6 +126,18 @@ if (phase === 'phase1') {
   check('wrong instance pin refused (pre-mutation)', pinRefused);
   const pv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations WHERE version <> '0001'`);
   check('zero writes from a refused pin', Number(pv.rows[0]?.['n']) === 0);
+
+  // 3e0) Fresh DB + supplied pin: refused BEFORE any write (TOFU needs an
+  // omitted pin + attended verification) on a REAL fresh postgres db.
+  await admin.query(`DROP DATABASE IF EXISTS contake_fresh WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_fresh`);
+  const fr = mk('contake_fresh');
+  let freshPinRefused = false;
+  try { await runMigrations(fr, { deployment: 'staging', expectInstanceId: '0123456789abcdef' }); } catch (e) { freshPinRefused = /INSTANCE BINDING refusal/.test(String(e)); }
+  check('fresh DB + supplied pin refused pre-write (TOFU gate)', freshPinRefused);
+  const frw = await fr.query(`SELECT to_regclass('schema_migrations') AS r`);
+  check('zero writes on fresh-DB pin refusal', frw.rows[0]?.['r'] === null);
+  await fr.end(); await admin.query(`DROP DATABASE contake_fresh WITH (FORCE)`);
 
   // 3e) Seed precondition: tampered migration digest refuses the seed pre-mutation.
   await db2.query(`UPDATE schema_migrations SET sha256 = 'tampered' WHERE version = '0001'`);

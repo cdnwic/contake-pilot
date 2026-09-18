@@ -104,11 +104,29 @@ export function durablePublish(path: string, contents: string): void {
     }
     throw new Error(`cli: cannot publish inventory at ${JSON.stringify(path)}: ${code ?? String(e)}`);
   }
-  const dfd = openSync(dir, constants.O_RDONLY);
-  try { fsyncSync(dfd); } finally { closeSync(dfd); }
+  const dirFsync = () => {
+    const dfd = openSync(dir, constants.O_RDONLY);
+    try { fsyncSync(dfd); } finally { closeSync(dfd); }
+  };
+  try {
+    dirFsync();
+  } catch (e) {
+    throw new Error(
+      `cli: inventory linked at ${JSON.stringify(path)} but the directory fsync FAILED - the publication is ` +
+      `INDETERMINATE (the file exists; its durability is unconfirmed). Reconcile explicitly before relying on it: ${String(e)}`,
+    );
+  }
   try {
     unlinkSync(tmp);
   } catch {
     throw new Error(`cli: inventory published to ${JSON.stringify(path)} but temp cleanup failed - reconcile manually: ${JSON.stringify(tmp)}`);
+  }
+  try {
+    dirFsync();
+  } catch (e) {
+    throw new Error(
+      `cli: inventory published to ${JSON.stringify(path)} but the post-cleanup directory fsync FAILED - temp-removal ` +
+      `durability is unconfirmed; reconcile ${JSON.stringify(tmp)} explicitly: ${String(e)}`,
+    );
   }
 }

@@ -44,13 +44,16 @@ import { createHash, randomBytes } from 'node:crypto';
 import { parse as parseSql, toSql } from 'pgsql-ast-parser';
 import { GRAPH_DDL, OTP_DDL, type Connectable, type Queryable } from '../repo/postgres.js';
 
-/** A named runner-owned guard primitive: a reviewed zero-row SELECT that must
- *  return NO rows, executed inside the step transaction before the artifact.
- *  Any returned row hard-fails the step (full rollback). */
-export interface MigrationAssertion {
-  readonly name: string;
-  readonly query: string; // SELECT only (AST-enforced)
-}
+/** A runner-owned NAMED guard primitive (independent security, 2026-09-18):
+ *  NO caller SQL anywhere - the guard's SQL is generated entirely by the
+ *  runner from validated identifiers and closed operator sets. Callers pick a
+ *  kind and name tables/columns; expressions, functions and subqueries are
+ *  not representable, so no side-effecting call can ride in. Each guard must
+ *  return NO rows; any returned row hard-fails the step (full rollback). */
+export type MigrationAssertion =
+  | { readonly kind: 'table-empty'; readonly table: string }
+  | { readonly kind: 'no-nulls'; readonly table: string; readonly column: string }
+  | { readonly kind: 'no-duplicates'; readonly table: string; readonly column: string; readonly normalize?: 'btrim' | 'none'; readonly skipNulls?: boolean };
 
 /** Declarative migration step: frozen SQL text + declared primitives. */
 export interface MigrationStep {
@@ -76,10 +79,21 @@ const ARTIFACT_ALLOWLIST: ReadonlySet<string> = new Set([
   'comment', 'insert', 'update', 'delete',
 ]);
 
-/** Session-scoped advisory-lock functions are forbidden anywhere (the runner
- *  owns the session lock); pg_advisory_xact_lock is runner-executed only. */
-const FORBIDDEN_CALLS: ReadonlySet<string> = new Set([
-  'pg_advisory_lock', 'pg_try_advisory_lock', 'pg_advisory_unlock', 'pg_advisory_unlock_all', 'pg_sleep',
+/** PURE-FUNCTION allowlist (independent QA, 2026-09-18): the ONLY function
+ *  calls permitted anywhere inside a migration artifact. Immutable string/
+ *  math/logic helpers needed by declarative DDL+DML (SA's canonical index
+ *  uses btrim). Everything else - side-effecting, volatile, session, lock,
+ *  config, sequence, system - is rejected by absence from this list. This is
+ *  an allowlist, not a growing forbidden-list. */
+const PURE_FUNCTION_ALLOWLIST: ReadonlySet<string> = new Set([
+  'btrim', 'trim', 'ltrim', 'rtrim', 'lower', 'upper', 'length', 'char_length',
+  'character_length', 'coalesce', 'nullif', 'replace', 'substring', 'left',
+  'right', 'concat', 'concat_ws', 'abs', 'round', 'floor', 'ceil', 'ceiling',
+  'greatest', 'least',
+  // STABLE timestamp for declarative column DEFAULTs (schema_migrations,
+  // auth_audit) - transaction-consistent, non-side-effecting, no system or
+  // session capability.
+  'now',
 ]);
 
 /** Recursively collects function call names from an AST (parser-normalized:
@@ -116,33 +130,57 @@ export function validateMigrationArtifact(sql: string): void {
       );
     }
   }
+  // Closed recursive grammar: every function call anywhere in the AST
+  // (expressions, defaults, index predicates, DML bodies, CTEs) must be a
+  // pure allowlisted function. SELECT/DO/CALL/UDF/extension statement types
+  // are already excluded above; this closes what remains.
   const calls: string[] = [];
   collectCalls(stmts, calls);
   for (const c of calls) {
-    if (FORBIDDEN_CALLS.has(c)) {
-      throw new Error(`release-migrations: ARTIFACT refusal - forbidden function call ${c} (session advisory locks and sleeps are not migration code)`);
+    if (!PURE_FUNCTION_ALLOWLIST.has(c)) {
+      throw new Error(
+        `release-migrations: ARTIFACT refusal - function call '${c}' is not in the pure-function allowlist ` +
+        `(declarative artifacts carry no side-effecting/volatile/session calls)`,
+      );
     }
   }
 }
 
-/** Assertion primitives are single SELECT statements, nothing else. */
-export function validateAssertion(a: MigrationAssertion): void {
-  if (!IDENT.test(a.name)) throw new Error(`release-migrations: invalid assertion name ${JSON.stringify(a.name)}`);
-  let stmts: { type: string }[];
-  try {
-    stmts = parseSql(a.query) as { type: string }[];
-  } catch (e) {
-    throw new Error(`release-migrations: ASSERTION refusal - unparsable guard query '${a.name}': ${(e as Error).message.split('\n')[0]}`);
-  }
-  if (stmts.length !== 1 || stmts[0]!.type !== 'select') {
-    throw new Error(`release-migrations: ASSERTION refusal - guard '${a.name}' must be ONE SELECT statement (zero-row guard), nothing else`);
-  }
-  const calls: string[] = [];
-  collectCalls(stmts, calls);
-  for (const c of calls) {
-    if (FORBIDDEN_CALLS.has(c)) throw new Error(`release-migrations: ASSERTION refusal - forbidden function call ${c} in guard '${a.name}'`);
+/** Validates a named guard's identifiers and returns the runner-GENERATED
+ *  guard SQL. Identifiers are validated and double-quoted by the runner;
+ *  every other byte of the generated statement is a fixed runner template. */
+export function buildAssertionQuery(a: MigrationAssertion): string {
+  switch (a.kind) {
+    case 'table-empty': {
+      if (!IDENT.test(a.table)) throw new Error(`release-migrations: invalid assertion table ${JSON.stringify(a.table)}`);
+      return `SELECT 1 AS violation FROM "${a.table}" LIMIT 1`;
+    }
+    case 'no-nulls': {
+      if (!IDENT.test(a.table) || !IDENT.test(a.column)) throw new Error('release-migrations: invalid assertion identifier');
+      return `SELECT 1 AS violation FROM "${a.table}" WHERE "${a.column}" IS NULL LIMIT 1`;
+    }
+    case 'no-duplicates': {
+      if (!IDENT.test(a.table) || !IDENT.test(a.column)) throw new Error('release-migrations: invalid assertion identifier');
+      const key = a.normalize === 'btrim' ? `btrim("${a.column}")` : `"${a.column}"`;
+      const where = a.skipNulls === false ? '' : ` WHERE "${a.column}" IS NOT NULL`;
+      return `SELECT 1 AS violation FROM "${a.table}"${where} GROUP BY ${key} HAVING count(*) > 1 LIMIT 1`;
+    }
+    default:
+      throw new Error(`release-migrations: unknown assertion kind ${JSON.stringify((a as { kind?: string }).kind)} - named runner-owned kinds only`);
   }
 }
+export function validateAssertion(a: MigrationAssertion): void {
+  buildAssertionQuery(a); // throws on invalid identifiers/kinds
+}
+
+/** The canonical executed form of an artifact: parsed statements re-serialized
+ *  by the AST printer, one per driver call. Execution runs EXACTLY these
+ *  serializations and the digest hashes EXACTLY this joined serialization -
+ *  executed bytes and hashed bytes are the same object by construction. */
+export function artifactStatements(sql: string): string[] {
+  return parseSql(sql).map(st => toSql.statement(st));
+}
+export const canonicalArtifactSql = (sql: string): string => artifactStatements(sql).join(';\n');
 
 /** Key-sorted canonical JSON for the declared-primitive digest component. */
 const canonicalJson = (v: unknown): string => {
@@ -154,10 +192,12 @@ const canonicalJson = (v: unknown): string => {
 
 /** Integrity digest over the EXACT artifact text + declared primitives:
  *  version + name + sql + canonical primitive declaration. Editing anything
- *  that executes changes the digest and FAILS the runner/boot history check. */
+ *  that executes changes the digest and FAILS the runner/boot history check.
+ *  `description` is operator display metadata and is deliberately NOT
+ *  integrity-protected; only executed content is. */
 export const stepDigest = (m: MigrationStep): string =>
   createHash('sha256').update(
-    `contake-migration/v4\n${m.version}\n${m.name}\n${m.sql}\n${canonicalJson({
+    `contake-migration/v5\n${m.version}\n${m.name}\n${canonicalArtifactSql(m.sql)}\n${canonicalJson({
       assertions: m.assertions ?? [], lockTables: m.lockTables ?? [], xactLockKey: m.xactLockKey ?? null,
     })}`,
   ).digest('hex');
@@ -242,7 +282,16 @@ export async function verifyTargetPreconditions(
     throw new Error(`release-migrations: invalid deployment label ${JSON.stringify(opts.deployment)} (expected ${DEPLOYMENT_LABEL})`);
   }
   const identity = await readDbIdentity(conn);
-  if (!identity) return { firstRun: true };
+  if (!identity) {
+    if (opts.expectInstanceId !== undefined) {
+      throw new Error(
+        `release-migrations: INSTANCE BINDING refusal - an instance pin ('${opts.expectInstanceId}') was presented but this ` +
+        `database carries NO stamped identity. A pin can only bind an existing stamp; omit --expect-instance-id for the ` +
+        `attended first-run TOFU gate (refusing BEFORE any write).`,
+      );
+    }
+    return { firstRun: true };
+  }
   if (identity.deploymentLabel !== opts.deployment) {
     throw new Error(
       `release-migrations: CROSS-DEPLOYMENT refusal - this database is stamped '${identity.deploymentLabel}' ` +
@@ -353,15 +402,15 @@ export async function runMigrations(
           if (m.xactLockKey !== undefined) await client.query(`SELECT pg_advisory_xact_lock(${m.xactLockKey})`);
           for (const t of m.lockTables ?? []) await client.query(`LOCK TABLE "${t}" IN SHARE ROW EXCLUSIVE MODE`);
           for (const a of m.assertions ?? []) {
-            const guard = await client.query(toSql.statement(parseSql(a.query)[0]!));
+            const guard = await client.query(buildAssertionQuery(a));
             if (guard.rows.length > 0) {
               throw new Error(
-                `release-migrations: ASSERTION refusal - guard '${a.name}' in '${m.version}' returned ${guard.rows.length} ` +
-                `violating row(s); migration blocked - rolling back (hard-fail, never silent-skip)`,
+                `release-migrations: ASSERTION refusal - guard '${a.kind}' in '${m.version}' found violating row(s); ` +
+                `migration blocked - rolling back (hard-fail, never silent-skip)`,
               );
             }
           }
-          for (const s of parseSql(m.sql)) await client.query(toSql.statement(s));
+          for (const stmt of artifactStatements(m.sql)) await client.query(stmt);
           const ins = await client.query(
             `INSERT INTO schema_migrations(version, name, sha256, applied_by) VALUES($1, $2, $3, $4)
              ON CONFLICT (version) DO NOTHING`,
@@ -387,6 +436,24 @@ export async function runMigrations(
     client.release();
   }
   return { identity, stampedNow, appliedNow, versions: [...applied.map(r => r.version), ...appliedNow] };
+}
+
+/** Boot identity requirement (independent QA + security, 2026-09-18): EVERY
+ *  PostgreSQL boot - production, staging, dev - MUST present the immutable
+ *  database instance identity it expects (CONTAKE_DB_INSTANCE_ID) alongside
+ *  the deployment label. Missing or malformed means fail closed: no runtime
+ *  ever serves a database whose identity it did not declare. */
+export function requiredBootIdentity(deployment: string, instanceId: string | undefined): { deployment: string; instanceId: string } {
+  if (!DEPLOYMENT_LABEL.test(deployment)) {
+    throw new Error(`release-migrations: invalid boot deployment label ${JSON.stringify(deployment)} (fail-closed)`);
+  }
+  if (instanceId === undefined || !/^[0-9a-f]{16}$/.test(instanceId)) {
+    throw new Error(
+      `release-migrations: PostgreSQL boot ('${deployment}') requires CONTAKE_DB_INSTANCE_ID (the 16-hex instance id ` +
+      `stamped by the release job and verified out-of-band at the operator TOFU gate) - refusing to boot (fail-closed)`,
+    );
+  }
+  return { deployment, instanceId };
 }
 
 /** Boot-time gate (fail-closed): exact version sequence + digest integrity,

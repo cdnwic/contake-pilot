@@ -3,7 +3,7 @@ import { buildApp } from './app.js';
 import { AuthService, type OtpStateStore } from './auth.js';
 import { MemoryGraphRepository } from './repo/memory.js';
 import { PostgresGraphRepository, pgDispatchState, createPgOtpState } from './repo/postgres.js';
-import { assertSchemaCurrent } from './migrations/runner.js';
+import { assertSchemaCurrent, requiredBootIdentity } from './migrations/runner.js';
 import type { GraphRepository } from './repo/graph-repository.js';
 import { applySeed, seedDemo } from './seed.js';
 import { assertBootPolicy, resolveAuthSecret, resolveSeedMode } from './boot-config.js';
@@ -83,15 +83,13 @@ if (process.env['DATABASE_URL']) {
   // (assertBootPolicy) and staging data comes only from the explicit
   // synthetic-only `seed:staging` job. The former boot-time demo/camp-demo PG
   // seeding path is removed with this change.
-  // Independent security (2026-09-18): a Postgres boot must verify the
-  // EXPECTED DEPLOYMENT against the database's stamped immutable identity
-  // before serving - a runtime pointed at another deployment's database
-  // fails closed. CONTAKE_DEPLOYMENT is required for every PG boot.
-  const expectedDeployment = process.env['CONTAKE_DEPLOYMENT'];
-  if (!expectedDeployment) {
-    throw new Error('CONTAKE_DEPLOYMENT is required for a Postgres boot - the runtime must declare which deployment identity it expects (fail-closed)');
-  }
-  await assertSchemaCurrent(pool, undefined, { deployment: expectedDeployment, instanceId: process.env['CONTAKE_DB_INSTANCE_ID'] });
+  // Independent QA + security (2026-09-18): EVERY Postgres boot must declare
+  // the expected deployment AND the immutable database instance identity
+  // (CONTAKE_DEPLOYMENT + CONTAKE_DB_INSTANCE_ID, the 16-hex stamp verified
+  // out-of-band at the operator TOFU gate) and both are verified against the
+  // database's stamped identity before serving - fail closed.
+  const bootIdentity = requiredBootIdentity(process.env['CONTAKE_DEPLOYMENT'] ?? '', process.env['CONTAKE_DB_INSTANCE_ID']);
+  await assertSchemaCurrent(pool, undefined, bootIdentity);
   repo = PostgresGraphRepository.connect(pool);
   dispatchState = pgDispatchState(pool);
   otpState = await createPgOtpState(pool, { applyDdl: false }); // pilot-prep #4: shared OTP state (schema via migrations)

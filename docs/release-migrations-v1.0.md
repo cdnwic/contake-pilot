@@ -1,11 +1,15 @@
-# Release migrations + staging synthetic seed (v1.3, 2026-09-18)
+# Release migrations + staging synthetic seed (v1.4, 2026-09-18)
 
 Owner: initializer lane (architecture convergence: external incident research +
 TL ruling + QA's SA v8 finding "migrateUsersPhone has no shipped standard
 runner/caller"). v1.3 is the unified declarative redesign resolving the
-independent QA and security FAILs on f9854cd6, 9182487e and 22267edb, with
-SA compatibility confirmed by backend and the TL's final reconciliation
-(2026-09-18). Sources behind the design:
+independent QA and security FAILs on f9854cd6, 9182487e, 22267edb and
+976db452, with SA compatibility confirmed by backend and the TL's final
+reconciliation (2026-09-18). v1.4 resolves the second unified QA+security
+round: fixed named runner-generated guards, a closed recursive AST grammar
+with a pure-function allowlist, digest bound to the canonical serialization
+actually executed, fresh-DB pin refusal, instance identity on EVERY PG boot,
+and explicit publication indeterminacy handling. Sources behind the design:
 12factor.net/admin-processes, neon.com/docs/connect/choose-connection,
 neon.com/docs/connect/connection-pooling, prisma.io/docs/orm/prisma-migrate/workflows/seeding.
 
@@ -18,22 +22,36 @@ other migration path and no schema work at app startup.
   A migration is frozen TEXT: `{ version, name, description, sql }` plus
   runner-owned declarative guard primitives. There are NO function steps, NO
   DO/CALL/PLpgSQL, NO arbitrary raw-query capability anywhere in the
-  framework. The digest hashes the artifact text and the ONLY statements
-  executed are the parse of that exact text (trailing garbage fails the
-  parse), one parsed statement per driver call. Editing anything that
-  executes changes the digest and fails the runner AND boot history checks.
+  framework. The ONLY statements executed are the per-statement AST
+  re-serializations of the artifact, and the digest hashes EXACTLY that
+  canonical serialization - executed bytes and hashed bytes are the same
+  object by construction (formatting/comments cannot drift the digest;
+  semantics always do; parse-serialize-reparse equivalence is tested for
+  every shipped artifact). `description` is operator documentation and is
+  NOT integrity-protected. Editing anything that executes changes the
+  digest and fails the runner AND boot history checks.
 - **Real-parser AST allowlist, not regex.** Every artifact parses with a real
   PostgreSQL parser (pgsql-ast-parser). Only declarative DDL+DML statement
   types are permitted (create/alter/drop table+index, comment, insert,
-  update, delete). Transaction control, SELECT/CALL/DO, session advisory
-  functions and unparseable syntax (SAVEPOINT/SET/LOCK) are rejected at
+  update, delete). Transaction control, SELECT/CALL/DO, CTAS, UDF/extension
+  shapes and unparseable syntax (SAVEPOINT/SET/LOCK) are rejected at
   registration - quoting, schema-qualification and comment tricks resolve to
-  the same AST and cannot bypass it.
-- **Runner-owned guard primitives (TL reconciliation).** Assertions (named
-  zero-row SELECT guards that HARD-FAIL inside the runner transaction, never
-  silent-skip), table locks and the xact advisory lock are declared as
-  structured step fields and executed BY THE RUNNER - never from migration
-  text. Primitive declarations are digest-covered.
+  the same AST and cannot bypass it. The grammar is CLOSED RECURSIVE: every
+  function call anywhere in the AST (expressions, column defaults, index
+  predicates, DML bodies, CTEs) must be in a pure-function allowlist
+  (immutable string/math/logic helpers plus STABLE `now()` for column
+  defaults). Side-effecting, volatile, session, lock, config, sequence and
+  system calls are rejected by absence from the list - this is an
+  allowlist, not a growing forbidden-list.
+- **Fixed named runner-generated guards (unified QA+security).** Assertions
+  are a CLOSED union of named guard kinds - `table-empty`, `no-nulls`,
+  `no-duplicates` - parameterized only by validated identifiers
+  (table/column) and fixed options (`normalize: 'btrim'`, `skipNulls`). The
+  runner GENERATES the guard SQL from fixed templates; no caller SQL,
+  expressions, functions or subqueries are representable. Guards HARD-FAIL
+  inside the runner transaction (never silent-skip); table locks and the
+  xact advisory lock are likewise declared structured fields executed BY
+  THE RUNNER. Primitive declarations are digest-covered.
 - **Versioned, forward-only migrations.** Registry `MIGRATIONS` is strictly
   sequential (`0001`, `0002`, ...). Applied history must be an exact registry
   prefix with exact version+name+digest equality (`verifyHistoryPrefix`).
@@ -52,10 +70,14 @@ other migration path and no schema work at app startup.
 - **Pre-mutation target binding.** `verifyTargetPreconditions` (deployment
   label + optional `--expect-instance-id` pin) runs READ-ONLY before any
   write; the first-run stamp is printed as an operator-attended TOFU gate,
-  never authentication. Later runs presenting a different deployment label or
+  never authentication. First-run TOFU REQUIRES an omitted pin: a fresh
+  database plus a supplied instance id is REFUSED before any write (zero
+  writes verified). Later runs presenting a different deployment label or
   pinned instance are refused.
-- **Startup verifies, never mutates.** A Postgres boot requires
-  `CONTAKE_DEPLOYMENT` (optional `CONTAKE_DB_INSTANCE_ID`) and
+- **Startup verifies, never mutates.** EVERY Postgres boot - production,
+  staging, dev - requires `CONTAKE_DEPLOYMENT` AND `CONTAKE_DB_INSTANCE_ID`
+  (the 16-hex instance stamp verified out-of-band at the operator TOFU
+  gate); `requiredBootIdentity` fails closed without either, and
   `assertSchemaCurrent` verifies exact versions + digests + stamped identity
   before anything serves. `PostgresGraphRepository.connect()` and
   `createPgOtpState(..., { applyDdl: false })` apply no DDL.
@@ -79,9 +101,9 @@ migration, guards as runner-owned primitives:
   description: 'users_phone_unique canonical partial unique index (SA lane)',
   xactLockKey: <SA migration lock key>,        // runner executes pg_advisory_xact_lock
   lockTables: ['users'],                        // runner executes LOCK TABLE ... SHARE ROW EXCLUSIVE
-  assertions: [                                 // runner-executed zero-row guards; ANY row hard-fails + rolls back
-    { name: 'no_duplicate_normalized_phones', query: `SELECT btrim(phone) AS p FROM users WHERE phone IS NOT NULL GROUP BY btrim(phone) HAVING count(*) > 1` },
-    { name: 'no_inconsistent_rows', query: `<SA inconsistency guard SELECT>` },
+  assertions: [                                 // runner-GENERATED named guards; ANY violation hard-fails + rolls back
+    { kind: 'no-duplicates', table: 'users', column: 'phone', normalize: 'btrim' },
+    // further guards use the same closed union (table-empty / no-nulls / no-duplicates)
   ],
   sql: `CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL`,
 }
@@ -150,14 +172,18 @@ Gates (all fail-closed, one transaction - any failure rolls back everything):
     temp files demand explicit operator reconciliation (indeterminate prior
     state is never guessed); full-write loop to a same-directory temp; fsync
     the temp; atomic no-clobber publish via hard-link (EEXIST refuses files
-    AND symlinks); fsync the directory; temp cleanup failure is reported
-    explicitly after a successful publish.
+    AND symlinks); fsync the directory - a failed directory fsync after the
+    link raises an explicit INDETERMINATE-publication error naming the file
+    (it exists; durability unconfirmed; reconcile before relying); temp
+    unlink failure is reported explicitly after a successful publish; the
+    post-cleanup directory fsync runs and its failure is likewise reported
+    explicitly (temp-removal durability unconfirmed).
 
 ## Behavior change shipped with this architecture
 
 The Postgres boot no longer applies the demo/camp-demo seeds or the QA staging
 slice, and no longer runs bootstrap DDL; it requires CONTAKE_DEPLOYMENT and
-verifies the stamped identity. Memory-adapter dev/test seeding is unchanged.
+CONTAKE_DB_INSTANCE_ID and verifies the stamped identity. Memory-adapter dev/test seeding is unchanged.
 Existing Postgres deployments adopt the runner by one explicit
 `migrate:release --deployment <label> --expect-host <host> --expect-db <db>`
 run (no-op baseline), after which boots pass the gate. Rebuild path for
