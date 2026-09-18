@@ -183,6 +183,26 @@ describe('staging synthetic seed', () => {
     await pg.close();
   });
 
+  it('seed precondition: tampered migration history/digests refuse the seed BEFORE any mutation', async () => {
+    const { pg, conn } = await stagingDb();
+    await conn.query(`UPDATE schema_migrations SET sha256 = 'tampered' WHERE version = '0001'`);
+    await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS })).rejects.toThrow(/INTEGRITY refusal/);
+    const st = await conn.query(`SELECT to_regclass('staging_seed_state') AS r`);
+    expect(st.rows[0]?.['r']).toBeNull(); // nothing was written
+    const u = await conn.query(`SELECT count(*)::int AS n FROM users`);
+    expect(Number(u.rows[0]?.['n'])).toBe(0);
+    await pg.close();
+  });
+
+  it('whole-row manifest: drift in an authoritative NON-data column is caught', async () => {
+    const { pg, conn } = await stagingDb();
+    await runStagingSeed(conn, { marker: '1', credentials: CREDS });
+    // Drift users.phone (a relational column OUTSIDE the jsonb data payload).
+    await conn.query(`UPDATE users SET phone = '+972555999999' WHERE user_id = (SELECT user_id FROM users LIMIT 1)`);
+    await expect(runStagingSeed(conn, { marker: '1', credentials: CREDS })).rejects.toThrow(/RERUN INTEGRITY/);
+    await pg.close();
+  });
+
   it('full coverage: first run refuses a database with rows in ANY business table, not just seeded ones', async () => {
     const { pg, conn } = await stagingDb();
     await conn.query(`INSERT INTO auth_audit(phone, kind, data) VALUES('+972555000001', 'foreign', '{}')`);

@@ -36,7 +36,7 @@ import { seedAfterSchool } from '../seeds/after-school.seed.js';
 import { seedConference } from '../seeds/conference.seed.js';
 import { seedLogistics } from '../seeds/logistics.seed.js';
 import { hashPasswordPure } from '../auth.js';
-import { readDbIdentity } from './runner.js';
+import { assertSchemaCurrent, readDbIdentity } from './runner.js';
 import type { SeedData } from '../repo/graph-repository.js';
 
 /** Every public-fixture identifier, derived from the fixture modules at call
@@ -206,9 +206,12 @@ async function computeLiveManifest(tx: { query(t: string, p?: unknown[]): Promis
   Promise<LiveManifest> {
   const rows: { table: string; pk: string; digest: string }[] = [];
   for (const { table, pk } of SEEDED_TABLES) {
-    const r = await tx.query(`SELECT ${pk}::text AS pk, data FROM ${table} ORDER BY ${pk}`);
+    // WHOLE-ROW coverage (independent QA): to_jsonb(t) carries EVERY column -
+    // authoritative relational columns and future ones, not only data. PG
+    // normalizes jsonb key order, so the text is deterministic.
+    const r = await tx.query(`SELECT "${pk}"::text AS pk, to_jsonb(t)::text AS row_json FROM "${table}" t ORDER BY "${pk}"`);
     for (const row of r.rows) {
-      rows.push({ table, pk: String(row['pk']), digest: rowDigest(row['data']) });
+      rows.push({ table, pk: String(row['pk']), digest: createHash('sha256').update(String(row['row_json'])).digest('hex') });
     }
   }
   const others = await tx.query(
@@ -267,6 +270,11 @@ export async function runStagingSeed(conn: Connectable, opts: StagingSeedOptions
         `synthetic seeding is permitted ONLY on a staging-stamped database (fail-closed)`,
       );
     }
+
+    // Security precondition: the database must carry the exact current
+    // migration history with matching artifact digests BEFORE the seed
+    // mutates anything (seeding onto drifted/unmigrated schema is refused).
+    await assertSchemaCurrent(client);
 
     for (const stmt of STATE_DDL.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
 

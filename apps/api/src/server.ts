@@ -91,7 +91,7 @@ if (process.env['DATABASE_URL']) {
   if (!expectedDeployment) {
     throw new Error('CONTAKE_DEPLOYMENT is required for a Postgres boot - the runtime must declare which deployment identity it expects (fail-closed)');
   }
-  await assertSchemaCurrent(pool, undefined, { deployment: expectedDeployment });
+  await assertSchemaCurrent(pool, undefined, { deployment: expectedDeployment, instanceId: process.env['CONTAKE_DB_INSTANCE_ID'] });
   repo = PostgresGraphRepository.connect(pool);
   dispatchState = pgDispatchState(pool);
   otpState = await createPgOtpState(pool, { applyDdl: false }); // pilot-prep #4: shared OTP state (schema via migrations)

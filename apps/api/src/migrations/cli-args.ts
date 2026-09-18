@@ -5,7 +5,9 @@
  *    is an error (the operator must choose deliberately);
  *  - bounded/canonical scalar values (actor, output path). */
 
-import { closeSync, constants, fsyncSync, openSync, writeSync } from 'node:fs';
+import { closeSync, constants, fsyncSync, linkSync, openSync, readdirSync, unlinkSync, writeSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { basename, dirname, join } from 'node:path';
 
 export interface CliSpec {
   readonly required: readonly string[];
@@ -58,29 +60,55 @@ export function validateActor(actor: string): string {
 }
 
 /** Output path: must not clobber an existing file. */
-/** Atomic inventory publication (independent QA + security): ONE exclusive
- *  create - O_CREAT|O_EXCL atomically refuses an existing path (no
- *  check-then-write race), O_NOFOLLOW refuses symlinks, mode 0600, and the
- *  contents are fsync'd before close so a crash cannot leave a torn file
- *  that looks published. There is no window in which a second writer can win. */
-export function writeFileExclusive(path: string, contents: string): void {
+/** Durable atomic inventory publication (independent QA + security):
+ *  1. INDETERMINATE-STATE RECONCILIATION: a leftover temp file from a previous
+ *     attempt means cleanup was interrupted - refuse and name the file for
+ *     explicit operator reconciliation instead of guessing.
+ *  2. FULL-WRITE LOOP to a same-directory temp (writeSync until every byte is
+ *     out), fsync the temp, close it.
+ *  3. ATOMIC NO-CLOBBER PUBLISH: hard-link(2) the temp onto the final path -
+ *     atomic, and EEXIST (existing file OR symlink) refuses to clobber.
+ *  4. fsync the DIRECTORY so the new directory entry is durable.
+ *  5. Temp cleanup failure is reported explicitly (published, but reconcile
+ *     the leftover temp), never silently swallowed. */
+export function durablePublish(path: string, contents: string): void {
   if (path.length === 0 || path.length > 512 || path.includes('\0')) {
     throw new Error('cli: invalid output path');
   }
-  let fd: number;
-  try {
-    fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST' || code === 'ELOOP') {
-      throw new Error(`cli: output path ${JSON.stringify(path)} already exists or is a symlink - refusing to clobber (atomic exclusive create)`);
-    }
-    throw new Error(`cli: cannot publish inventory at ${JSON.stringify(path)}: ${code ?? String(e)}`);
+  const dir = dirname(path);
+  const base = basename(path);
+  const leftovers = readdirSync(dir).filter(f => f.startsWith(`${base}.contake-tmp-`));
+  if (leftovers.length > 0) {
+    throw new Error(
+      `cli: indeterminate prior publication state at ${JSON.stringify(path)} - leftover temp file(s): ${leftovers.join(', ')}. ` +
+      `Reconcile explicitly (inspect and remove) before publishing again; refusing to guess.`,
+    );
   }
+  const tmp = join(dir, `${base}.contake-tmp-${process.pid}-${randomBytes(4).toString('hex')}`);
+  const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
   try {
-    writeSync(fd, contents);
+    const buf = Buffer.from(contents, 'utf8');
+    let off = 0;
+    while (off < buf.length) off += writeSync(fd, buf, off, buf.length - off);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
+  }
+  try {
+    linkSync(tmp, path);
+  } catch (e) {
+    unlinkSync(tmp);
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST' || code === 'ELOOP') {
+      throw new Error(`cli: output path ${JSON.stringify(path)} already exists or is a symlink - refusing to clobber (atomic no-clobber publish)`);
+    }
+    throw new Error(`cli: cannot publish inventory at ${JSON.stringify(path)}: ${code ?? String(e)}`);
+  }
+  const dfd = openSync(dir, constants.O_RDONLY);
+  try { fsyncSync(dfd); } finally { closeSync(dfd); }
+  try {
+    unlinkSync(tmp);
+  } catch {
+    throw new Error(`cli: inventory published to ${JSON.stringify(path)} but temp cleanup failed - reconcile manually: ${JSON.stringify(tmp)}`);
   }
 }

@@ -19,7 +19,7 @@
  *  - requires the DIRECT endpoint ('-pooler' hosts are refused: pooled is the
  *    runtime role); DATABASE_URL is never printed;
  *  - forward-only + applied-step integrity digests; runs zero seeding. */
-import { runMigrations, assertDirectDatabaseUrl } from './runner.js';
+import { runMigrations, assertDirectDatabaseUrl, verifyTargetPreconditions } from './runner.js';
 import { parseCliArgs, resolveDatabaseUrl, validateActor } from './cli-args.js';
 
 const args = parseCliArgs(process.argv.slice(2), {
@@ -47,13 +47,11 @@ try {
   if (String(c.rows[0]?.['db']) !== args['--expect-db']) {
     throw new Error(`release-migrations: connected database '${String(c.rows[0]?.['db'])}' is not the expected '${args['--expect-db']}' - refusing (fail-closed)`);
   }
-  const result = await runMigrations(pool, { deployment: args['--deployment']!, appliedBy });
-  if (args['--expect-instance-id'] !== undefined && result.identity.instanceId !== args['--expect-instance-id']) {
-    throw new Error(
-      `release-migrations: INSTANCE BINDING refusal - operator pinned instance '${args['--expect-instance-id']}' ` +
-      `but this database is stamped '${result.identity.instanceId}'. Refusing to treat it as the provisioned target.`,
-    );
-  }
+  // PRE-MUTATION target binding (security): verify the stamped deployment +
+  // instance pin READ-ONLY before any write. First runs are unstamped and
+  // proceed to the operator-attended TOFU stamp below.
+  await verifyTargetPreconditions(pool, { deployment: args['--deployment']!, expectInstanceId: args['--expect-instance-id'] });
+  const result = await runMigrations(pool, { deployment: args['--deployment']!, appliedBy, expectInstanceId: args['--expect-instance-id'] });
   if (result.stampedNow) {
     console.error(
       `release-migrations: OPERATOR GATE (first run) - stamped deployment '${result.identity.deploymentLabel}' ` +

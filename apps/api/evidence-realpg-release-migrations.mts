@@ -15,7 +15,8 @@
 import { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
 import {
-  MIGRATIONS, assertDirectDatabaseUrl, assertSchemaCurrent, runMigrations, stepDigest, type MigrationStep,
+  MIGRATIONS, assertDirectDatabaseUrl, assertSchemaCurrent, runMigrations, stepDigest,
+  validateMigrationArtifact, type MigrationStep,
 } from './src/migrations/runner.js';
 import { runStagingSeed } from './src/migrations/staging-seed.js';
 
@@ -73,37 +74,67 @@ if (phase === 'phase1') {
   await admin.query(`CREATE DATABASE contake_evidence`);
   const db2 = mk('contake_evidence');
   const failing: MigrationStep = {
-    kind: 'fn',
-    version: '0001', name: 'partial-ddl', description: 'creates then throws',
-    up: async tx => { await tx.query('CREATE TABLE partial_leak(id int)'); throw new Error('boom'); },
+    version: '0001', name: 'partial-ddl', description: 'second statement fails',
+    sql: 'CREATE TABLE partial_leak(id int); CREATE TABLE partial_leak(id int)',
   };
   let threw = false;
   try { await runMigrations(db2, { deployment: 'staging', migrations: [failing] }); } catch { threw = true; }
-  check('failing step threw', threw);
+  check('failing artifact threw', threw);
   const leak = await db2.query(`SELECT to_regclass('partial_leak') AS r`);
   check('partial DDL rolled back on REAL postgres', leak.rows[0]?.['r'] === null, leak.rows[0]);
   const vv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations`);
   check('no version row after rollback', Number(vv.rows[0]?.['n']) === 0);
 
-  // 3b) Restricted capability on REAL postgres: tx-control + session-lock escape.
-  const txEscape: MigrationStep = {
-    kind: 'fn',
-    version: '0001', name: 'tx-escape', description: 'attempts COMMIT mid-DDL',
-    up: async tx => { await tx.query('CREATE TABLE escape_leak(id int)'); await tx.query('COMMIT'); },
-  };
-  let escapeRefused = false;
-  try { await runMigrations(db2, { deployment: 'staging', migrations: [txEscape] }); } catch (e) { escapeRefused = /TRANSACTION-CONTROL refusal/.test(String(e)); }
-  check('COMMIT inside a step mechanically rejected', escapeRefused);
+  // 3b) AST allowlist on REAL postgres: tx-control / DO / session-lock artifacts
+  // are rejected at registration, before ANY statement executes.
+  for (const [label, sql] of [
+    ['COMMIT artifact', 'CREATE TABLE escape_leak(id int); COMMIT'],
+    ['DO artifact', `DO $$ BEGIN RAISE EXCEPTION 'x'; END $$`],
+    ['quoted session-unlock artifact', 'SELECT "pg_advisory_unlock"(841000001)'],
+    ['schema-qualified session-lock artifact', 'SELECT pg_catalog.pg_advisory_lock(1)'],
+  ] as const) {
+    let refused = false;
+    try { await runMigrations(db2, { deployment: 'staging', migrations: [{ version: '0001', name: 'bad', description: 'x', sql }] }); }
+    catch (e) { refused = /ARTIFACT refusal/.test(String(e)); }
+    check(`${label} rejected at registration`, refused);
+  }
   const el = await db2.query(`SELECT to_regclass('escape_leak') AS r`);
-  check('no partial DDL persists after escape rejection', el.rows[0]?.['r'] === null);
-  const lockEscape: MigrationStep = {
-    kind: 'fn',
-    version: '0001', name: 'lock-escape', description: 'attempts to drop the runner session lock',
-    up: async tx => { await tx.query('SELECT pg_advisory_unlock(841000001)'); },
-  };
-  let lockRefused = false;
-  try { await runMigrations(db2, { deployment: 'staging', migrations: [lockEscape] }); } catch (e) { lockRefused = /SESSION-LOCK refusal/.test(String(e)); }
-  check('session-lock escape mechanically rejected', lockRefused);
+  check('no statement executed from a rejected artifact', el.rows[0]?.['r'] === null);
+
+  // 3c) Guard primitive hard-fail rolls back on REAL postgres.
+  await runMigrations(db2, { deployment: 'staging' });
+  await db2.query(`INSERT INTO users(user_id, org_id, phone, data) VALUES('u1', 'o1', '+972555111111', '{}')`);
+  let guardRefused = false;
+  try {
+    await runMigrations(db2, {
+      deployment: 'staging',
+      migrations: [...MIGRATIONS, {
+        version: '0002', name: 'guarded', description: 'x',
+        xactLockKey: 4242, lockTables: ['users'],
+        assertions: [{ name: 'no_users_yet', query: 'SELECT user_id FROM users' }],
+        sql: 'CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users(btrim(phone)) WHERE phone IS NOT NULL',
+      }],
+    });
+  } catch (e) { guardRefused = /ASSERTION refusal/.test(String(e)); }
+  check('guard hard-fails on REAL postgres', guardRefused);
+  const gi = await db2.query(`SELECT to_regclass('users_phone_unique') AS r`);
+  check('guarded artifact rolled back', gi.rows[0]?.['r'] === null);
+
+  // 3d) Pre-mutation instance pin: wrong pin refuses with ZERO writes.
+  let pinRefused = false;
+  try { await runMigrations(db2, { deployment: 'staging', expectInstanceId: 'wrong-pin' }); } catch (e) { pinRefused = /INSTANCE BINDING refusal/.test(String(e)); }
+  check('wrong instance pin refused (pre-mutation)', pinRefused);
+  const pv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations WHERE version <> '0001'`);
+  check('zero writes from a refused pin', Number(pv.rows[0]?.['n']) === 0);
+
+  // 3e) Seed precondition: tampered migration digest refuses the seed pre-mutation.
+  await db2.query(`UPDATE schema_migrations SET sha256 = 'tampered' WHERE version = '0001'`);
+  let seedRefused = false;
+  try { await runStagingSeed(db2, { marker: '1', credentials: CREDS }); } catch (e) { seedRefused = /INTEGRITY refusal/.test(String(e)); }
+  check('seed refuses tampered migration history before mutation', seedRefused);
+  const su = await db2.query(`SELECT count(*)::int AS n FROM users WHERE user_id LIKE 'stg-%'`);
+  check('seed wrote nothing after refusal', Number(su.rows[0]?.['n']) === 0);
+  await db2.query(`UPDATE schema_migrations SET sha256 = $1 WHERE version = '0001'`, [stepDigest(MIGRATIONS[0]!)]);
 
   // 4) Staging seed on real Postgres: transaction, exact rerun, drift, rollback.
   const sd = mk('contake_seed');

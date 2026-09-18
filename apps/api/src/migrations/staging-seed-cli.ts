@@ -23,7 +23,7 @@
  *  hardcoded. */
 import { runStagingSeed, deriveForbiddenIdentifiers } from './staging-seed.js';
 import { assertDirectDatabaseUrl } from './runner.js';
-import { parseCliArgs, resolveDatabaseUrl, writeFileExclusive } from './cli-args.js';
+import { parseCliArgs, resolveDatabaseUrl, durablePublish } from './cli-args.js';
 
 const args = parseCliArgs(process.argv.slice(2), {
   required: ['--expect-host', '--expect-db'],
@@ -65,7 +65,7 @@ try {
   const inventoryJson = JSON.stringify(result.inventory, null, 2);
   const out = args['--inventory-out'];
   if (out) {
-    writeFileExclusive(out, inventoryJson);
+    durablePublish(out, inventoryJson);
     console.log(`seed:staging: non-secret inventory written to ${out} (manifest sha256 ${result.inventory.manifestSha256})`);
   } else {
     console.log('seed:staging: non-secret inventory:');
