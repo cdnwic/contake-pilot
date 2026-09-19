@@ -123,6 +123,27 @@ other migration path and no schema work at app startup.
   an unverifiable marker is an UNPROVEN-DIRTY hard stop retaining all
   failures + attempt evidence, blocking pending attended recovery.
   `--resolve-dirty '<note>'` performs attended resolution.
+- **Pre-committed eligibility protocol (SA4-C3).** Every mutation of a
+  gated target is preceded by an ATOMIC conditional admission consume on
+  `schema_migration_target_state` (ELIGIBLE -> IN-FLIGHT in one guarded
+  UPDATE inside the bootstrap transaction, committed before any risky
+  statement; a concurrent start loses the race, no read/write TOCTOU).
+  ELIGIBLE is restored ONLY by clean completion, in the same transaction
+  as the final apply/commit; a restore failure stays blocked. Every
+  post-admission exit (refusal, abort, kill, crash, expiry) leaves the
+  durable IN-FLIGHT record - no exit path restores eligibility early and
+  no TTL ever grants it: a stale IN-FLIGHT only flags the target for
+  ATTENDED recovery (`--resolve-dirty`), which invalidates every
+  outstanding issued ack, records a `dirty-resolved` event with the
+  affected nonces, and restores ELIGIBLE with a `recovered_at` watermark
+  in ONE transaction; the apply gate refuses acks minted at/before
+  `recovered_at` (POST-RECOVERY - the first cycle after recovery requires
+  a fresh attended TOFU). First-ever ELIGIBLE provisioning is attended
+  (explicit issuance/run path, never a side effect of bookkeeping),
+  recorded as a `target-provisioned` event, and TOFU-bound to the
+  deployment label that provisioned it; a first governed run claiming a
+  different label refuses (PROVISIONING BINDING) without consuming
+  eligibility.
 - **Pre-mutation target binding.** `verifyTargetPreconditions` (deployment
   label + optional `--expect-instance-id` pin) runs READ-ONLY before any
   write; the first-run stamp is printed as an operator-attended TOFU gate,

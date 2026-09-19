@@ -696,11 +696,28 @@ if (phase === 'phase1') {
 
   // 2) ATTACK SET through the REAL CLI (all must fail closed, nothing applied).
   const applied = async () => (await tofu.query(`SELECT version FROM public.schema_migrations ORDER BY seq`)).rows.map(x => String(x['version']));
+  // SA4-C3: every post-admission refusal/abort leaves the target IN-FLIGHT;
+  // attended recovery (recorded, invalidating outstanding acks) is the only
+  // way back - recover() is the harness's attended-recovery step.
+  const recover = async (dbx: typeof tofu) => {
+    const st = await dbx.query(`SELECT eligible, dirty FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database()`);
+    if (st.rows.length > 0 && (st.rows[0]?.['eligible'] !== true || st.rows[0]?.['dirty'] === true)) {
+      await attendedResolveDirty(dbx, { note: 'evidence: attended recovery between attack runs', resolvedBy: 'evidence' });
+    }
+  };
+  // SA4-C3: fresh target adopted the running digest ONLY through the governed
+  // first-run TOFU stamp; first provisioning is attended + deployment-bound.
+  const ident0 = await tofu.query(`SELECT registry_digest FROM public.contake_db_identity WHERE id = 1`);
+  check('SA4-C3: fresh target adopted the running REGISTRY_DIGEST through the governed first-run TOFU stamp', String(ident0.rows[0]?.['registry_digest']) === R.REGISTRY_DIGEST, ident0.rows);
+  const provEv0 = await tofu.query(`SELECT report FROM public.schema_migration_evidence WHERE kind = 'target-provisioned'`);
+  check('SA4-C3: first ELIGIBLE provisioning is attended (append-only target-provisioned event) and bound to the deployment', provEv0.rows.length === 1 && JSON.stringify(provEv0.rows[0]?.['report']).includes('"deployment":"staging"'), provEv0.rows);
 
   const noAck = cliRun(url, []);
   console.error(`OBSERVED[cli no-ack]: status=${noAck.status} ${noAck.stderr.split('\n').find(l => l.includes('GATE')) ?? ''}`);
   check('REAL CLI refuses an absent ack (exit 75, nothing executed)', noAck.status === 75 && noAck.stderr.includes('GATE: no ack supplied'), { status: noAck.status, stderr: noAck.stderr.slice(0, 200) });
   check('no-ack run applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+  // (SA4-C3: the no-ack invocation is the issuance-first path - exit 75
+  // BEFORE any run, so NO admission consume happens and no recovery needed.)
 
   // SA4 s2/s5: target-binding + parser attacks through the BUILT CLI.
   const unknownFlag = cliRun(url, ['--bogus-flag', 'x']);
@@ -726,8 +743,10 @@ if (phase === 'phase1') {
   console.error(`OBSERVED[cli wrong-ack]: status=${wrongAck.status}`);
   check('REAL CLI refuses a wrong ack (runner gate, fail closed)', wrongAck.status !== 0 && wrongAck.stderr.includes('OPERATOR GATE refusal'), { status: wrongAck.status });
   check('wrong-ack run applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+  await recover(tofu); // SA4-C3: the gate refusal left the target IN-FLIGHT
 
-  const staleAck = pf.requiredAck;
+  const pfStale = preflight(url);
+  const staleAck = pfStale.requiredAck;
   // The ack binds the canonical inconsistency LISTS (+ target + deployment):
   // the state change must alter a LIST to invalidate it. A blank phone enters
   // blankPhoneUsers - the minted digest no longer matches the recomputed one.
@@ -736,6 +755,7 @@ if (phase === 'phase1') {
   console.error(`OBSERVED[cli stale-ack]: status=${stale.status}`);
   check('REAL CLI refuses a STALE ack (list state changed after it was minted; runner recomputes under lock)', stale.status !== 0 && stale.stderr.includes('OPERATOR GATE refusal'), { status: stale.status });
   await tofu.query(`DELETE FROM users WHERE user_id = 'u-late'`);
+  await recover(tofu); // SA4-C3: stale-ack refusal left IN-FLIGHT
 
   await admin.query(`DROP DATABASE IF EXISTS contake_tofu2 WITH (FORCE)`);
   await admin.query(`CREATE DATABASE contake_tofu2`);
@@ -747,9 +767,11 @@ if (phase === 'phase1') {
   const replayed = cliRun(url, ['--ack', pf2.requiredAck]);
   console.error(`OBSERVED[cli replayed-ack]: status=${replayed.status}`);
   check('REAL CLI refuses a REPLAYED ack (minted against another target)', replayed.status !== 0 && replayed.stderr.includes('OPERATOR GATE refusal'), { status: replayed.status });
+  await recover(tofu);
 
   const fabricated = cliRun(url, ['--ack', `ack:${'f'.repeat(16)}:${'0'.repeat(64)}`]);
   check('REAL CLI refuses a fabricated ack (no preflight ever produced it)', fabricated.status !== 0 && fabricated.stderr.includes('NO ISSUED PREFLIGHT'), { status: fabricated.status });
+  await recover(tofu);
   // SA3 Q1: TRULY-ABSENT preflight - a well-formed ack from an arbitrary
   // nonce + the public canonical digest, NO issuance record anywhere.
   const forgedReport = await computeUsersPhonePreflight(tofu, { deployment: 'staging' });
@@ -759,18 +781,22 @@ if (phase === 'phase1') {
   check('SA3 Q1: REAL CLI refuses a TRULY-ABSENT preflight ack (arbitrary nonce + public digest, no record)',
     forged.status !== 0 && forged.stderr.includes('NO ISSUED PREFLIGHT'), { status: forged.status });
   check('all refusals applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+  await recover(tofu);
 
   // SA2-A acceptance: PLAN-MISMATCH presentation (ack minted for 0002-only / 0003-alone)
-  const tamperedPlanAck = (keep: string) => `ack:${pf.nonce}:${operatorListDigestForReview({
-    target: pf.target, deployment: pf.deployment, nonce: pf.nonce, plan: pf.plan.filter((x: { version: string }) => x.version === keep),
-    collisionGroups: pf.collisionGroups, crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies, blankPhoneUsers: pf.blankPhoneUsers,
+  const pfPm = preflight(url);
+  const tamperedPlanAck = (keep: string) => `ack:${pfPm.nonce}:${operatorListDigestForReview({
+    target: pfPm.target, deployment: pfPm.deployment, nonce: pfPm.nonce, plan: pfPm.plan.filter((x: { version: string }) => x.version === keep),
+    collisionGroups: pfPm.collisionGroups, crossRepresentationInconsistencies: pfPm.crossRepresentationInconsistencies, blankPhoneUsers: pfPm.blankPhoneUsers,
   })}`;
   const planMismatch2 = cliRun(url, ['--ack', tamperedPlanAck('0002')]);
+  await recover(tofu); // SA4-C3: each refusal leaves IN-FLIGHT
   const planMismatch3 = cliRun(url, ['--ack', tamperedPlanAck('0003')]);
   check('REAL CLI refuses PLAN-MISMATCH presentations (0002-only / 0003-alone)',
     planMismatch2.status !== 0 && planMismatch2.stderr.includes('OPERATOR GATE refusal')
     && planMismatch3.status !== 0 && planMismatch3.stderr.includes('OPERATOR GATE refusal'), { s2: planMismatch2.status, s3: planMismatch3.status });
   check('plan-mismatch refusals applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+  await recover(tofu);
 
   // SA2-A acceptance: POST-ABORT reuse. A gated 0003 variant whose guard
   // always fires aborts the plan AFTER the ack was accepted at 0002; the
@@ -788,10 +814,16 @@ if (phase === 'phase1') {
   check('the aborted ack record is invalidated (mutually exclusive with consumed)', invState.rows[0]?.['state'] === 'invalidated', invState.rows);
   let replayRefused = '';
   try { await runMigrations(tofu, { deployment: 'staging', migrations: failingPlan, operatorAck: abortAck }); } catch (e) { replayRefused = String(e); }
-  check('POST-ABORT REPLAY of the exact same ack refuses (ACK LIFECYCLE loud conflict)', /ACK LIFECYCLE/.test(replayRefused), replayRefused.slice(0, 200));
+  check('SA4-C3: POST-ABORT REPLAY refuses at ADMISSION (target IN-FLIGHT; no exit restores eligibility)', /IN-FLIGHT TARGET refusal/.test(replayRefused), replayRefused.slice(0, 200));
+  await recover(tofu);
+  let replayRefused2 = '';
+  try { await runMigrations(tofu, { deployment: 'staging', migrations: failingPlan, operatorAck: abortAck }); } catch (e) { replayRefused2 = String(e); }
+  check('POST-ABORT REPLAY post-recovery reaches the gate and refuses (ACK LIFECYCLE loud conflict)', /ACK LIFECYCLE/.test(replayRefused2), replayRefused2.slice(0, 200));
+  await recover(tofu);
 
   // 3) GREEN PATH: operator reviews the preflight, supplies THIS target+state ack.
-  const green = cliRun(url, ['--ack', pf.requiredAck]);
+  const pfGreen = preflight(url);
+  const green = cliRun(url, ['--ack', pfGreen.requiredAck]);
   console.error(`OBSERVED[cli green]: status=${green.status} ${green.stdout.split('\n').find(l => l.includes('applied')) ?? ''}`);
   check('REAL CLI applies 0002+0003 with the exact operator ack', green.status === 0 && green.stdout.includes('"0002"') && green.stdout.includes('"0003"'), { status: green.status, stdout: green.stdout.slice(0, 300) });
   const rows = await tofu.query(`SELECT user_id, phone, data->>'phone' AS jp FROM users ORDER BY user_id`);
@@ -818,7 +850,7 @@ if (phase === 'phase1') {
     && String(ev.rows[0]!['list_digest']) === pf.listDigest
     && String(ev.rows[1]!['list_digest']) !== pf.listDigest
     && ev.rows.every(x => String(x['target']) === 'contake_tofu')
-    && ev.rows.every(x => String((x['report'] as { ack?: string }).ack) === pf.requiredAck)
+    && ev.rows.every(x => String((x['report'] as { ack?: string }).ack) === pfGreen.requiredAck)
     && ev.rows.every(x => (x['report'] as { preStateDigest?: string }).preStateDigest === (x['report'] as { postStateDigest?: string }).postStateDigest)
     && ev.rows.every(x => Array.isArray((x['report'] as { plan?: unknown[] }).plan)), ev.rows.map(x => ({ version: x['version'], list_digest: String(x['list_digest']).slice(0, 16), target: x['target'] })));
   const bootRow = (await tofu.query(`SELECT version, list_digest FROM public.schema_migration_evidence WHERE kind = 'runner-bootstrap'`)).rows;
@@ -834,6 +866,11 @@ if (phase === 'phase1') {
     blockedRun.status !== 0 && /ASSERTION refusal - guard 'no-duplicates' in '0002'/.test(blockedRun.stderr), { status: blockedRun.status });
   const t2 = await tofu2.query(`SELECT to_regclass('users_phone_unique') AS r`);
   check('tofu: blocked run built nothing', t2.rows[0]?.['r'] === null);
+  {
+    const st2 = await tofu2.query(`SELECT eligible, dirty, in_flight FROM public.schema_migration_target_state`);
+    check('SA4-C3: tofu2 abort left a durable DIRTY + IN-FLIGHT record (no exit restores eligibility early)',
+      st2.rows[0]?.['dirty'] === true && st2.rows[0]?.['eligible'] === false && !!st2.rows[0]?.['in_flight'], st2.rows);
+  }
 
   // SA3 section 5: every lifecycle event has UNIQUE append-only identity on
   // BOTH databases (no (version,kind) collapse, no dropped invalidation).
@@ -873,6 +910,22 @@ if (phase === 'phase1') {
   // retaining BOTH errors; target blocks issuance + runs; attended
   // resolution unblocks (append-only dirty-resolved event).
   await tofu2.query(`DELETE FROM users WHERE user_id IN ('u-a', 'u-b')`); // keep guard quiet; sabotage the evidence writes instead
+  // SA4-C3: recovery atomicity on REAL PG - invalidation + resolution event +
+  // eligibility restore in ONE unit, with the affected nonces recorded.
+  const acksBefore2 = await tofu2.query(`SELECT nonce FROM public.schema_migration_acks WHERE state = 'issued'`);
+  await attendedResolveDirty(tofu2, { note: 'evidence: blocked run reviewed by operator', resolvedBy: 'evidence' });
+  {
+    const res2 = await tofu2.query(`SELECT report FROM public.schema_migration_evidence WHERE kind = 'dirty-resolved'`);
+    const rep2 = res2.rows[0]?.['report'] as { invalidatedNonces?: string[] } | undefined;
+    const stillIssued2 = await tofu2.query(`SELECT count(*)::int AS n FROM public.schema_migration_acks WHERE state = 'issued'`);
+    const st2b = await tofu2.query(`SELECT eligible, dirty, recovered_at FROM public.schema_migration_target_state`);
+    check('SA4-C3: recovery invalidated exactly the outstanding issued acks and recorded them in the resolution event (one atomic unit)',
+      acksBefore2.rows.length === 1 && Array.isArray(rep2?.invalidatedNonces) && rep2!.invalidatedNonces!.length === 1
+      && rep2!.invalidatedNonces![0] === String(acksBefore2.rows[0]!['nonce']) && Number(stillIssued2.rows[0]?.['n']) === 0,
+      { before: acksBefore2.rows, report: rep2 });
+    check('SA4-C3: recovery restored ELIGIBLE with a recovery watermark in the same unit',
+      st2b.rows[0]?.['eligible'] === true && st2b.rows[0]?.['dirty'] === false && !!st2b.rows[0]?.['recovered_at'], st2b.rows);
+  }
   const pfDirty = await issueOperatorPreflight(tofu2, { deployment: 'staging' });
   await tofu2.query(`CREATE OR REPLACE FUNCTION public.__sa3_fail_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'simulated evidence-write failure'; END; $$`);
   await tofu2.query(`CREATE TRIGGER __sa3_fail_evidence BEFORE INSERT ON public.schema_migration_evidence FOR EACH ROW EXECUTE FUNCTION public.__sa3_fail_evidence()`);
@@ -891,7 +944,9 @@ if (phase === 'phase1') {
   await tofu2.query(`DROP FUNCTION public.__sa3_fail_evidence()`);
   await attendedResolveDirty(tofu2, { note: 'evidence writer repaired; abort reviewed by operator', resolvedBy: 'evidence' });
   const resolvedEv = await tofu2.query(`SELECT report FROM public.schema_migration_evidence WHERE kind = 'dirty-resolved'`);
-  check('SA3: attended DIRTY resolution recorded as append-only event retaining the prior failure', resolvedEv.rows.length === 1 && JSON.stringify(resolvedEv.rows[0]?.['report']).includes('invalidationFailure'), resolvedEv.rows);
+  check('SA3: attended DIRTY resolution recorded as append-only event retaining the prior failure', resolvedEv.rows.length === 2 && resolvedEv.rows.some(x => JSON.stringify(x['report']).includes('invalidationFailure')), resolvedEv.rows);
+  check('SA4-C3: second recovery invalidated exactly the ack left issued by the failed invalidation unit',
+    resolvedEv.rows.some(x => JSON.stringify((x['report'] as { invalidatedNonces?: string[] })?.invalidatedNonces) === JSON.stringify([pfDirty.nonce])), resolvedEv.rows);
   const pfAfter = await issueOperatorPreflight(tofu2, { deployment: 'staging' });
   const rAfter = await runMigrations(tofu2, { deployment: 'staging', operatorAck: operatorAckFor(pfAfter) });
   check('SA3: target unblocked after attended resolution (fresh issuance + run applies 0002+0003)', JSON.stringify(rAfter.appliedNow) === '["0002","0003"]', rAfter.appliedNow);
@@ -905,7 +960,7 @@ if (phase === 'phase1') {
   const url3 = `postgres://postgres@${host}:${port}/contake_tofu3`;
   const pfUnproven = preflight(url3);
   await tofu3.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected evidence-write failure'; END; $$`);
-  await tofu3.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected marker-write failure'; END; $$`);
+  await tofu3.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.dirty IS TRUE THEN RAISE EXCEPTION 'injected marker-write failure'; END IF; RETURN NEW; END; $$`);
   await tofu3.query(`CREATE TRIGGER __sa4_fail_evidence BEFORE INSERT ON public.schema_migration_evidence FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_evidence()`);
   await tofu3.query(`CREATE TRIGGER __sa4_fail_state BEFORE INSERT OR UPDATE ON public.schema_migration_target_state FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_state()`);
   const unproven = cliRun(url3, ['--ack', pfUnproven.requiredAck]);
@@ -919,17 +974,166 @@ if (phase === 'phase1') {
   const ts3 = await tofu3.query(`SELECT dirty FROM public.schema_migration_target_state`);
   check('SA4: UNPROVEN-DIRTY persisted NO dirty marker (nothing silently recorded)', ts3.rows.length === 0 || ts3.rows[0]?.['dirty'] !== true, ts3.rows);
   check('SA4: UNPROVEN-DIRTY run applied nothing past 0001', JSON.stringify((await tofu3.query(`SELECT version FROM public.schema_migrations ORDER BY seq`)).rows.map(x => String(x['version']))) === '["0001"]');
-  // attended recovery: operator repairs out of band; no durable marker to
-  // resolve - fresh issuance + run succeed through the built CLI.
+  {
+    const ts3b = await tofu3.query(`SELECT eligible, dirty, in_flight FROM public.schema_migration_target_state`);
+    check('SA4-C3: UNPROVEN-DIRTY left the target durably IN-FLIGHT (attended recovery required; no silent re-eligibility)',
+      ts3b.rows[0]?.['eligible'] === false && !!ts3b.rows[0]?.['in_flight'] && ts3b.rows[0]?.['dirty'] !== true, ts3b.rows);
+  }
+  let blockedIssue3 = '';
+  try { await issueOperatorPreflight(tofu3, { deployment: 'staging' }); } catch (e) { blockedIssue3 = String(e); }
+  check('SA4-C3: IN-FLIGHT target blocks preflight issuance', /IN-FLIGHT TARGET refusal/.test(blockedIssue3), blockedIssue3.slice(0, 160));
+  // attended recovery: operator repairs out of band, resolves the IN-FLIGHT
+  // record (invalidating the ack the failed invalidation unit left issued),
+  // then fresh issuance + run succeed through the built CLI.
   await tofu3.query(`DROP TRIGGER __sa4_fail_evidence ON public.schema_migration_evidence`);
   await tofu3.query(`DROP TRIGGER __sa4_fail_state ON public.schema_migration_target_state`);
   await tofu3.query(`DROP FUNCTION public.__sa4_fail_evidence()`);
   await tofu3.query(`DROP FUNCTION public.__sa4_fail_state()`);
+  await attendedResolveDirty(tofu3, { note: 'evidence: unproven run reviewed and resolved by operator', resolvedBy: 'evidence' });
   const pf3 = preflight(url3);
   const recovered = cliRun(url3, ['--ack', pf3.requiredAck]);
   check('SA4: target not durably blocked - after attended repair the built CLI applies 0002+0003', recovered.status === 0 && recovered.stdout.includes('"0002"') && recovered.stdout.includes('"0003"'), { status: recovered.status });
   await tofu3.end();
   await admin.query(`DROP DATABASE contake_tofu3 WITH (FORCE)`);
+
+  // SA4-C3 s3 security: the admission consume is ATOMIC - two concurrent
+  // starts race the conditional UPDATE; EXACTLY ONE wins (no read/write TOCTOU).
+  await admin.query(`DROP DATABASE IF EXISTS contake_atomic WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_atomic`);
+  const atomic1 = mk('contake_atomic');
+  await runMigrations(atomic1, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  const atomic2 = mk('contake_atomic');
+  const raceSql = (tag: string) => `UPDATE public.schema_migration_target_state SET eligible = false, in_flight = '{"race":"${tag}"}'::jsonb, updated_at = now() WHERE target = pg_catalog.current_database() AND eligible = true AND dirty = false RETURNING target`;
+  const [w1, w2] = await Promise.all([
+    atomic1.query(raceSql('a')).then(r => r.rows.length, () => -1),
+    atomic2.query(raceSql('b')).then(r => r.rows.length, () => -1),
+  ]);
+  check('SA4-C3: concurrent admission consume - EXACTLY ONE wins (atomic conditional write)',
+    [w1, w2].filter(w => w === 1).length === 1 && [w1, w2].filter(w => w === 0).length === 1, { w1, w2 });
+  await attendedResolveDirty(atomic1, { note: 'evidence: race winner released', resolvedBy: 'evidence' });
+  await atomic1.end(); await atomic2.end();
+  await admin.query(`DROP DATABASE contake_atomic WITH (FORCE)`);
+
+  // SA4-C3 s3 security: no risky statement can COMMIT before the admission
+  // consume is durably acknowledged - stall the gated plan with row locks and
+  // WITNESS the committed IN-FLIGHT record from a second connection while
+  // ZERO gated work has landed.
+  await admin.query(`DROP DATABASE IF EXISTS contake_witness WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_witness`);
+  const wit = mk('contake_witness');
+  await runMigrations(wit, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  await wit.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('w1', 'org-1', 'w@x', ' +972555000999 ', '{}')`);
+  const pfW = await issueOperatorPreflight(wit, { deployment: 'staging' });
+  const stall = mk('contake_witness');
+  const stallClient = await stall.connect();
+  await stallClient.query('BEGIN');
+  await stallClient.query(`SELECT user_id FROM public.users FOR UPDATE`);
+  const witness = mk('contake_witness');
+  const witRunP = runMigrations(wit, { deployment: 'staging', operatorAck: operatorAckFor(pfW) });
+  let seen = '';
+  for (let i = 0; i < 600; i++) {
+    const st = await witness.query(`SELECT eligible, in_flight FROM public.schema_migration_target_state`);
+    if (st.rows[0]?.['eligible'] === false) { seen = JSON.stringify(st.rows[0]); break; }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  check('SA4-C3: admission consume COMMITTED (IN-FLIGHT visible to a second connection) while the gated plan is stalled',
+    seen.includes('"eligible":false') && seen.includes('"in_flight"'), seen || '(consume never became visible)');
+  const stalledApplied = await witness.query(`SELECT version FROM public.schema_migrations ORDER BY seq`);
+  const stalledUsers = await witness.query(`SELECT phone FROM public.users WHERE user_id = 'w1'`);
+  check('SA4-C3: while stalled, ZERO gated work has committed (0002/0003 absent; users row unnormalized)',
+    JSON.stringify(stalledApplied.rows.map(x => String(x['version']))) === '["0001"]' && stalledUsers.rows[0]?.['phone'] === ' +972555000999 ',
+    { applied: stalledApplied.rows, phone: stalledUsers.rows[0]?.['phone'] });
+  await stallClient.query('ROLLBACK'); stallClient.release();
+  const witRun = await witRunP;
+  check('SA4-C3: after the stall clears, the run completes green and restores ELIGIBLE', JSON.stringify(witRun.appliedNow) === '["0002","0003"]', witRun.appliedNow);
+  const witState = await witness.query(`SELECT eligible FROM public.schema_migration_target_state`);
+  check('SA4-C3: clean completion restored ELIGIBLE', witState.rows[0]?.['eligible'] === true, witState.rows);
+  await wit.end(); await stall.end(); await witness.end();
+  await admin.query(`DROP DATABASE contake_witness WITH (FORCE)`);
+
+  // SA4-C3 s3 security: restart with a crashed run's durable IN-FLIGHT record -
+  // BOTH issuance and apply through the BUILT CLI refuse; the stale record
+  // NEVER grants eligibility (no TTL), attended recovery + fresh TOFU required.
+  await admin.query(`DROP DATABASE IF EXISTS contake_restart WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_restart`);
+  const rst = mk('contake_restart');
+  await runMigrations(rst, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  const urlR = `postgres://postgres@${host}:${port}/contake_restart`;
+  await rst.query(`UPDATE public.schema_migration_target_state SET eligible = false, in_flight = '{"nonce":"simulated-crash","firstVersion":"0002"}'::jsonb, updated_at = now() - interval '6 hours'`);
+  const rstIssue = cliRun(urlR, []);
+  check('SA4-C3: restart with IN-FLIGHT - issuance through the built CLI refuses (stale record NEVER grants)',
+    rstIssue.status !== 0 && rstIssue.stderr.includes('IN-FLIGHT TARGET refusal') && rstIssue.stderr.includes('stuck for'), { status: rstIssue.status, stderr: rstIssue.stderr.slice(0, 200) });
+  const rstRun = cliRun(urlR, ['--ack', `ack:${'a'.repeat(16)}:${'0'.repeat(64)}`]);
+  check('SA4-C3: restart with IN-FLIGHT - apply through the built CLI refuses at admission',
+    rstRun.status !== 0 && rstRun.stderr.includes('IN-FLIGHT TARGET refusal'), { status: rstRun.status, stderr: rstRun.stderr.slice(0, 200) });
+  await attendedResolveDirty(rst, { note: 'evidence: operator cleared the crashed run', resolvedBy: 'evidence' });
+  const rstPf = preflight(urlR);
+  const rstGreen = cliRun(urlR, ['--ack', rstPf.requiredAck]);
+  check('SA4-C3: after attended recovery + fresh TOFU the built CLI runs green', rstGreen.status === 0, { status: rstGreen.status, stderr: rstGreen.stderr.slice(0, 200) });
+  await rst.end();
+  await admin.query(`DROP DATABASE contake_restart WITH (FORCE)`);
+
+  // SA4-C3: registry-digest adoption ONLY through the governed first-run path -
+  // a pre-stamped anchor from a DIFFERENT blueprint refuses (no silent re-anchor).
+  await admin.query(`DROP DATABASE IF EXISTS contake_anchor WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_anchor`);
+  const anc = mk('contake_anchor');
+  await runMigrations(anc, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  const ident = await anc.query(`SELECT registry_digest FROM public.contake_db_identity WHERE id = 1`);
+  check('SA4-C3: fresh target adopted the running REGISTRY_DIGEST through the governed first-run TOFU stamp',
+    String(ident.rows[0]?.['registry_digest']) === R.REGISTRY_DIGEST, ident.rows);
+  const provEv = await anc.query(`SELECT report FROM public.schema_migration_evidence WHERE kind = 'target-provisioned'`);
+  check('SA4-C3: first ELIGIBLE provisioning is attended (append-only target-provisioned event) and bound to the deployment',
+    provEv.rows.length === 1 && JSON.stringify(provEv.rows[0]?.['report']).includes('"deployment":"staging"'), provEv.rows);
+  await anc.query(`UPDATE public.contake_db_identity SET registry_digest = '${'0'.repeat(64)}' WHERE id = 1`);
+  let anchorErr = '';
+  try { await runMigrations(anc, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) }); } catch (e) { anchorErr = String(e); }
+  check('SA4-C3: a stamped anchor from a different registry digest REFUSES (ANCHOR refusal; no silent re-anchor)',
+    /ANCHOR refusal/.test(anchorErr), anchorErr.slice(0, 200));
+  await anc.end();
+  await admin.query(`DROP DATABASE contake_anchor WITH (FORCE)`);
+
+  // SA4-C3: TOFU-bound provisioning - a target provisioned under a DIFFERENT
+  // deployment label refuses the first governed run claiming another label.
+  await admin.query(`DROP DATABASE IF EXISTS contake_provbind WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_provbind`);
+  const pb = mk('contake_provbind');
+  await issueOperatorPreflight(pb, { deployment: 'production' });
+  let pbErr = '';
+  try { await runMigrations(pb, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) }); } catch (e) { pbErr = String(e); }
+  check('SA4-C3: PROVISIONING BINDING refusal - first governed run claims staging on a production-provisioned target',
+    /PROVISIONING BINDING refusal/.test(pbErr), pbErr.slice(0, 200));
+  const pbState = await pb.query(`SELECT eligible FROM public.schema_migration_target_state`);
+  check('SA4-C3: the binding refusal did NOT consume eligibility (target still ELIGIBLE)', pbState.rows[0]?.['eligible'] === true, pbState.rows);
+  await pb.end();
+  await admin.query(`DROP DATABASE contake_provbind WITH (FORCE)`);
+
+  // SA4-C3 (d): the first cycle after attended recovery demands a FRESH
+  // attended TOFU - an ack row minted at/before recovered_at is dead even
+  // while still 'issued' (forged backdated row, all digests correct).
+  await admin.query(`DROP DATABASE IF EXISTS contake_postrec WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_postrec`);
+  const pr = mk('contake_postrec');
+  await runMigrations(pr, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  const urlPR = `postgres://postgres@${host}:${port}/contake_postrec`;
+  await pr.query(`UPDATE public.schema_migration_target_state SET eligible = false, in_flight = '{"nonce":"simulated-crash"}'::jsonb, updated_at = now()`);
+  await attendedResolveDirty(pr, { note: 'evidence: crash reviewed', resolvedBy: 'evidence' });
+  const pfB = await issueOperatorPreflight(pr, { deployment: 'staging' });
+  const pfBRow = (await pr.query(`SELECT plan_digest, list_digest FROM public.schema_migration_acks WHERE nonce = $1`, [pfB.nonce])).rows[0]!;
+  await pr.query(
+    `INSERT INTO public.schema_migration_acks(nonce, target, deployment_label, plan_digest, list_digest, state, issued_at) VALUES('postrec-forged', pg_catalog.current_database(), 'staging', $1, $2, 'issued', now() - interval '1 hour')`,
+    [String(pfBRow['plan_digest']), String(pfBRow['list_digest'])],
+  );
+  const postRec = cliRun(urlPR, ['--ack', `ack:postrec-forged:${String(pfBRow['list_digest'])}`]);
+  check('SA4-C3: POST-RECOVERY refusal - ack minted at/before recovered_at is dead even with correct digests and issued state',
+    postRec.status !== 0 && postRec.stderr.includes('POST-RECOVERY'), { status: postRec.status, stderr: postRec.stderr.slice(0, 200) });
+  check('SA4-C3: POST-RECOVERY refusal applied nothing', JSON.stringify((await pr.query(`SELECT version FROM public.schema_migrations ORDER BY seq`)).rows.map(x => String(x['version']))) === '["0001"]');
+  await recover(pr);
+  const pfC = preflight(urlPR);
+  const prGreen = cliRun(urlPR, ['--ack', pfC.requiredAck]);
+  check('SA4-C3: fresh attended TOFU after recovery runs green', prGreen.status === 0, { status: prGreen.status, stderr: prGreen.stderr.slice(0, 200) });
+  await pr.end();
+  await admin.query(`DROP DATABASE contake_postrec WITH (FORCE)`);
 
   await tofu2.end(); await tofu.end();
   await admin.query(`DROP DATABASE contake_tofu2 WITH (FORCE)`);
