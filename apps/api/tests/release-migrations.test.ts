@@ -15,7 +15,7 @@ import {
   verifyTargetPreconditions, assertSingleStatementForms, REGISTRY_DIGEST, type MigrationStep,
 } from '../src/migrations/runner.js';
 import * as runnerModule from '../src/migrations/runner.js';
-import { issueOperatorPreflight, operatorAckFor, type Connectable } from '../src/migrations/runner.js';
+import { attendedResolveDirty, issueOperatorPreflight, operatorAckFor, type Connectable } from '../src/migrations/runner.js';
 /** SA2+SA3: staging-shaped lanes mint the attended-TOFU ack through the
  *  runner's REAL issuance path (persisted issued-nonce record; the runner
  *  re-verifies + consumes it in-transaction). No label exemption exists. */
@@ -541,6 +541,13 @@ describe('release-migration runner', () => {
     const t = await conn.query(`SELECT to_regclass('partial_leak') AS r, to_regclass('partial_idx') AS i`);
     expect(t.rows[0]?.['r']).toBe('partial_leak');
     expect(t.rows[0]?.['i']).toBe('partial_idx');
+    // SA4-C3: the intentional abort left the target durably IN-FLIGHT (the
+    // admission consume is never silently restored); attended recovery is
+    // the only way back, then a fresh issuance + run succeeds.
+    const st = await conn.query(`SELECT eligible, in_flight FROM schema_migration_target_state`);
+    expect(st.rows[0]?.['eligible']).toBe(false);
+    expect(st.rows[0]?.['in_flight']).toBeTruthy();
+    await attendedResolveDirty(conn, { note: 'test: reviewed intentional template failure', resolvedBy: 'test' });
     await stagingRunMigrations(conn, { deployment: 'staging' });
     await expect(assertSchemaCurrent(conn)).resolves.toBeUndefined();
     await pg.close();
