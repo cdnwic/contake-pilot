@@ -45,7 +45,10 @@ try {
   }
   // 1) resolved-target preflight ISSUANCE first (operator attends this list;
   //    the nonce record it persists is the only ack that can exist).
-  const pf = await issueOperatorPreflight(pool, { deployment });
+  const pf = await issueOperatorPreflight(pool, {
+    deployment,
+    expectInstanceId: arg('--expect-instance-id'), expectRegistryDigest: arg('--expect-registry-digest'),
+  });
   console.log(JSON.stringify({ preflight: pf, registryDigest: REGISTRY_DIGEST }, null, 2));
   const required = operatorAckFor(pf);
   if (!ack) {

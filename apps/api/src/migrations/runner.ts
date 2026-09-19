@@ -1169,7 +1169,7 @@ async function assertTargetNotDirty(client: Queryable): Promise<void> {
  *  arbitrary nonce plus the public canonical digest constructs nothing. */
 export async function issueOperatorPreflight(
   conn: Connectable,
-  opts: { deployment: string; migrations?: readonly MigrationStep[] },
+  opts: { deployment: string; migrations?: readonly MigrationStep[]; expectInstanceId?: string; expectRegistryDigest?: string },
 ): Promise<OperatorPreflightReport & { listDigest: string }> {
   const client = await conn.connect();
   try {
@@ -1178,6 +1178,11 @@ export async function issueOperatorPreflight(
     try {
       await client.query('BEGIN');
       try {
+        // SA3: pins bind BEFORE any write here too - a presented pin that does
+        // not match refuses inside this transaction, which ROLLS BACK, so a
+        // refused issuance leaves zero writes on the target (the same
+        // pre-write guarantee runMigrations enforces).
+        await verifyTargetPreconditions(client, { deployment: opts.deployment, expectInstanceId: opts.expectInstanceId, expectRegistryDigest: opts.expectRegistryDigest });
         await ensureRunnerBookkeeping(client);
         await assertTargetNotDirty(client);
         const pf = await computeUsersPhonePreflight(client, { deployment: opts.deployment, migrations: opts.migrations });

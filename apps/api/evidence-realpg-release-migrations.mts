@@ -45,8 +45,12 @@ const {
 /** SA3: evidence lanes mint REAL acks through the REAL issuance path
  *  (persisted issued-nonce record, bound to the SAME migrations array). */
 const ackedRun = async (db: Parameters<typeof runMigrations>[0], opts: Parameters<typeof runMigrations>[1]) => {
-  const pf = await issueOperatorPreflight(db, opts.migrations === undefined
-    ? { deployment: opts.deployment } : { deployment: opts.deployment, migrations: opts.migrations });
+  const pf = await issueOperatorPreflight(db, {
+    deployment: opts.deployment,
+    ...(opts.migrations === undefined ? {} : { migrations: opts.migrations }),
+    ...(opts.expectInstanceId === undefined ? {} : { expectInstanceId: opts.expectInstanceId }),
+    ...(opts.expectRegistryDigest === undefined ? {} : { expectRegistryDigest: opts.expectRegistryDigest }),
+  });
   return runMigrations(db, { operatorAck: operatorAckFor(pf), ...opts });
 };
 const { DATA_REGISTRY_DIGEST, runStagingSeed } = S;
@@ -622,7 +626,13 @@ if (phase === 'phase1') {
   await mig.query(`DROP FUNCTION public.dp_check()`);
   await mig.query(`DROP FUNCTION public.pre_exist()`);
 
-  check('conf: catalog identical to pre-attack baseline after cleanup', JSON.stringify(await catalogSnapshot(mig)) === pre, { afterAll: afterAll.length });
+  // SA3: the runner's append-only evidence ledger legitimately burns
+  // schema_migration_evidence_seq_seq values on refused/rolled-back attacks
+  // (a refusal is itself a recorded lifecycle event). A sequence counter is
+  // not an attack artifact: normalize ONLY that sequence value out of both
+  // snapshots; every other catalog member must be EXACTLY restored.
+  const stripEvSeq = (snap: string) => JSON.stringify((JSON.parse(snap) as string[]).filter(x => !(typeof x === 'string' && x.startsWith('seqval ') && x.includes('schema_migration_evidence_seq_seq'))));
+  check('conf: catalog identical to pre-attack baseline after cleanup (modulo append-only evidence sequence)', stripEvSeq(JSON.stringify(await catalogSnapshot(mig))) === stripEvSeq(pre), { afterAll: afterAll.length });
   await run.end(); await mig.end(); await adminC.end();
   await admin.query(`DROP DATABASE contake_conf WITH (FORCE)`);
   await admin.query(`DROP ROLE conf_runtime`); await admin.query(`DROP ROLE conf_migrator`);
@@ -804,15 +814,26 @@ if (phase === 'phase1') {
   check('SA3 Q2: tofu2 abort invalidation recorded (never dropped by a conflict)', inv2.rows.length === 1, inv2.rows);
 
   // SA3 section 3: deployment-label bypass attempts against the MODULE UNDER
-  // EVIDENCE (dist in the DIST lane): test/test-harness get NO exemption.
-  let testLaneRefused = '';
-  try { await runMigrations(tofu2, { deployment: 'test' }); } catch (e) { testLaneRefused = String(e); }
-  check('SA3: deployment=test is REFUSED without an issued ack (no caller-label exemption in the shipped artifact)',
-    /OPERATOR GATE refusal/.test(testLaneRefused), testLaneRefused.slice(0, 160));
-  let harnessLaneRefused = '';
-  try { await runMigrations(tofu2, { deployment: 'test-harness' }); } catch (e) { harnessLaneRefused = String(e); }
-  check('SA3: deployment=test-harness is REFUSED without an issued ack (no caller-label exemption in the shipped artifact)',
-    /OPERATOR GATE refusal/.test(harnessLaneRefused), harnessLaneRefused.slice(0, 160));
+  // EVIDENCE (dist in the DIST lane): test/test-harness labels get NO ack-gate
+  // exemption. Fresh scratch databases (no prior stamp) so the ACK GATE -
+  // not the cross-deployment binding - is what refuses.
+  for (const label of ['test', 'test-harness'] as const) {
+    const scratch = `contake_sa3_label_${label.replace('-', '_')}`;
+    await admin.query(`DROP DATABASE IF EXISTS "${scratch}" WITH (FORCE)`);
+    await admin.query(`CREATE DATABASE "${scratch}"`);
+    const sdb = mk(scratch);
+    let labelRefused = '';
+    try { await runMigrations(sdb, { deployment: label }); } catch (e) { labelRefused = String(e); }
+    check(`SA3: deployment=${label} is REFUSED without an issued ack (no caller-label exemption in the shipped artifact)`,
+      /OPERATOR GATE refusal/.test(labelRefused), labelRefused.slice(0, 160));
+    // the ack gate binds ONLY the credential-identity data-mutation steps:
+    // ungated 0001 init-schema provisions the schema by design; the refusal
+    // must stop EVERY ack-gated step (0002 normalize + 0003 index).
+    const sw = await sdb.query(`SELECT (SELECT count(*)::int FROM public.schema_migrations WHERE version <> '0001') AS gated_applied, to_regclass('public.users_phone_unique') AS idx`);
+    check(`SA3: deployment=${label} refusal applies ZERO ack-gated steps (0002/0003 absent, index never built)`, sw.rows[0]?.['gated_applied'] === 0 && sw.rows[0]?.['idx'] === null, sw.rows[0]);
+    await sdb.end();
+    await admin.query(`DROP DATABASE "${scratch}" WITH (FORCE)`);
+  }
 
   // SA3 section 5 on REAL PG: invalidation-failure -> DIRTY/INDETERMINATE
   // retaining BOTH errors; target blocks issuance + runs; attended
