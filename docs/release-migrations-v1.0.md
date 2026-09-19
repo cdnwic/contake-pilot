@@ -96,14 +96,22 @@ other migration path and no schema work at app startup.
   `pg_advisory_lock(841000001)` held across bootstrap + all steps; concurrent
   runners serialize and the loser no-ops.
 - **Runner-owned per-step transaction.** BEGIN, primitives, artifact
-  statements, version INSERT in the SAME transaction (rowCount must be
-  exactly 1), COMMIT; any failure rolls the whole step back; transactional
+  statements, version INSERT in the SAME transaction (plain INSERT - a
+  collision is a loud unique-violation failure), COMMIT; any failure rolls
+  the whole step back; transactional
   DDL means partial step DDL never persists.
 - **Explicit invocation only, closed CLI.** Schema changes run as a separate
   release job, never at web boot:
-  `DATABASE_URL=<direct> pnpm --filter @contake/api migrate:release -- --deployment <label> --expect-host <host> --expect-db <db> [--by <actor>] [--expect-instance-id <id>]`
-  Closed parser (unknown/duplicate/bare/missing rejected); flag XOR env URL;
-  target tuple matched against the URL AND `current_database()` before DDL.
+  `pnpm --filter @contake/api migrate:release -- --database-url <direct> --deployment staging|production [--ack ack:<nonce>:<listDigest>] [--expect-instance-id <id>] [--expect-registry-digest <digest>]`
+  ONE canonical gated entrypoint (SA3): `migrate:release` routes to
+  `scripts/migrate.mts` (the ungated cli.ts is deleted; every shipped
+  invocation path resolves to the same gate). Without `--ack` the CLI runs
+  the canonical preflight ISSUANCE (minting + persisting the unique nonce
+  bound to target + deployment + plan + listDigest), prints it, and exits 75
+  without executing; with `--ack` the runner re-verifies the ack against the
+  persisted record under the step locks and consumes it atomically with the
+  gated plan (absent-record / wrong-target / plan-mismatch / stale /
+  consumed / invalidated all fail closed; any abort invalidates the ack).
 - **Pre-mutation target binding.** `verifyTargetPreconditions` (deployment
   label + optional `--expect-instance-id` pin) runs READ-ONLY before any
   write; the first-run stamp is printed as an operator-attended TOFU gate,
@@ -222,7 +230,7 @@ The Postgres boot no longer applies the demo/camp-demo seeds or the QA staging
 slice, and no longer runs bootstrap DDL; it requires CONTAKE_DEPLOYMENT and
 CONTAKE_DB_INSTANCE_ID and verifies the stamped identity. Memory-adapter dev/test seeding is unchanged.
 Existing Postgres deployments adopt the runner by one explicit
-`migrate:release --deployment <label> --expect-host <host> --expect-db <db>`
+`migrate:release --database-url <direct> --deployment <label> [--ack ...]`
 run (no-op baseline), after which boots pass the gate. Rebuild path for
 staging = migrate + `seed:staging`; no local `pg_dump` bootstrap.
 

@@ -10,7 +10,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { pgliteConnectable, type Connectable } from '../src/repo/postgres.js';
-import { computeUsersPhonePreflight, operatorAckFor, runMigrations } from '../src/migrations/runner.js';
+import { issueOperatorPreflight, operatorAckFor, runMigrations } from '../src/migrations/runner.js';
 import {
   assertNoForbidden, DATA_REGISTRY_DIGEST, deriveFixtureIdentifiers, deriveForbiddenIdentifiers, runStagingSeed,
 } from '../src/migrations/staging-seed.js';
@@ -47,7 +47,7 @@ async function stagingDb(deployment = 'staging') {
   const conn = fileConn!;
   await conn.query('DROP SCHEMA public CASCADE');
   await conn.query('CREATE SCHEMA public');
-  await runMigrations(conn, { deployment, operatorAck: operatorAckFor(await computeUsersPhonePreflight(conn, { deployment })) });
+  await runMigrations(conn, { deployment, operatorAck: operatorAckFor(await issueOperatorPreflight(conn, { deployment })) });
   return { pg: { close: async () => {} }, conn };
 }
 
@@ -275,7 +275,7 @@ describe('staging synthetic seed', () => {
     const mk = async () => {
       const pg = new PGlite();
       const conn = pgliteConnectable(pg);
-      await runMigrations(conn, { deployment: 'staging', operatorAck: operatorAckFor(await computeUsersPhonePreflight(conn, { deployment: 'staging' })) });
+      await runMigrations(conn, { deployment: 'staging', operatorAck: operatorAckFor(await issueOperatorPreflight(conn, { deployment: 'staging' })) });
       return { pg, conn };
     };
     const a = await mk();

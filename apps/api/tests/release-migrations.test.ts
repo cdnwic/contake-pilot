@@ -15,12 +15,12 @@ import {
   verifyTargetPreconditions, assertSingleStatementForms, REGISTRY_DIGEST, type MigrationStep,
 } from '../src/migrations/runner.js';
 import * as runnerModule from '../src/migrations/runner.js';
-import { computeUsersPhonePreflight, operatorAckFor, type Connectable } from '../src/migrations/runner.js';
-/** SA2: staging-shaped lanes mint the attended-TOFU ack from the runner's own
- *  canonical preflight (empty list on fresh DBs; the runner recomputes
- *  in-transaction). */
+import { issueOperatorPreflight, operatorAckFor, type Connectable } from '../src/migrations/runner.js';
+/** SA2+SA3: staging-shaped lanes mint the attended-TOFU ack through the
+ *  runner's REAL issuance path (persisted issued-nonce record; the runner
+ *  re-verifies + consumes it in-transaction). No label exemption exists. */
 const stagingRunMigrations = async (conn: Connectable, opts: Parameters<typeof runnerModule.runMigrations>[1]): Promise<runnerModule.MigrationRunResult> => {
-  const pf = await computeUsersPhonePreflight(conn, { deployment: opts.deployment });
+  const pf = await issueOperatorPreflight(conn, { deployment: opts.deployment });
   return runnerModule.runMigrations(conn, { operatorAck: operatorAckFor(pf), ...opts });
 };
 

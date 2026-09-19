@@ -91,9 +91,11 @@ export interface MigrationStep {
   readonly assertions?: readonly MigrationAssertion[];
   /** Runner-executed `LOCK TABLE <t> IN SHARE ROW EXCLUSIVE MODE` before the step. */
   readonly lockTables?: readonly string[];
-  /** SA2: steps that mutate credential-identity row data require the
-   *  attended-TOFU operator ack, enforced by the RUNNER (recomputed under the
-   *  step's locks, same transaction - no TOCTOU gap) on non-test deployments. */
+  /** SA2+SA3: steps that mutate credential-identity row data require the
+   *  attended-TOFU operator ack, enforced by the RUNNER against the PERSISTED
+   *  issued-nonce record (recomputed under the step's locks, same
+   *  transaction - no TOCTOU gap). NO caller-supplied label (deployment,
+   *  env, mode) relaxes this gate in the shipped artifact (SA3 section 3). */
   readonly requiresOperatorAck?: boolean;
   /** Runner-executed pg_advisory_xact_lock(key) first (step-scoped). */
   readonly xactLockKey?: number;
@@ -539,13 +541,50 @@ ALTER TABLE public.contake_db_identity ADD COLUMN IF NOT EXISTS registry_digest 
 const RUNNER_EVIDENCE_DDL = `
 CREATE TABLE IF NOT EXISTS public.schema_migration_evidence(
   seq bigserial PRIMARY KEY,
+  event_id text NOT NULL,
   version text NOT NULL,
   kind text NOT NULL,
   report jsonb NOT NULL,
   list_digest text NOT NULL,
   target text NOT NULL,
   recorded_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE(version, kind)
+  UNIQUE(event_id)
+);
+ALTER TABLE public.schema_migration_evidence ADD COLUMN IF NOT EXISTS event_id text;
+UPDATE public.schema_migration_evidence SET event_id = 'legacy-' || seq::text WHERE event_id IS NULL;
+ALTER TABLE public.schema_migration_evidence ALTER COLUMN event_id SET NOT NULL;
+ALTER TABLE public.schema_migration_evidence DROP CONSTRAINT IF EXISTS schema_migration_evidence_version_kind_key;
+CREATE UNIQUE INDEX IF NOT EXISTS schema_migration_evidence_event_id_key ON public.schema_migration_evidence(event_id)`;
+
+/** SA3 section 4: issued-nonce ack lifecycle (runner-owned). Every ack is a
+ *  PERSISTED record minted by the preflight issuance path - an arbitrary
+ *  nonce plus the public canonical digest constructs nothing (Q1). State
+ *  transitions are guarded single-row UPDATEs (state='issued' precondition):
+ *  consumption and invalidation are mutually exclusive and a second
+ *  transition attempt is a LOUD conflict, never a silent no-op (Q2). */
+const RUNNER_ACK_DDL = `
+CREATE TABLE IF NOT EXISTS public.schema_migration_acks(
+  nonce text PRIMARY KEY,
+  target text NOT NULL,
+  deployment_label text NOT NULL,
+  plan_digest text NOT NULL,
+  list_digest text NOT NULL,
+  state text NOT NULL CHECK (state IN ('issued','consumed','invalidated')),
+  issued_at timestamptz NOT NULL DEFAULT now(),
+  transitioned_at timestamptz
+)`;
+
+/** SA3 section 5: DIRTY/INDETERMINATE target marker (runner-owned). An
+ *  evidence-write failure marks the target dirty and BLOCKS all subsequent
+ *  ack issuance and migration runs until attended resolution. This is a
+ *  singleton state marker, not the append-only evidence trail; the trail
+ *  records the attended resolution as its own unique append-only event. */
+const RUNNER_TARGET_STATE_DDL = `
+CREATE TABLE IF NOT EXISTS public.schema_migration_target_state(
+  target text PRIMARY KEY,
+  dirty boolean NOT NULL DEFAULT false,
+  dirty_reason jsonb,
+  updated_at timestamptz NOT NULL DEFAULT now()
 )`;
 
 
@@ -557,6 +596,10 @@ const buildBlueprintManifest = (): readonly BlueprintManifestEntry[] => {
   // the evidence schema flips REGISTRY_DIGEST like any other member.
   entries.push({ role: 'runner-ddl', id: 'runner-ddl.schema-migrations+identity', contentHash: manifestMemberHash('runner-ddl', 'runner-ddl.schema-migrations+identity', RUNNER_DDL) });
   entries.push({ role: 'runner-ddl', id: 'runner-ddl.schema-migration-evidence', contentHash: manifestMemberHash('runner-ddl', 'runner-ddl.schema-migration-evidence', RUNNER_EVIDENCE_DDL) });
+  // SA3: the ack-lifecycle and dirty-marker bookkeeping DDL are runner-owned
+  // closed templates and MANIFEST MEMBERS on the same terms.
+  entries.push({ role: 'runner-ddl', id: 'runner-ddl.schema-migration-acks', contentHash: manifestMemberHash('runner-ddl', 'runner-ddl.schema-migration-acks', RUNNER_ACK_DDL) });
+  entries.push({ role: 'runner-ddl', id: 'runner-ddl.schema-migration-target-state', contentHash: manifestMemberHash('runner-ddl', 'runner-ddl.schema-migration-target-state', RUNNER_TARGET_STATE_DDL) });
   for (const t of TEMPLATES) {
     // description is operator display metadata (not executable) - excluded,
     // consistent with step-digest doctrine.
@@ -790,8 +833,11 @@ export function buildAssertionQuery(a: MigrationAssertion): string {
       // SA1 ruling (2026-09-19): 'btrim-nullif-empty' treats blank as ABSENCE -
       // the grouping key is NULLIF(btrim,'') and NULL keys never collide
       // (two absent phones are not the same phone).
-      const key = a.normalize === 'btrim-nullif-empty' ? `NULLIF(pg_catalog.btrim("${c}"), '')`
-        : a.normalize === 'btrim' ? `pg_catalog.btrim("${c}")` : `"${c}"`;
+      // SA3 section 6: the key is built from the NAMED_NORMALIZATIONS
+      // registry members themselves (ONE source of truth - no detached
+      // literal copy; the constructive tamper matrix proves the wiring).
+      const key = a.normalize === 'btrim-nullif-empty' ? NAMED_NORMALIZATIONS['NORM_COL_BTRIM_NULLIF_EMPTY']!.replaceAll('{column}', `"${c}"`)
+        : a.normalize === 'btrim' ? NAMED_NORMALIZATIONS['NORM_COL_BTRIM']!.replaceAll('{column}', `"${c}"`) : `"${c}"`;
       const where = a.normalize === 'btrim-nullif-empty'
         ? (a.skipNulls === false ? '' : ` WHERE ${key} IS NOT NULL`)
         : (a.skipNulls === false ? '' : ` WHERE "${c}" IS NOT NULL`);
@@ -1070,6 +1116,137 @@ export function operatorAckFor(preflight: { nonce: string; listDigest: string })
 }
 const ACK_FORMAT = /^ack:([0-9a-f]{16}):([0-9a-f]{64})$/;
 
+/** SA3 section 4: canonical plan digest (the pending gated steps'
+ *  identities: version + name + step digest) - the ack record binds it
+ *  separately so a plan mismatch is directly inspectable. */
+const planDigestFor = (plan: readonly OperatorPlanStep[]): string =>
+  createHash('sha256').update(`contake-operator-plan/v1\n${canonicalJson(plan)}`).digest('hex');
+
+/** Runner-owned bookkeeping DDL, idempotently ensured inside the caller's
+ *  transaction (the caller holds the session advisory lock). Shared by
+ *  runMigrations bootstrap AND preflight issuance - SA3: issuance persists,
+ *  so the bookkeeping must exist before the first governed run. Evidence
+ *  writes are plain unique-event INSERTs: NO ON CONFLICT DO NOTHING anywhere
+ *  in the evidence path (SA3 section 5); a conflict is a LOUD failure. */
+async function ensureRunnerBookkeeping(client: Queryable): Promise<void> {
+  const evBefore = await client.query(`SELECT to_regclass('public.schema_migration_evidence') AS r`);
+  for (const ddl of [RUNNER_DDL, RUNNER_EVIDENCE_DDL, RUNNER_ACK_DDL, RUNNER_TARGET_STATE_DDL]) {
+    for (const stmt of ddl.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
+  }
+  if (!evBefore.rows[0]?.['r']) {
+    // The evidence table's own bootstrap creation is recorded once
+    // (post-creation self-record). Check-then-insert under the session
+    // advisory lock is race-free; no silent-conflict escape hatch exists.
+    const member = BLUEPRINT_MANIFEST.find(e => e.id === 'runner-ddl.schema-migration-evidence')!;
+    const existing = await client.query(`SELECT 1 FROM public.schema_migration_evidence WHERE kind = 'runner-bootstrap' LIMIT 1`);
+    if (existing.rows.length === 0) {
+      await client.query(
+        `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, '0000', 'runner-bootstrap', $2::jsonb, $3, pg_catalog.current_database())`,
+        [randomBytes(16).toString('hex'), JSON.stringify({ table: 'schema_migration_evidence', createdBy: 'runner-bootstrap', ddlContentHash: member.contentHash }), member.contentHash],
+      );
+    }
+  }
+}
+
+/** SA3 section 5: a DIRTY/INDETERMINATE target blocks all ack issuance and
+ *  all migration runs until attended resolution (attendedResolveDirty). */
+async function assertTargetNotDirty(client: Queryable): Promise<void> {
+  const d = await client.query(`SELECT dirty, dirty_reason FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database()`);
+  if (d.rows[0]?.['dirty'] === true) {
+    throw new Error(
+      `release-migrations: DIRTY TARGET refusal - this database is marked DIRTY/INDETERMINATE ` +
+      `(reason: ${JSON.stringify(d.rows[0]['dirty_reason'])}); attended resolution via attendedResolveDirty is required ` +
+      `before any further preflight issuance or migration run (fail-closed)`,
+    );
+  }
+}
+
+/** SA3 section 4: preflight ISSUANCE - the ONLY way an ack comes into
+ *  existence. Under the runner's session advisory lock: recompute the
+ *  canonical preflight, mint a unique nonce, and PERSIST the issued record
+ *  bound to target + deployment + plan + listDigest, plus a unique
+ *  append-only 'ack-issued' evidence event. No nonce record, no ack: an
+ *  arbitrary nonce plus the public canonical digest constructs nothing. */
+export async function issueOperatorPreflight(
+  conn: Connectable,
+  opts: { deployment: string; migrations?: readonly MigrationStep[] },
+): Promise<OperatorPreflightReport & { listDigest: string }> {
+  const client = await conn.connect();
+  try {
+    await client.query(`SET search_path = ''`);
+    await client.query(`SELECT pg_catalog.pg_advisory_lock(${RUNNER_LOCK_KEY})`);
+    try {
+      await client.query('BEGIN');
+      try {
+        await ensureRunnerBookkeeping(client);
+        await assertTargetNotDirty(client);
+        const pf = await computeUsersPhonePreflight(client, { deployment: opts.deployment, migrations: opts.migrations });
+        await client.query(
+          `INSERT INTO public.schema_migration_acks(nonce, target, deployment_label, plan_digest, list_digest, state) VALUES($1, $2, $3, $4, $5, 'issued')`,
+          [pf.nonce, pf.target, pf.deployment, planDigestFor(pf.plan), pf.listDigest],
+        );
+        await client.query(
+          `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, '0000', 'ack-issued', $2::jsonb, $3, $4)`,
+          [randomBytes(16).toString('hex'), JSON.stringify({
+            nonce: pf.nonce, deployment: pf.deployment, plan: pf.plan,
+            collisionGroups: pf.collisionGroups, crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies, blankPhoneUsers: pf.blankPhoneUsers,
+          }), pf.listDigest, pf.target],
+        );
+        await client.query('COMMIT');
+        return pf;
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw e;
+      }
+    } finally {
+      await client.query(`SELECT pg_catalog.pg_advisory_unlock(${RUNNER_LOCK_KEY})`).catch(() => undefined);
+      await client.query(`RESET ALL`).catch(() => undefined);
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/** SA3 section 5: ATTENDED resolution of a DIRTY/INDETERMINATE target.
+ *  Requires an operator note; records a unique append-only 'dirty-resolved'
+ *  evidence event retaining the prior dirty reason, then clears the marker. */
+export async function attendedResolveDirty(conn: Connectable, opts: { note: string; resolvedBy?: string }): Promise<void> {
+  if (typeof opts.note !== 'string' || opts.note.trim().length < 8) {
+    throw new Error('release-migrations: attended DIRTY resolution requires an operator note (>= 8 chars) - refusing (fail-closed)');
+  }
+  const client = await conn.connect();
+  try {
+    await client.query(`SET search_path = ''`);
+    await client.query(`SELECT pg_catalog.pg_advisory_lock(${RUNNER_LOCK_KEY})`);
+    try {
+      await client.query('BEGIN');
+      try {
+        const d = await client.query(`SELECT dirty, dirty_reason FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database() FOR UPDATE`);
+        if (d.rows.length === 0 || d.rows[0]!['dirty'] !== true) {
+          throw new Error('release-migrations: attended DIRTY resolution refused - this target is NOT dirty (nothing to resolve)');
+        }
+        await client.query(
+          `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, '0000', 'dirty-resolved', $2::jsonb, 'dirty-resolved', pg_catalog.current_database())`,
+          [randomBytes(16).toString('hex'), JSON.stringify({ priorDirtyReason: d.rows[0]!['dirty_reason'], resolutionNote: opts.note, resolvedBy: opts.resolvedBy ?? 'operator' })],
+        );
+        await client.query(
+          `UPDATE public.schema_migration_target_state SET dirty = false, dirty_reason = $1::jsonb, updated_at = now() WHERE target = pg_catalog.current_database()`,
+          [JSON.stringify({ resolved: true, note: opts.note })],
+        );
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw e;
+      }
+    } finally {
+      await client.query(`SELECT pg_catalog.pg_advisory_unlock(${RUNNER_LOCK_KEY})`).catch(() => undefined);
+      await client.query(`RESET ALL`).catch(() => undefined);
+    }
+  } finally {
+    client.release();
+  }
+}
+
 /** SA2-A section 2(c): canonical state projection the gated plan's safety
  *  depends on, ALREADY normalized (NULLIF(btrim,'')) - idempotent under the
  *  plan's own mutation, so the post-step digest must equal the pre-step
@@ -1118,18 +1295,9 @@ export async function runMigrations(
     try {
       await client.query('BEGIN');
       try {
-        const evBefore = await client.query(`SELECT to_regclass('public.schema_migration_evidence') AS r`);
-        for (const stmt of RUNNER_DDL.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
-        for (const stmt of RUNNER_EVIDENCE_DDL.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
-        if (!evBefore.rows[0]?.['r']) {
-          // SA2-A section 3(c): the evidence table's own bootstrap creation is
-          // recorded in the evidence trail once (post-creation self-record).
-          const member = BLUEPRINT_MANIFEST.find(e => e.id === 'runner-ddl.schema-migration-evidence')!;
-          await client.query(
-            `INSERT INTO public.schema_migration_evidence(version, kind, report, list_digest, target) VALUES('0000', 'runner-bootstrap', $1::jsonb, $2, pg_catalog.current_database()) ON CONFLICT (version, kind) DO NOTHING`,
-            [JSON.stringify({ table: 'schema_migration_evidence', createdBy: 'runner-bootstrap', ddlContentHash: member.contentHash }), member.contentHash],
-          );
-        }
+        // SA3: ONE shared idempotent bookkeeping ensure (the same path the
+        // preflight issuance uses); plain unique-event INSERTs only.
+        await ensureRunnerBookkeeping(client);
         // Pre-mutation target binding is enforced inside the bootstrap tx as
         // well (the CLI also checks read-only before calling): any refusal
         // here still precedes every step write and rolls back.
@@ -1213,6 +1381,8 @@ export async function runMigrations(
         await client.query(`UPDATE public.contake_db_identity SET migration_role = CURRENT_USER WHERE id = 1`);
         applied = await readAppliedRows(client);
         verifyHistoryPrefix(applied, migrations);
+        // SA3 section 5: a DIRTY/INDETERMINATE target blocks every run.
+        await assertTargetNotDirty(client);
         await client.query('COMMIT');
       } catch (e) {
         await client.query('ROLLBACK').catch(() => undefined);
@@ -1232,7 +1402,7 @@ export async function runMigrations(
       const pending = migrations.slice(applied.length);
       for (let gi = 0; gi < pending.length;) {
         const group: MigrationStep[] = [pending[gi]!];
-        if (pending[gi]!.requiresOperatorAck === true && opts.deployment !== 'test' && opts.deployment !== 'test-harness') {
+        if (pending[gi]!.requiresOperatorAck === true) {
           while (gi + group.length < pending.length && pending[gi + group.length]!.requiresOperatorAck === true) {
             group.push(pending[gi + group.length]!);
           }
@@ -1242,7 +1412,7 @@ export async function runMigrations(
         // Captured inside the steps; hoisted so the catch path can actively
         // restore non-transactional sequence state after ROLLBACK.
         const sequenceCaptures: Map<string, SeqVal>[] = [];
-        let ackToInvalidate: string | undefined;
+        let ackNonceToInvalidate: string | undefined;
         try {
           for (const m of group) {
             // Re-pin search_path INSIDE the transaction (and again before
@@ -1251,47 +1421,100 @@ export async function runMigrations(
             await client.query(`SELECT pg_catalog.set_config('search_path', '', true)`);
             if (m.xactLockKey !== undefined) await client.query(`SELECT pg_catalog.pg_advisory_xact_lock(${m.xactLockKey})`);
             for (const t of m.lockTables ?? []) await client.query(`LOCK TABLE "${CONTROLLED_SCHEMA}"."${t}" IN SHARE ROW EXCLUSIVE MODE`);
-            // SA2/SA2-A real-entrypoint operator gate: the RUNNER recomputes
-            // the canonical preflight HERE - over the FULL current table,
-            // same canonical enumeration the preflight displayed, inside the
-            // locks, immediately before mutation (no TOCTOU gap) - and
-            // refuses absent/wrong/stale/replayed/plan-mismatch acks (fail
-            // closed, whole-group rollback). Test deployments are hermetic
-            // synthetic lanes (gate-exempt).
+            // SA2/SA2-A/SA3 real-entrypoint operator gate: the RUNNER
+            // recomputes the canonical preflight HERE - over the FULL current
+            // table, same canonical enumeration the issuance displayed,
+            // inside the locks, same transaction (no TOCTOU gap) - and
+            // accepts ONLY an ack whose nonce is a PERSISTED, issued,
+            // unconsumed record bound to THIS target + deployment + plan +
+            // recomputed listDigest (SA3 section 4: no nonce record, no
+            // ack). Consumption is ONE guarded UPDATE inside the group
+            // transaction - atomic with the gated DDL; a second transition
+            // attempt is a LOUD conflict, never a silent no-op (SA3 sections
+            // 4+5). NO caller-supplied label (deployment, env, mode) relaxes
+            // this gate anywhere in the shipped artifact (SA3 section 3).
             let gateReport: (OperatorPreflightReport & { listDigest: string }) | undefined;
             let preStateDigest: string | undefined;
-            if (m.requiresOperatorAck === true && opts.deployment !== 'test' && opts.deployment !== 'test-harness') {
+            if (m.requiresOperatorAck === true) {
               const pf = await computeUsersPhonePreflight(client, { deployment: opts.deployment, migrations, nonce: '0000000000000000' });
               const parsed = typeof opts.operatorAck === 'string' ? ACK_FORMAT.exec(opts.operatorAck) : null;
+              const isContinuation = gateAcceptedThisRun !== undefined && opts.operatorAck === gateAcceptedThisRun;
               const expectedDigest = parsed
                 ? operatorListDigestForReview({ target: pf.target, deployment: pf.deployment, plan: pf.plan, nonce: parsed[1]!, collisionGroups: pf.collisionGroups, crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies, blankPhoneUsers: pf.blankPhoneUsers })
                 : undefined;
-              const ackMatches = parsed !== null && parsed[2] === expectedDigest;
-              const isContinuation = gateAcceptedThisRun !== undefined && opts.operatorAck === gateAcceptedThisRun;
-              if (!ackMatches && !isContinuation) {
-                throw new Error(
-                  `release-migrations: OPERATOR GATE refusal - step '${m.version}' mutates credential-identity row data and ` +
-                  `requires the attended-TOFU ack for THIS plan+target+state (target ${pf.target}, deployment ${opts.deployment}, ` +
-                  `plan [${pf.plan.map(x => x.version).join(',')}], listDigest ${pf.listDigest.slice(0, 16)}...). ` +
-                  `Supplied ack is absent/wrong/stale/replayed/plan-mismatched - refusing BEFORE any write (fail-closed, rolling back).`,
-                );
-              }
-              if (ackMatches && !isContinuation) {
-                // SA2-A single-use: this exact attended authorization must
-                // never have been consumed or invalidated before.
-                const seen = await client.query(`SELECT 1 FROM public.schema_migration_evidence WHERE report->>'ack' = $1 LIMIT 1`, [opts.operatorAck!]);
-                if (seen.rows.length > 0) {
+              if (!isContinuation) {
+                if (!parsed) {
                   throw new Error(
-                    `release-migrations: OPERATOR GATE refusal - REPLAY: this exact ack was already consumed or invalidated ` +
-                    `(single-use attended authorization). Mint a fresh ack from a fresh preflight (fail-closed, rolling back).`,
+                    `release-migrations: OPERATOR GATE refusal - step '${m.version}' mutates credential-identity row data and ` +
+                    `requires an ISSUED attended-TOFU ack (ack:<nonce>:<listDigest>) for THIS plan+target+state (target ${pf.target}, ` +
+                    `deployment ${opts.deployment}, plan [${pf.plan.map(x => x.version).join(',')}], listDigest ${pf.listDigest.slice(0, 16)}...). ` +
+                    `Supplied ack is absent or malformed - refusing BEFORE any write (fail-closed, rolling back).`,
                   );
                 }
+                const nonce = parsed[1]!;
+                const rec = await client.query(
+                  `SELECT target, deployment_label, plan_digest, list_digest, state FROM public.schema_migration_acks WHERE nonce = $1 FOR UPDATE`,
+                  [nonce],
+                );
+                if (rec.rows.length === 0) {
+                  throw new Error(
+                    `release-migrations: OPERATOR GATE refusal - NO ISSUED PREFLIGHT: ack nonce ${nonce} has no issuance record. ` +
+                    `An ack exists ONLY as the persisted output of the preflight issuance path (issueOperatorPreflight); an arbitrary ` +
+                    `nonce plus the public canonical digest constructs nothing (fail-closed, rolling back).`,
+                  );
+                }
+                const r0 = rec.rows[0]!;
+                if (String(r0['target']) !== pf.target || String(r0['deployment_label']) !== opts.deployment) {
+                  throw new Error(
+                    `release-migrations: OPERATOR GATE refusal - CROSS-TARGET ack: issued for target '${String(r0['target'])}' ` +
+                    `deployment '${String(r0['deployment_label'])}', presented against '${pf.target}'/'${opts.deployment}' (fail-closed, rolling back).`,
+                  );
+                }
+                if (String(r0['plan_digest']) !== planDigestFor(pf.plan)) {
+                  throw new Error(
+                    `release-migrations: OPERATOR GATE refusal - PLAN MISMATCH: the issued ack binds plan digest ` +
+                    `${String(r0['plan_digest']).slice(0, 16)}... but the pending gated plan digests ${planDigestFor(pf.plan).slice(0, 16)}... (fail-closed, rolling back).`,
+                  );
+                }
+                if (parsed[2] !== expectedDigest || String(r0['list_digest']) !== expectedDigest) {
+                  throw new Error(
+                    `release-migrations: OPERATOR GATE refusal - ack digest mismatch: wrong or STALE state (the recomputed canonical ` +
+                    `lists under lock disagree with the issued binding, or the digest was constructed off-path). Mint a fresh ack ` +
+                    `from a fresh issuance (fail-closed, rolling back).`,
+                  );
+                }
+                if (String(r0['state']) !== 'issued') {
+                  throw new Error(
+                    `release-migrations: OPERATOR GATE refusal - ACK LIFECYCLE: ack nonce ${nonce} is already '${String(r0['state'])}'. ` +
+                    `Consumed and invalidated acks are dead; a second transition is a loud conflict, never a silent no-op. ` +
+                    `Mint a fresh ack from a fresh issuance (fail-closed, rolling back).`,
+                  );
+                }
+                // The ack is ACCEPTED from here: ANY later failure in this
+                // group (consumption write, event write, guard, DDL) aborts
+                // into the invalidation path (SA3 section 5).
                 gateAcceptedThisRun = opts.operatorAck;
-                ackToInvalidate = opts.operatorAck;
+                ackNonceToInvalidate = nonce;
+                // Consume atomically WITH the gated plan: ONE guarded UPDATE
+                // inside the group transaction (rolls back with it on abort).
+                const consumed = await client.query(
+                  `UPDATE public.schema_migration_acks SET state = 'consumed', transitioned_at = now() WHERE nonce = $1 AND state = 'issued'`,
+                  [nonce],
+                );
+                if (consumed.rowCount !== 1) {
+                  throw new Error(
+                    `release-migrations: OPERATOR GATE refusal - ACK LIFECYCLE conflict: consuming nonce ${nonce} transitioned ` +
+                    `${String(consumed.rowCount)} rows (expected exactly 1 issued record) - loud conflict (fail-closed, rolling back).`,
+                  );
+                }
+                await client.query(
+                  `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, $2, 'ack-consumed', $3::jsonb, $4, $5)`,
+                  [randomBytes(16).toString('hex'), m.version, JSON.stringify({ nonce, ack: opts.operatorAck, plan: pf.plan }), expectedDigest, pf.target],
+                );
               }
               // Persist the digest BOUND TO THE ACK (its nonce), so the
               // evidence record is independently derivable from the ack.
-              gateReport = parsed ? { ...pf, listDigest: expectedDigest! } : pf;
+              gateReport = expectedDigest !== undefined ? { ...pf, listDigest: expectedDigest } : pf;
               preStateDigest = await usersStateDigest(client);
             }
             for (const a of m.assertions ?? []) {
@@ -1335,24 +1558,21 @@ export async function runMigrations(
                 );
               }
             }
-            const ins = await client.query(
-              `INSERT INTO public.schema_migrations(version, name, sha256, applied_by) VALUES($1, $2, $3, $4)
-               ON CONFLICT (version) DO NOTHING`,
+            // SA3 section 5: plain INSERT - a version collision is a LOUD
+            // unique-violation failure, never a silently dropped write.
+            await client.query(
+              `INSERT INTO public.schema_migrations(version, name, sha256, applied_by) VALUES($1, $2, $3, $4)`,
               [m.version, m.name, stepDigest(m), opts.appliedBy ?? 'release-job'],
             );
-            if (ins.rowCount !== 1) {
-              throw new Error(
-                `release-migrations: version record for '${m.version}' collided inside its own transaction ` +
-                `(rowCount=${ins.rowCount}) - history drift; rolling back the step`,
-              );
-            }
             if (gateReport) {
               // Persist the acknowledged report + per-step pre/post digests
               // with the migration's evidence record (rolls back with the
               // group on any failure).
+              // SA3 section 5: unique append-only event identity (fresh
+              // event_id per event); a conflict is a LOUD failure.
               await client.query(
-                `INSERT INTO public.schema_migration_evidence(version, kind, report, list_digest, target) VALUES($1, 'attended-tofu', $2::jsonb, $3, $4) ON CONFLICT (version, kind) DO NOTHING`,
-                [m.version, JSON.stringify({
+                `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, $2, 'attended-tofu', $3::jsonb, $4, $5)`,
+                [randomBytes(16).toString('hex'), m.version, JSON.stringify({
                   ack: opts.operatorAck, plan: gateReport.plan, nonce: gateReport.nonce,
                   preStateDigest, postStateDigest,
                   report: { collisionGroups: gateReport.collisionGroups, crossRepresentationInconsistencies: gateReport.crossRepresentationInconsistencies, blankPhoneUsers: gateReport.blankPhoneUsers },
@@ -1389,11 +1609,46 @@ export async function runMigrations(
           // sequence restore: the record's seq value must survive above the
           // restored baseline (rewinding beneath a persisted row would
           // collide on the next insert).
-          if (ackToInvalidate !== undefined) {
-            await client.query(
-              `INSERT INTO public.schema_migration_evidence(version, kind, report, list_digest, target) VALUES($1, 'attended-tofu-invalidated', $2::jsonb, $3, pg_catalog.current_database()) ON CONFLICT (version, kind) DO NOTHING`,
-              [group[0]!.version, JSON.stringify({ ack: ackToInvalidate, reason: e instanceof Error ? e.message : String(e) }), 'invalidated'],
-            ).catch(() => undefined);
+          if (ackNonceToInvalidate !== undefined) {
+            // SA3 sections 4+5: the abort INVALIDATES the issued ack
+            // (guarded single-row transition + unique append-only event).
+            // NO catch-and-continue: if either write fails the aftermath is
+            // unprovable - mark the target DIRTY/INDETERMINATE (retaining
+            // BOTH error records) and block all further issuance and runs
+            // until attended resolution. Runs AFTER the sequence restore
+            // above: the event's seq value must survive above the restored
+            // baseline (rewinding beneath a persisted row would collide on
+            // the next insert).
+            const originalFailure = e instanceof Error ? e.message : String(e);
+            try {
+              const inv = await client.query(
+                `UPDATE public.schema_migration_acks SET state = 'invalidated', transitioned_at = now() WHERE nonce = $1 AND state = 'issued'`,
+                [ackNonceToInvalidate],
+              );
+              if (inv.rowCount !== 1) {
+                throw new Error(`ack lifecycle conflict: invalidating nonce ${ackNonceToInvalidate} transitioned ${String(inv.rowCount)} rows (expected exactly 1 issued record)`);
+              }
+              await client.query(
+                `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, $2, 'ack-invalidated', $3::jsonb, 'invalidated', pg_catalog.current_database())`,
+                [randomBytes(16).toString('hex'), group[0]!.version, JSON.stringify({ nonce: ackNonceToInvalidate, reason: originalFailure })],
+              );
+            } catch (invErr) {
+              const invalidationFailure = invErr instanceof Error ? invErr.message : String(invErr);
+              const dirtyReason = JSON.stringify({ originalFailure, invalidationFailure });
+              // Best-effort dirty MARKER on the singleton state row (the
+              // evidence trail itself may be the failed writer). This is a
+              // state marker, not an append-only event - the loud upsert
+              // never drops an event.
+              await client.query(
+                `INSERT INTO public.schema_migration_target_state(target, dirty, dirty_reason, updated_at) VALUES(pg_catalog.current_database(), true, $1::jsonb, now()) ON CONFLICT (target) DO UPDATE SET dirty = true, dirty_reason = $1::jsonb, updated_at = now()`,
+                [dirtyReason],
+              ).catch(() => undefined);
+              throw new Error(
+                `release-migrations: DIRTY/INDETERMINATE - the abort's ack invalidation could not be persisted; the target is ` +
+                `marked DIRTY and blocks all further preflight issuance and migration runs until attended resolution ` +
+                `(attendedResolveDirty). original failure: ${originalFailure} | invalidation failure: ${invalidationFailure} (fail-closed)`,
+              );
+            }
           }
           throw e;
         }
