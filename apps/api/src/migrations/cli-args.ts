@@ -17,8 +17,14 @@ export interface CliSpec {
 export function parseCliArgs(argv: readonly string[], spec: CliSpec): Record<string, string> {
   const known = new Set([...spec.required, ...spec.optional]);
   const out: Record<string, string> = {};
-  for (let i = 0; i < argv.length; i += 1) {
-    const a = argv[i]!;
+  // Package-runner separator: `pnpm run <script> -- <args>` delivers a
+  // literal leading '--' token (npm strips it; pnpm 9 passes it through to
+  // the script). Skip exactly ONE leading separator so the documented
+  // invocation works on both runners; any OTHER '--' stays an unknown
+  // flag / bare positional and refuses like before.
+  const args = argv[0] === '--' ? argv.slice(1) : argv;
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i]!;
     if (!a.startsWith('--')) {
       throw new Error(`cli: bare positional argument ${JSON.stringify(a)} is not accepted - use explicit --flag value pairs`);
     }
@@ -28,7 +34,7 @@ export function parseCliArgs(argv: readonly string[], spec: CliSpec): Record<str
     if (out[a] !== undefined) {
       throw new Error(`cli: duplicate flag ${JSON.stringify(a)}`);
     }
-    const v = argv[i + 1];
+    const v = args[i + 1];
     if (v === undefined || v.startsWith('--')) {
       throw new Error(`cli: flag ${JSON.stringify(a)} requires a value`);
     }

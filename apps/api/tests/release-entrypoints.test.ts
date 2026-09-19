@@ -81,6 +81,15 @@ describe('SA4 canonical BUILT entrypoint', () => {
     const missing = runDistCli(['--deployment', 'staging'], { DATABASE_URL: '' });
     expect(missing.status).not.toBe(0);
     expect(missing.stderr).toMatch(/required flag/);
+    // Package-runner separator: pnpm 9 delivers a literal leading '--'
+    // (`pnpm run migrate:release -- --deployment ...`); exactly ONE leading
+    // separator is skipped, any other '--' still refuses.
+    const sep = runDistCli(['--', '--deployment', 'staging'], { DATABASE_URL: '' });
+    expect(sep.status).not.toBe(0);
+    expect(sep.stderr).toMatch(/required flag/); // '--' skipped; the parser ran
+    const sepMid = runDistCli([...base, '--', 'v'], { DATABASE_URL: '' });
+    expect(sepMid.status).not.toBe(0);
+    expect(sepMid.stderr).toMatch(/unknown flag/);
   });
 
   it('POSITIVE: the built entrypoint GATES - direct-endpoint + expected tuple are enforced BEFORE any connection', () => {

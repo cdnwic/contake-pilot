@@ -131,6 +131,14 @@ if (phase === 'phase1') {
   check('step effect rolled back on REAL postgres', leak.rows[0]?.['r'] === null, leak.rows[0]);
   const vv = await db2.query(`SELECT count(*)::int AS n FROM schema_migrations`);
   check('no version row after rollback', Number(vv.rows[0]?.['n']) === 0);
+  // SA4-C3: the abort left a durable IN-FLIGHT record; attended recovery is
+  // the only way back before the next governed runs on this target.
+  {
+    const st = await db2.query(`SELECT eligible, in_flight FROM public.schema_migration_target_state`);
+    check('SA4-C3: failing template execution left the target durably IN-FLIGHT (no exit restores eligibility early)',
+      st.rows[0]?.['eligible'] === false && !!st.rows[0]?.['in_flight'], st.rows);
+    await attendedResolveDirty(db2, { note: 'evidence: intentional template failure reviewed', resolvedBy: 'evidence' });
+  }
 
   // 3b) R3 closed registry on REAL postgres: caller SQL itself is an unknown
   // template; tx-control / session-lock shapes cannot be expressed; param-level
