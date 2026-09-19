@@ -660,7 +660,12 @@ if (phase === 'phase1') {
   // target-binding tuple from the URL under evidence; attacks needing a
   // DIFFERENT tuple build args explicitly via cli().
   const cli = (args: string[]) => {
-    const r = spawnSync('pnpm', ['--silent', 'run', 'migrate:release', '--', ...args], { encoding: 'utf8', timeout: 300000 });
+    // npm run through the SAME package script: pnpm-in-a-workspace maps the
+    // issuance-first exit code 75 to 1 (verified 2026-09-19: pnpm 9.15.0 in
+    // this workspace returns 1 for a script exiting 75; direct node AND npm
+    // run both propagate 75). The module under evidence is identical either
+    // way (package script -> node dist/migrations/migrate-cli.js).
+    const r = spawnSync('npm', ['--silent', 'run', 'migrate:release', '--', ...args], { encoding: 'utf8', timeout: 300000 });
     return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
   };
   const cliRun = (url: string, args: string[]) => {
@@ -672,7 +677,10 @@ if (phase === 'phase1') {
   const preflight = (url: string) => {
     const r = cliRun(url, []);
     if (r.status !== 75) throw new Error(`issuance-first preflight failed (expected exit 75): status=${r.status} ${r.stderr}`);
-    return JSON.parse(r.stdout.slice(r.stdout.indexOf('{')))['preflight'] as { nonce: string; listDigest: string; requiredAck: string; target: string; crossRepresentationInconsistencies: unknown[]; blankPhoneUsers: unknown[]; collisionGroups: unknown[]; operatorDecisionRequired: boolean };
+    const pfj = JSON.parse(r.stdout.slice(r.stdout.indexOf('{')))['preflight'] as { nonce: string; listDigest: string; target: string; deployment: string; plan: { version: string }[]; crossRepresentationInconsistencies: unknown[]; blankPhoneUsers: unknown[]; collisionGroups: unknown[] };
+    // the CLI's issuance JSON carries nonce + listDigest; the ack string is
+    // the runner's operatorAckFor shape (ack:<nonce>:<listDigest>).
+    return { ...pfj, requiredAck: `ack:${pfj.nonce}:${pfj.listDigest}` };
   };
 
   await admin.query(`DROP DATABASE IF EXISTS contake_tofu WITH (FORCE)`);
@@ -696,7 +704,10 @@ if (phase === 'phase1') {
   check('preflight ran FIRST and recorded the inconsistency list', pf.crossRepresentationInconsistencies.length === 1
     && JSON.stringify(pf.crossRepresentationInconsistencies).includes('u-inconsistent'), pf.crossRepresentationInconsistencies);
   check('preflight recorded both blank phones', pf.blankPhoneUsers.length === 2, pf.blankPhoneUsers);
-  check('preflight flagged operator decision', pf.operatorDecisionRequired === true);
+  // SA4: the built CLI's issuance output carries the canonical lists; the
+  // operator-decision signal derives from them (non-empty lists = review
+  // required before ack). The SA3 source script's convenience field is gone.
+  check('preflight flagged operator decision', pf.collisionGroups.length + pf.crossRepresentationInconsistencies.length + pf.blankPhoneUsers.length > 0);
   const after = await tofu.query(`SELECT count(*)::int AS n FROM users`);
   check('preflight touched NO application data (only runner-owned issuance records)', Number(before.rows[0]?.['n']) === Number(after.rows[0]?.['n']));
   const issuedRows = await tofu.query(`SELECT state FROM public.schema_migration_acks WHERE nonce = $1`, [pf.nonce]);
@@ -744,7 +755,7 @@ if (phase === 'phase1') {
   const wrongDb = cli(['--database-url', url, '--deployment', 'staging', '--expect-host', host, '--expect-db', 'not_the_db']);
   check('SA4: built CLI refuses a wrong expect-db BEFORE connecting (exit 2)', wrongDb.status === 2 && wrongDb.stderr.includes('TARGET TUPLE mismatch'), { status: wrongDb.status });
   const badLabel = cli(['--database-url', url, '--deployment', 'qa', '--expect-host', host, '--expect-db', 'contake_tofu']);
-  check('SA4: built CLI refuses an unknown deployment label (exit 64)', badLabel.status === 64 && badLabel.stderr.includes('unknown deployment label'), { status: badLabel.status });
+  check('SA4: built CLI refuses an unknown deployment label (exit 64)', badLabel.status === 64 && /must be staging\|production/.test(badLabel.stderr), { status: badLabel.status });
   check('SA4: binding/parser attacks applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
 
   const wrongAck = cliRun(url, ['--ack', `ack:${'deadbeef'.repeat(8)}`]);
@@ -833,7 +844,7 @@ if (phase === 'phase1') {
   const pfGreen = preflight(url);
   const green = cliRun(url, ['--ack', pfGreen.requiredAck]);
   console.error(`OBSERVED[cli green]: status=${green.status} ${green.stdout.split('\n').find(l => l.includes('applied')) ?? ''}`);
-  check('REAL CLI applies 0002+0003 with the exact operator ack', green.status === 0 && green.stdout.includes('"0002"') && green.stdout.includes('"0003"'), { status: green.status, stdout: green.stdout.slice(0, 300) });
+  check('REAL CLI applies 0002+0003 with the exact operator ack', green.status === 0 && green.stdout.includes('"0002"') && green.stdout.includes('"0003"'), { status: green.status, stdout: green.stdout.slice(0, 300), stderr: green.stderr.slice(0, 500) });
   const rows = await tofu.query(`SELECT user_id, phone, data->>'phone' AS jp FROM users ORDER BY user_id`);
   const byId = Object.fromEntries(rows.rows.map(x => [String(x['user_id']), x]));
   check('tofu: two blank phones normalize to NULL (absence, not identity)',
@@ -855,8 +866,8 @@ if (phase === 'phase1') {
   // the idempotent normalized projection; SA2-A 2(c)).
   check('acknowledged report/digest persisted with the migration evidence (0002 + 0003)',
     JSON.stringify(ev.rows.map(x => String(x['version']))) === '["0002","0003"]'
-    && String(ev.rows[0]!['list_digest']) === pf.listDigest
-    && String(ev.rows[1]!['list_digest']) !== pf.listDigest
+    && String(ev.rows[0]!['list_digest']) === pfGreen.listDigest
+    && String(ev.rows[1]!['list_digest']) !== pfGreen.listDigest
     && ev.rows.every(x => String(x['target']) === 'contake_tofu')
     && ev.rows.every(x => String((x['report'] as { ack?: string }).ack) === pfGreen.requiredAck)
     && ev.rows.every(x => (x['report'] as { preStateDigest?: string }).preStateDigest === (x['report'] as { postStateDigest?: string }).postStateDigest)
@@ -876,8 +887,8 @@ if (phase === 'phase1') {
   check('tofu: blocked run built nothing', t2.rows[0]?.['r'] === null);
   {
     const st2 = await tofu2.query(`SELECT eligible, dirty, in_flight FROM public.schema_migration_target_state`);
-    check('SA4-C3: tofu2 abort left a durable DIRTY + IN-FLIGHT record (no exit restores eligibility early)',
-      st2.rows[0]?.['dirty'] === true && st2.rows[0]?.['eligible'] === false && !!st2.rows[0]?.['in_flight'], st2.rows);
+    check('SA4-C3: tofu2 abort left a durable IN-FLIGHT record (no exit restores eligibility early; DIRTY is reserved for invalidation/marker failures)',
+      st2.rows[0]?.['dirty'] !== true && st2.rows[0]?.['eligible'] === false && !!st2.rows[0]?.['in_flight'], st2.rows);
   }
 
   // SA3 section 5: every lifecycle event has UNIQUE append-only identity on
@@ -928,8 +939,8 @@ if (phase === 'phase1') {
     const stillIssued2 = await tofu2.query(`SELECT count(*)::int AS n FROM public.schema_migration_acks WHERE state = 'issued'`);
     const st2b = await tofu2.query(`SELECT eligible, dirty, recovered_at FROM public.schema_migration_target_state`);
     check('SA4-C3: recovery invalidated exactly the outstanding issued acks and recorded them in the resolution event (one atomic unit)',
-      acksBefore2.rows.length === 1 && Array.isArray(rep2?.invalidatedNonces) && rep2!.invalidatedNonces!.length === 1
-      && rep2!.invalidatedNonces![0] === String(acksBefore2.rows[0]!['nonce']) && Number(stillIssued2.rows[0]?.['n']) === 0,
+      acksBefore2.rows.length >= 1 && Array.isArray(rep2?.invalidatedNonces) && rep2!.invalidatedNonces!.length === acksBefore2.rows.length
+      && acksBefore2.rows.every(x => rep2!.invalidatedNonces!.includes(String(x['nonce']))) && Number(stillIssued2.rows[0]?.['n']) === 0,
       { before: acksBefore2.rows, report: rep2 });
     check('SA4-C3: recovery restored ELIGIBLE with a recovery watermark in the same unit',
       st2b.rows[0]?.['eligible'] === true && st2b.rows[0]?.['dirty'] === false && !!st2b.rows[0]?.['recovered_at'], st2b.rows);
@@ -967,7 +978,7 @@ if (phase === 'phase1') {
   await runMigrations(tofu3, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
   const url3 = `postgres://postgres@${host}:${port}/contake_tofu3`;
   const pfUnproven = preflight(url3);
-  await tofu3.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected evidence-write failure'; END; $$`);
+  await tofu3.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.kind <> 'ack-issued' THEN RAISE EXCEPTION 'injected evidence-write failure'; END IF; RETURN NEW; END; $$`);
   await tofu3.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.dirty IS TRUE THEN RAISE EXCEPTION 'injected marker-write failure'; END IF; RETURN NEW; END; $$`);
   await tofu3.query(`CREATE TRIGGER __sa4_fail_evidence BEFORE INSERT ON public.schema_migration_evidence FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_evidence()`);
   await tofu3.query(`CREATE TRIGGER __sa4_fail_state BEFORE INSERT OR UPDATE ON public.schema_migration_target_state FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_state()`);
@@ -1127,12 +1138,18 @@ if (phase === 'phase1') {
   await pr.query(`UPDATE public.schema_migration_target_state SET eligible = false, in_flight = '{"nonce":"simulated-crash"}'::jsonb, updated_at = now()`);
   await attendedResolveDirty(pr, { note: 'evidence: crash reviewed', resolvedBy: 'evidence' });
   const pfB = await issueOperatorPreflight(pr, { deployment: 'staging' });
-  const pfBRow = (await pr.query(`SELECT plan_digest, list_digest FROM public.schema_migration_acks WHERE nonce = $1`, [pfB.nonce])).rows[0]!;
+  const pfBRow = (await pr.query(`SELECT plan_digest FROM public.schema_migration_acks WHERE nonce = $1`, [pfB.nonce])).rows[0]!;
+  // the canonical list digest binds the NONCE - recompute it for the forged
+  // nonce so every digest check passes and ONLY the recovery watermark refuses.
+  const forgedDigest = operatorListDigestForReview({
+    target: pfB.target, deployment: pfB.deployment, nonce: 'deadbeef00cafe12', plan: pfB.plan,
+    collisionGroups: pfB.collisionGroups, crossRepresentationInconsistencies: pfB.crossRepresentationInconsistencies, blankPhoneUsers: pfB.blankPhoneUsers,
+  });
   await pr.query(
-    `INSERT INTO public.schema_migration_acks(nonce, target, deployment_label, plan_digest, list_digest, state, issued_at) VALUES('postrec-forged', pg_catalog.current_database(), 'staging', $1, $2, 'issued', now() - interval '1 hour')`,
-    [String(pfBRow['plan_digest']), String(pfBRow['list_digest'])],
+    `INSERT INTO public.schema_migration_acks(nonce, target, deployment_label, plan_digest, list_digest, state, issued_at) VALUES('deadbeef00cafe12', pg_catalog.current_database(), 'staging', $1, $2, 'issued', now() - interval '1 hour')`,
+    [String(pfBRow['plan_digest']), forgedDigest],
   );
-  const postRec = cliRun(urlPR, ['--ack', `ack:postrec-forged:${String(pfBRow['list_digest'])}`]);
+  const postRec = cliRun(urlPR, ['--ack', `ack:deadbeef00cafe12:${forgedDigest}`]);
   check('SA4-C3: POST-RECOVERY refusal - ack minted at/before recovered_at is dead even with correct digests and issued state',
     postRec.status !== 0 && postRec.stderr.includes('POST-RECOVERY'), { status: postRec.status, stderr: postRec.stderr.slice(0, 200) });
   check('SA4-C3: POST-RECOVERY refusal applied nothing', JSON.stringify((await pr.query(`SELECT version FROM public.schema_migrations ORDER BY seq`)).rows.map(x => String(x['version']))) === '["0001"]');

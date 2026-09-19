@@ -14,6 +14,11 @@ describe('closed CLI parser', () => {
   it('rejects unknown flags', () => {
     expect(() => parseCliArgs(['--deployment', 'staging', '--evil', 'x'], spec)).toThrow(/unknown flag/);
   });
+  it('skips exactly ONE leading package-runner separator; any other -- refuses', () => {
+    expect(parseCliArgs(['--', '--deployment', 'staging'], spec)).toEqual({ '--deployment': 'staging' });
+    expect(() => parseCliArgs(['--deployment', 'staging', '--', 'x'], spec)).toThrow(/unknown flag/);
+    expect(() => parseCliArgs(['--', '--', '--deployment', 'staging'], spec)).toThrow(/unknown flag/);
+  });
   it('rejects duplicate flags', () => {
     expect(() => parseCliArgs(['--deployment', 'a', '--deployment', 'b'], spec)).toThrow(/duplicate/);
   });
