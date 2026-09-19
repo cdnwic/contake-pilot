@@ -16,9 +16,14 @@
  *  privilege lockdown.
  *
  *  Usage: tsx evidence-realpg-release-migrations.mts <phase1|phase2|phase3|phase4|phase5> <socketDirOrHost> <port>
- *  phase5 (SA2 attended-TOFU): drives the REAL migration CLI
- *  (scripts/migrate.mts -> runMigrations) as a child process; the runner
- *  enforces the operator ack under lock, in-transaction.
+ *  phase5 (SA2/SA2-A/SA3 attended-TOFU + ack lifecycle): drives the REAL
+ *  migration CLI (scripts/migrate.mts -> runMigrations) as a child process;
+ *  the runner enforces the ISSUED-NONCE ack lifecycle under lock,
+ *  in-transaction: truly-absent/wrong-target/plan-mismatch/stale/consumed/
+ *  invalidated presentations, unique append-only evidence identity, no
+ *  caller-label exemptions (dist in the DIST lane), and the
+ *  invalidation-failure DIRTY/INDETERMINATE contract with attended
+ *  resolution.
  */
 import { Pool } from 'pg';
 import { randomBytes } from 'node:crypto';
@@ -32,12 +37,16 @@ const R = await import(RUNNER_PATH) as typeof import('./src/migrations/runner.js
 const S = await import(SEED_PATH) as typeof import('./src/migrations/staging-seed.js');
 const {
   MIGRATIONS, REGISTRY_DIGEST, assertDirectDatabaseUrl, assertSchemaCurrent, assertSingleStatementForms, assertZeroCatalogDelta, catalogSnapshot,
-  computeUsersPhonePreflight, operatorAckFor, operatorListDigestForReview, restoreSequenceValues, runMigrations, sequenceValues, stepDigest,
+  attendedResolveDirty, computeUsersPhonePreflight, issueOperatorPreflight, operatorAckFor, operatorListDigestForReview,
+  restoreSequenceValues, runMigrations, sequenceValues, stepDigest,
 } = R;
 /** SA2: evidence lanes mint the attended-TOFU ack from the runner's canonical
  *  preflight against the CURRENT state (the runner recomputes in-transaction). */
+/** SA3: evidence lanes mint REAL acks through the REAL issuance path
+ *  (persisted issued-nonce record, bound to the SAME migrations array). */
 const ackedRun = async (db: Parameters<typeof runMigrations>[0], opts: Parameters<typeof runMigrations>[1]) => {
-  const pf = await computeUsersPhonePreflight(db, { deployment: opts.deployment });
+  const pf = await issueOperatorPreflight(db, opts.migrations === undefined
+    ? { deployment: opts.deployment } : { deployment: opts.deployment, migrations: opts.migrations });
   return runMigrations(db, { operatorAck: operatorAckFor(pf), ...opts });
 };
 const { DATA_REGISTRY_DIGEST, runStagingSeed } = S;
@@ -657,7 +666,9 @@ if (phase === 'phase1') {
   check('preflight recorded both blank phones', pf.blankPhoneUsers.length === 2, pf.blankPhoneUsers);
   check('preflight flagged operator decision', pf.operatorDecisionRequired === true);
   const after = await tofu.query(`SELECT count(*)::int AS n FROM users`);
-  check('preflight was read-only (row data untouched)', Number(before.rows[0]?.['n']) === Number(after.rows[0]?.['n']));
+  check('preflight touched NO application data (only runner-owned issuance records)', Number(before.rows[0]?.['n']) === Number(after.rows[0]?.['n']));
+  const issuedRows = await tofu.query(`SELECT state FROM public.schema_migration_acks WHERE nonce = $1`, [pf.nonce]);
+  check('SA3: preflight PERSISTED the issued nonce record (state=issued)', issuedRows.rows.length === 1 && issuedRows.rows[0]?.['state'] === 'issued', issuedRows.rows);
 
   // 2) ATTACK SET through the REAL CLI (all must fail closed, nothing applied).
   const applied = async () => (await tofu.query(`SELECT version FROM public.schema_migrations ORDER BY seq`)).rows.map(x => String(x['version']));
@@ -694,7 +705,15 @@ if (phase === 'phase1') {
   check('REAL CLI refuses a REPLAYED ack (minted against another target)', replayed.status !== 0 && replayed.stderr.includes('OPERATOR GATE refusal'), { status: replayed.status });
 
   const fabricated = cli(['--database-url', url, '--deployment', 'staging', '--ack', `ack:${'f'.repeat(16)}:${'0'.repeat(64)}`]);
-  check('REAL CLI refuses a fabricated ack (no preflight ever produced it)', fabricated.status !== 0 && fabricated.stderr.includes('OPERATOR GATE refusal'), { status: fabricated.status });
+  check('REAL CLI refuses a fabricated ack (no preflight ever produced it)', fabricated.status !== 0 && fabricated.stderr.includes('NO ISSUED PREFLIGHT'), { status: fabricated.status });
+  // SA3 Q1: TRULY-ABSENT preflight - a well-formed ack from an arbitrary
+  // nonce + the public canonical digest, NO issuance record anywhere.
+  const forgedReport = await computeUsersPhonePreflight(tofu, { deployment: 'staging' });
+  const forgedAck = operatorAckFor(forgedReport);
+  const forged = cli(['--database-url', url, '--deployment', 'staging', '--ack', forgedAck]);
+  console.error(`OBSERVED[cli truly-absent-ack]: status=${forged.status}`);
+  check('SA3 Q1: REAL CLI refuses a TRULY-ABSENT preflight ack (arbitrary nonce + public digest, no record)',
+    forged.status !== 0 && forged.stderr.includes('NO ISSUED PREFLIGHT'), { status: forged.status });
   check('all refusals applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
 
   // SA2-A acceptance: PLAN-MISMATCH presentation (ack minted for 0002-only / 0003-alone)
@@ -713,19 +732,19 @@ if (phase === 'phase1') {
   // always fires aborts the plan AFTER the ack was accepted at 0002; the
   // invalidation is recorded append-only and the same ack can never return.
   const failingPlan = [...MIGRATIONS.slice(0, 2), { ...MIGRATIONS[2]!, assertions: [{ kind: 'table-empty', table: 'users' }] }];
-  const pfAbort = preflight(url); // plan binding: default registry... mint against the failing plan via the runner seam instead
-  void pfAbort;
-  const pfAbortReal = await computeUsersPhonePreflight(tofu, { deployment: 'staging', migrations: failingPlan });
+  const pfAbortReal = await issueOperatorPreflight(tofu, { deployment: 'staging', migrations: failingPlan });
   const abortAck = operatorAckFor(pfAbortReal);
   let aborted = '';
   try { await runMigrations(tofu, { deployment: 'staging', migrations: failingPlan, operatorAck: abortAck }); } catch (e) { aborted = String(e); }
   check('abort injection: failing guarded 0003 aborts the plan after the ack was accepted', /ASSERTION refusal - guard 'table-empty'/.test(aborted), aborted.slice(0, 160));
   check('abort rolled the WHOLE plan back (nothing past 0001)', JSON.stringify(await applied()) === '["0001"]', await applied());
-  const invRows = (await tofu.query(`SELECT kind FROM public.schema_migration_evidence WHERE kind = 'attended-tofu-invalidated'`)).rows;
-  check('abort INVALIDATED the ack (append-only evidence survives the rollback)', invRows.length === 1, invRows);
+  const invRows = (await tofu.query(`SELECT event_id, kind, report->>'nonce' AS nonce FROM public.schema_migration_evidence WHERE kind = 'ack-invalidated'`)).rows;
+  check('abort INVALIDATED the ack (append-only evidence survives the rollback)', invRows.length === 1 && invRows[0]?.['nonce'] === pfAbortReal.nonce, invRows);
+  const invState = await tofu.query(`SELECT state FROM public.schema_migration_acks WHERE nonce = $1`, [pfAbortReal.nonce]);
+  check('the aborted ack record is invalidated (mutually exclusive with consumed)', invState.rows[0]?.['state'] === 'invalidated', invState.rows);
   let replayRefused = '';
   try { await runMigrations(tofu, { deployment: 'staging', migrations: failingPlan, operatorAck: abortAck }); } catch (e) { replayRefused = String(e); }
-  check('POST-ABORT REPLAY of the exact same ack refuses (single-use attended authorization)', /REPLAY/.test(replayRefused), replayRefused.slice(0, 200));
+  check('POST-ABORT REPLAY of the exact same ack refuses (ACK LIFECYCLE loud conflict)', /ACK LIFECYCLE/.test(replayRefused), replayRefused.slice(0, 200));
 
   // 3) GREEN PATH: operator reviews the preflight, supplies THIS target+state ack.
   const green = cli(['--database-url', url, '--deployment', 'staging', '--ack', pf.requiredAck]);
@@ -771,6 +790,56 @@ if (phase === 'phase1') {
     blockedRun.status !== 0 && /ASSERTION refusal - guard 'no-duplicates' in '0002'/.test(blockedRun.stderr), { status: blockedRun.status });
   const t2 = await tofu2.query(`SELECT to_regclass('users_phone_unique') AS r`);
   check('tofu: blocked run built nothing', t2.rows[0]?.['r'] === null);
+
+  // SA3 section 5: every lifecycle event has UNIQUE append-only identity on
+  // BOTH databases (no (version,kind) collapse, no dropped invalidation).
+  for (const [label, db] of [['tofu', tofu], ['tofu2', tofu2]] as const) {
+    const ids = await db.query(`SELECT event_id FROM public.schema_migration_evidence`);
+    const uniq = new Set(ids.rows.map(x => String(x['event_id'])));
+    check(`SA3: ${label} evidence events all carry UNIQUE event_id (append-only; ${ids.rows.length} events)`, uniq.size === ids.rows.length && ids.rows.length > 0, ids.rows.length);
+  }
+  // tofu2's blocked run invalidated its ack too - TWO independent
+  // invalidations across the run history are BOTH retained (Q2 class).
+  const inv2 = await tofu2.query(`SELECT event_id, report->>'nonce' AS nonce FROM public.schema_migration_evidence WHERE kind = 'ack-invalidated'`);
+  check('SA3 Q2: tofu2 abort invalidation recorded (never dropped by a conflict)', inv2.rows.length === 1, inv2.rows);
+
+  // SA3 section 3: deployment-label bypass attempts against the MODULE UNDER
+  // EVIDENCE (dist in the DIST lane): test/test-harness get NO exemption.
+  let testLaneRefused = '';
+  try { await runMigrations(tofu2, { deployment: 'test' }); } catch (e) { testLaneRefused = String(e); }
+  check('SA3: deployment=test is REFUSED without an issued ack (no caller-label exemption in the shipped artifact)',
+    /OPERATOR GATE refusal/.test(testLaneRefused), testLaneRefused.slice(0, 160));
+  let harnessLaneRefused = '';
+  try { await runMigrations(tofu2, { deployment: 'test-harness' }); } catch (e) { harnessLaneRefused = String(e); }
+  check('SA3: deployment=test-harness is REFUSED without an issued ack (no caller-label exemption in the shipped artifact)',
+    /OPERATOR GATE refusal/.test(harnessLaneRefused), harnessLaneRefused.slice(0, 160));
+
+  // SA3 section 5 on REAL PG: invalidation-failure -> DIRTY/INDETERMINATE
+  // retaining BOTH errors; target blocks issuance + runs; attended
+  // resolution unblocks (append-only dirty-resolved event).
+  await tofu2.query(`DELETE FROM users WHERE user_id IN ('u-a', 'u-b')`); // keep guard quiet; sabotage the evidence writes instead
+  const pfDirty = await issueOperatorPreflight(tofu2, { deployment: 'staging' });
+  await tofu2.query(`CREATE OR REPLACE FUNCTION public.__sa3_fail_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'simulated evidence-write failure'; END; $$`);
+  await tofu2.query(`CREATE TRIGGER __sa3_fail_evidence BEFORE INSERT ON public.schema_migration_evidence FOR EACH ROW EXECUTE FUNCTION public.__sa3_fail_evidence()`);
+  let dirtyErr = '';
+  try { await runMigrations(tofu2, { deployment: 'staging', operatorAck: operatorAckFor(pfDirty) }); } catch (e) { dirtyErr = String(e); }
+  check('SA3: invalidation-failure surfaces DIRTY/INDETERMINATE retaining BOTH error records',
+    /DIRTY\/INDETERMINATE/.test(dirtyErr) && dirtyErr.includes('original failure:') && dirtyErr.includes('invalidation failure:') && dirtyErr.includes('simulated evidence-write failure'), dirtyErr.slice(0, 300));
+  let dirtyBlockedRun = '';
+  try { await runMigrations(tofu2, { deployment: 'staging' }); } catch (e) { dirtyBlockedRun = String(e); }
+  check('SA3: DIRTY target blocks subsequent runs', /DIRTY TARGET refusal/.test(dirtyBlockedRun), dirtyBlockedRun.slice(0, 160));
+  let dirtyBlockedIssue = '';
+  try { await issueOperatorPreflight(tofu2, { deployment: 'staging' }); } catch (e) { dirtyBlockedIssue = String(e); }
+  check('SA3: DIRTY target blocks preflight issuance', /DIRTY TARGET refusal/.test(dirtyBlockedIssue), dirtyBlockedIssue.slice(0, 160));
+  // attended resolution (operator repairs the writer first, then resolves):
+  await tofu2.query(`DROP TRIGGER __sa3_fail_evidence ON public.schema_migration_evidence`);
+  await tofu2.query(`DROP FUNCTION public.__sa3_fail_evidence()`);
+  await attendedResolveDirty(tofu2, { note: 'evidence writer repaired; abort reviewed by operator', resolvedBy: 'evidence' });
+  const resolvedEv = await tofu2.query(`SELECT report FROM public.schema_migration_evidence WHERE kind = 'dirty-resolved'`);
+  check('SA3: attended DIRTY resolution recorded as append-only event retaining the prior failure', resolvedEv.rows.length === 1 && JSON.stringify(resolvedEv.rows[0]?.['report']).includes('invalidationFailure'), resolvedEv.rows);
+  const pfAfter = await issueOperatorPreflight(tofu2, { deployment: 'staging' });
+  const rAfter = await runMigrations(tofu2, { deployment: 'staging', operatorAck: operatorAckFor(pfAfter) });
+  check('SA3: target unblocked after attended resolution (fresh issuance + run applies 0002+0003)', JSON.stringify(rAfter.appliedNow) === '["0002","0003"]', rAfter.appliedNow);
   await tofu2.end(); await tofu.end();
   await admin.query(`DROP DATABASE contake_tofu2 WITH (FORCE)`);
   await admin.query(`DROP DATABASE contake_tofu WITH (FORCE)`);

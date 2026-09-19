@@ -27,7 +27,7 @@ import { PGlite } from '@electric-sql/pglite';
 import type { GraphRepository } from '../../src/repo/graph-repository.js';
 import { MemoryGraphRepository } from '../../src/repo/memory.js';
 import { PostgresGraphRepository, pgliteConnectable, createPgOtpState, type Connectable } from '../../src/repo/postgres.js';
-import { runMigrations } from '../../src/migrations/runner.js';
+import { issueOperatorPreflight, operatorAckFor, runMigrations } from '../../src/migrations/runner.js';
 import { memoryOtpState, type OtpStateStore } from '../../src/auth.js';
 import { probe } from './g4-diag.js';
 import { applySeed, seedDemo } from '../../src/seed.js';
@@ -128,7 +128,11 @@ export function getFileInstanceInfo(): { instanceId: string; fileId: string; res
  *  the reviewed forward-migration path (shared release-migration runner,
  *  steps 0001-0003) - never via bootstrap, never via caller SQL. */
 async function createUsersPhoneIndex(conn: Connectable): Promise<void> {
-  await runMigrations(conn, { deployment: 'test-harness' });
+  // SA3: no caller-label exemptions anywhere - the harness mints a REAL
+  // issued-nonce ack through the runner's issuance path, exactly as an
+  // operator would (persisted, single-consume, bound to the plan).
+  const pf = await issueOperatorPreflight(conn, { deployment: 'test-harness' });
+  await runMigrations(conn, { deployment: 'test-harness', operatorAck: operatorAckFor(pf) });
 }
 
 async function makeRealPgRepo(): Promise<GraphRepository> {
