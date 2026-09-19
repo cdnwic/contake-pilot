@@ -84,16 +84,16 @@ describe('SA4 canonical BUILT entrypoint', () => {
   });
 
   it('POSITIVE: the built entrypoint GATES - direct-endpoint + expected tuple are enforced BEFORE any connection', () => {
-    const pooled = runDistCli(['--deployment', 'staging', '--expect-host', 'h-pooler.x', '--expect-db', 'db', '--database-url', 'postgres://u:p@h-pooler.x/db']);
+    const pooled = runDistCli(['--deployment', 'staging', '--expect-host', 'h-pooler.x', '--expect-db', 'db', '--database-url', 'postgres://u:p@h-pooler.x/db'], { DATABASE_URL: '' });
     expect(pooled.status).not.toBe(0);
     expect(pooled.stderr).toMatch(/POOLED endpoint refused/);
-    const wrongHost = runDistCli(['--deployment', 'staging', '--expect-host', 'other-host', '--expect-db', 'db', '--database-url', 'postgres://u:p@localhost/db']);
+    const wrongHost = runDistCli(['--deployment', 'staging', '--expect-host', 'other-host', '--expect-db', 'db', '--database-url', 'postgres://u:p@localhost/db'], { DATABASE_URL: '' });
     expect(wrongHost.status).toBe(2);
     expect(wrongHost.stderr).toMatch(/TARGET TUPLE mismatch/);
-    const wrongDb = runDistCli(['--deployment', 'staging', '--expect-host', 'localhost', '--expect-db', 'other-db', '--database-url', 'postgres://u:p@localhost/db']);
+    const wrongDb = runDistCli(['--deployment', 'staging', '--expect-host', 'localhost', '--expect-db', 'other-db', '--database-url', 'postgres://u:p@localhost/db'], { DATABASE_URL: '' });
     expect(wrongDb.status).toBe(2);
     expect(wrongDb.stderr).toMatch(/TARGET TUPLE mismatch/);
-    const badLabel = runDistCli(['--deployment', 'test', '--expect-host', 'h', '--expect-db', 'd', '--database-url', 'postgres://u:p@h/d']);
+    const badLabel = runDistCli(['--deployment', 'test', '--expect-host', 'h', '--expect-db', 'd', '--database-url', 'postgres://u:p@h/d'], { DATABASE_URL: '' });
     expect(badLabel.status).toBe(64);
   });
 
