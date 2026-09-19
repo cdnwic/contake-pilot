@@ -17,7 +17,8 @@
  *
  *  Usage: tsx evidence-realpg-release-migrations.mts <phase1|phase2|phase3|phase4|phase5> <socketDirOrHost> <port>
  *  phase5 (SA2/SA2-A/SA3 attended-TOFU + ack lifecycle): drives the REAL
- *  migration CLI (scripts/migrate.mts -> runMigrations) as a child process;
+ *  BUILT migration CLI (package script migrate:release -> node dist ->
+ *  runMigrations) as a child process; source spawn is void (SA4);
  *  the runner enforces the ISSUED-NONCE ack lifecycle under lock,
  *  in-transaction: truly-absent/wrong-target/plan-mismatch/stale/consumed/
  *  invalidated presentations, unique append-only evidence identity, no
@@ -31,8 +32,8 @@ import type { MigrationStep } from './src/migrations/runner.js';
 // R5 section 4: the module under evidence is selectable - the SAME phases run
 // against src (tsx) or the BUILT DIST (the artifact that deploys). The
 // evidence pack records which module path ran plus its sha256.
-const RUNNER_PATH = process.env['EVIDENCE_RUNNER'] ?? './src/migrations/runner.js';
-const SEED_PATH = process.env['EVIDENCE_SEED'] ?? './src/migrations/staging-seed.js';
+const RUNNER_PATH = process.env['EVIDENCE_RUNNER'] ?? './dist/migrations/runner.js';
+const SEED_PATH = process.env['EVIDENCE_SEED'] ?? './dist/migrations/staging-seed.js';
 const R = await import(RUNNER_PATH) as typeof import('./src/migrations/runner.js');
 const S = await import(SEED_PATH) as typeof import('./src/migrations/staging-seed.js');
 const {
@@ -637,20 +638,33 @@ if (phase === 'phase1') {
   await admin.query(`DROP DATABASE contake_conf WITH (FORCE)`);
   await admin.query(`DROP ROLE conf_runtime`); await admin.query(`DROP ROLE conf_migrator`);
 } else if (phase === 'phase5') {
-  // SA2 ruling (2026-09-19): the attended-TOFU operator gate is enforced by
-  // the REAL product path - the migration CLI (scripts/migrate.mts) ->
-  // runMigrations itself, recomputed under the step locks in the step
-  // transaction (no TOCTOU). No harness gate, no env ack. The evidence drives
-  // the real CLI as a child process against disposable databases.
+  // SA2 + SA4 rulings (2026-09-19): the attended-TOFU operator gate is
+  // enforced by the REAL product path - the BUILT migration CLI invoked
+  // through the package script (migrate:release -> node
+  // dist/migrations/migrate-cli.js -> runMigrations) with the required
+  // target-binding tuple, recomputed under the step locks in the step
+  // transaction (no TOCTOU). No harness gate, no env ack, no source spawn.
+  // The evidence drives the built CLI as a child process against disposable
+  // databases.
   const { spawnSync } = await import('node:child_process');
+  // SA4: the gated entrypoint is invoked ONLY as the BUILT artifact through
+  // the package script (source spawn is void). cliRun() derives the required
+  // target-binding tuple from the URL under evidence; attacks needing a
+  // DIFFERENT tuple build args explicitly via cli().
   const cli = (args: string[]) => {
-    const r = spawnSync('npx', ['tsx', 'scripts/migrate.mts', ...args], { encoding: 'utf8', timeout: 300000 });
+    const r = spawnSync('pnpm', ['--silent', 'run', 'migrate:release', '--', ...args], { encoding: 'utf8', timeout: 300000 });
     return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
   };
+  const cliRun = (url: string, args: string[]) => {
+    const u = new URL(url);
+    return cli(['--database-url', url, '--deployment', 'staging', '--expect-host', u.hostname, '--expect-db', u.pathname.slice(1), ...args]);
+  };
+  // SA4: the canonical preflight IS the built CLI's issuance-first run (exit
+  // 75, NOTHING executed). Parse the persisted preflight JSON from stdout.
   const preflight = (url: string) => {
-    const r = spawnSync('npx', ['tsx', 'scripts/users-phone-preflight.mts', '--database-url', url, '--deployment', 'staging'], { encoding: 'utf8', timeout: 300000 });
-    if (r.status !== 0) throw new Error(`preflight failed: ${r.stderr}`);
-    return JSON.parse(r.stdout) as { listDigest: string; requiredAck: string; target: string; crossRepresentationInconsistencies: unknown[]; blankPhoneUsers: unknown[]; collisionGroups: unknown[]; operatorDecisionRequired: boolean };
+    const r = cliRun(url, []);
+    if (r.status !== 75) throw new Error(`issuance-first preflight failed (expected exit 75): status=${r.status} ${r.stderr}`);
+    return JSON.parse(r.stdout.slice(r.stdout.indexOf('{')))['preflight'] as { nonce: string; listDigest: string; requiredAck: string; target: string; crossRepresentationInconsistencies: unknown[]; blankPhoneUsers: unknown[]; collisionGroups: unknown[]; operatorDecisionRequired: boolean };
   };
 
   await admin.query(`DROP DATABASE IF EXISTS contake_tofu WITH (FORCE)`);
@@ -683,12 +697,32 @@ if (phase === 'phase1') {
   // 2) ATTACK SET through the REAL CLI (all must fail closed, nothing applied).
   const applied = async () => (await tofu.query(`SELECT version FROM public.schema_migrations ORDER BY seq`)).rows.map(x => String(x['version']));
 
-  const noAck = cli(['--database-url', url, '--deployment', 'staging']);
+  const noAck = cliRun(url, []);
   console.error(`OBSERVED[cli no-ack]: status=${noAck.status} ${noAck.stderr.split('\n').find(l => l.includes('GATE')) ?? ''}`);
   check('REAL CLI refuses an absent ack (exit 75, nothing executed)', noAck.status === 75 && noAck.stderr.includes('GATE: no ack supplied'), { status: noAck.status, stderr: noAck.stderr.slice(0, 200) });
   check('no-ack run applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
 
-  const wrongAck = cli(['--database-url', url, '--deployment', 'staging', '--ack', `ack:${'deadbeef'.repeat(8)}`]);
+  // SA4 s2/s5: target-binding + parser attacks through the BUILT CLI.
+  const unknownFlag = cliRun(url, ['--bogus-flag', 'x']);
+  check('SA4: built CLI refuses an unknown flag', unknownFlag.status !== 0 && (unknownFlag.stderr + unknownFlag.stdout).includes('unknown flag'), { status: unknownFlag.status });
+  const barePositional = cliRun(url, ['positional']);
+  check('SA4: built CLI refuses a bare positional', barePositional.status !== 0 && (barePositional.stderr + barePositional.stdout).includes('bare positional'), { status: barePositional.status });
+  const dupFlag = cliRun(url, ['--expect-db', 'contake_tofu']);
+  check('SA4: built CLI refuses a duplicate flag', dupFlag.status !== 0 && (dupFlag.stderr + dupFlag.stdout).includes('duplicate flag'), { status: dupFlag.status });
+  const missingBinding = cli(['--database-url', url, '--deployment', 'staging']);
+  check('SA4: built CLI refuses a missing required binding flag', missingBinding.status !== 0 && (missingBinding.stderr + missingBinding.stdout).includes('--expect-host'), { status: missingBinding.status });
+  const pooledUrl = url.replace(`@${host}:`, `@${host}-pooler.`);
+  const pooled = cliRun(pooledUrl, []);
+  check('SA4: built CLI refuses a POOLED endpoint (direct schema-owner endpoint required)', pooled.status !== 0 && pooled.stderr.includes('POOLED endpoint refused'), { status: pooled.status });
+  const wrongHost = cli(['--database-url', url, '--deployment', 'staging', '--expect-host', 'not-the-host', '--expect-db', 'contake_tofu']);
+  check('SA4: built CLI refuses a wrong expect-host BEFORE connecting (exit 2)', wrongHost.status === 2 && wrongHost.stderr.includes('TARGET TUPLE mismatch'), { status: wrongHost.status });
+  const wrongDb = cli(['--database-url', url, '--deployment', 'staging', '--expect-host', host, '--expect-db', 'not_the_db']);
+  check('SA4: built CLI refuses a wrong expect-db BEFORE connecting (exit 2)', wrongDb.status === 2 && wrongDb.stderr.includes('TARGET TUPLE mismatch'), { status: wrongDb.status });
+  const badLabel = cli(['--database-url', url, '--deployment', 'qa', '--expect-host', host, '--expect-db', 'contake_tofu']);
+  check('SA4: built CLI refuses an unknown deployment label (exit 64)', badLabel.status === 64 && badLabel.stderr.includes('unknown deployment label'), { status: badLabel.status });
+  check('SA4: binding/parser attacks applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
+
+  const wrongAck = cliRun(url, ['--ack', `ack:${'deadbeef'.repeat(8)}`]);
   console.error(`OBSERVED[cli wrong-ack]: status=${wrongAck.status}`);
   check('REAL CLI refuses a wrong ack (runner gate, fail closed)', wrongAck.status !== 0 && wrongAck.stderr.includes('OPERATOR GATE refusal'), { status: wrongAck.status });
   check('wrong-ack run applied nothing', JSON.stringify(await applied()) === '["0001"]', await applied());
@@ -698,7 +732,7 @@ if (phase === 'phase1') {
   // the state change must alter a LIST to invalidate it. A blank phone enters
   // blankPhoneUsers - the minted digest no longer matches the recomputed one.
   await ins('u-late', '');
-  const stale = cli(['--database-url', url, '--deployment', 'staging', '--ack', staleAck]);
+  const stale = cliRun(url, ['--ack', staleAck]);
   console.error(`OBSERVED[cli stale-ack]: status=${stale.status}`);
   check('REAL CLI refuses a STALE ack (list state changed after it was minted; runner recomputes under lock)', stale.status !== 0 && stale.stderr.includes('OPERATOR GATE refusal'), { status: stale.status });
   await tofu.query(`DELETE FROM users WHERE user_id = 'u-late'`);
@@ -710,17 +744,17 @@ if (phase === 'phase1') {
   await tofu2.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-other', 'org-1', 'o@x', '+972555000777', '{}')`);
   const url2 = `postgres://postgres@${host}:${port}/contake_tofu2`;
   const pf2 = preflight(url2);
-  const replayed = cli(['--database-url', url, '--deployment', 'staging', '--ack', pf2.requiredAck]);
+  const replayed = cliRun(url, ['--ack', pf2.requiredAck]);
   console.error(`OBSERVED[cli replayed-ack]: status=${replayed.status}`);
   check('REAL CLI refuses a REPLAYED ack (minted against another target)', replayed.status !== 0 && replayed.stderr.includes('OPERATOR GATE refusal'), { status: replayed.status });
 
-  const fabricated = cli(['--database-url', url, '--deployment', 'staging', '--ack', `ack:${'f'.repeat(16)}:${'0'.repeat(64)}`]);
+  const fabricated = cliRun(url, ['--ack', `ack:${'f'.repeat(16)}:${'0'.repeat(64)}`]);
   check('REAL CLI refuses a fabricated ack (no preflight ever produced it)', fabricated.status !== 0 && fabricated.stderr.includes('NO ISSUED PREFLIGHT'), { status: fabricated.status });
   // SA3 Q1: TRULY-ABSENT preflight - a well-formed ack from an arbitrary
   // nonce + the public canonical digest, NO issuance record anywhere.
   const forgedReport = await computeUsersPhonePreflight(tofu, { deployment: 'staging' });
   const forgedAck = operatorAckFor(forgedReport);
-  const forged = cli(['--database-url', url, '--deployment', 'staging', '--ack', forgedAck]);
+  const forged = cliRun(url, ['--ack', forgedAck]);
   console.error(`OBSERVED[cli truly-absent-ack]: status=${forged.status}`);
   check('SA3 Q1: REAL CLI refuses a TRULY-ABSENT preflight ack (arbitrary nonce + public digest, no record)',
     forged.status !== 0 && forged.stderr.includes('NO ISSUED PREFLIGHT'), { status: forged.status });
@@ -731,8 +765,8 @@ if (phase === 'phase1') {
     target: pf.target, deployment: pf.deployment, nonce: pf.nonce, plan: pf.plan.filter((x: { version: string }) => x.version === keep),
     collisionGroups: pf.collisionGroups, crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies, blankPhoneUsers: pf.blankPhoneUsers,
   })}`;
-  const planMismatch2 = cli(['--database-url', url, '--deployment', 'staging', '--ack', tamperedPlanAck('0002')]);
-  const planMismatch3 = cli(['--database-url', url, '--deployment', 'staging', '--ack', tamperedPlanAck('0003')]);
+  const planMismatch2 = cliRun(url, ['--ack', tamperedPlanAck('0002')]);
+  const planMismatch3 = cliRun(url, ['--ack', tamperedPlanAck('0003')]);
   check('REAL CLI refuses PLAN-MISMATCH presentations (0002-only / 0003-alone)',
     planMismatch2.status !== 0 && planMismatch2.stderr.includes('OPERATOR GATE refusal')
     && planMismatch3.status !== 0 && planMismatch3.stderr.includes('OPERATOR GATE refusal'), { s2: planMismatch2.status, s3: planMismatch3.status });
@@ -757,7 +791,7 @@ if (phase === 'phase1') {
   check('POST-ABORT REPLAY of the exact same ack refuses (ACK LIFECYCLE loud conflict)', /ACK LIFECYCLE/.test(replayRefused), replayRefused.slice(0, 200));
 
   // 3) GREEN PATH: operator reviews the preflight, supplies THIS target+state ack.
-  const green = cli(['--database-url', url, '--deployment', 'staging', '--ack', pf.requiredAck]);
+  const green = cliRun(url, ['--ack', pf.requiredAck]);
   console.error(`OBSERVED[cli green]: status=${green.status} ${green.stdout.split('\n').find(l => l.includes('applied')) ?? ''}`);
   check('REAL CLI applies 0002+0003 with the exact operator ack', green.status === 0 && green.stdout.includes('"0002"') && green.stdout.includes('"0003"'), { status: green.status, stdout: green.stdout.slice(0, 300) });
   const rows = await tofu.query(`SELECT user_id, phone, data->>'phone' AS jp FROM users ORDER BY user_id`);
@@ -795,7 +829,7 @@ if (phase === 'phase1') {
   await tofu2.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-a', 'org-1', 'a@x', '+972555000444', '{}')`);
   await tofu2.query(`INSERT INTO users(user_id, org_id, email, phone, data) VALUES('u-b', 'org-2', 'b@x', '  +972555000444 ', '{}')`);
   const pf2b = preflight(url2);
-  const blockedRun = cli(['--database-url', url2, '--deployment', 'staging', '--ack', pf2b.requiredAck]);
+  const blockedRun = cliRun(url2, ['--ack', pf2b.requiredAck]);
   check('REAL CLI: a real cross-tenant collision still BLOCKS loudly even with a valid ack',
     blockedRun.status !== 0 && /ASSERTION refusal - guard 'no-duplicates' in '0002'/.test(blockedRun.stderr), { status: blockedRun.status });
   const t2 = await tofu2.query(`SELECT to_regclass('users_phone_unique') AS r`);
@@ -861,6 +895,42 @@ if (phase === 'phase1') {
   const pfAfter = await issueOperatorPreflight(tofu2, { deployment: 'staging' });
   const rAfter = await runMigrations(tofu2, { deployment: 'staging', operatorAck: operatorAckFor(pfAfter) });
   check('SA3: target unblocked after attended resolution (fresh issuance + run applies 0002+0003)', JSON.stringify(rAfter.appliedNow) === '["0002","0003"]', rAfter.appliedNow);
+  // SA4 section 4 on REAL PG through the BUILT CLI: marker-write failure is
+  // an UNPROVEN-DIRTY hard stop - the run does NOT falsely claim DIRTY, ALL
+  // failures are retained, and the target is NOT silently recorded dirty.
+  await admin.query(`DROP DATABASE IF EXISTS contake_tofu3 WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE contake_tofu3`);
+  const tofu3 = mk('contake_tofu3');
+  await runMigrations(tofu3, { deployment: 'staging', migrations: MIGRATIONS.slice(0, 1) });
+  const url3 = `postgres://postgres@${host}:${port}/contake_tofu3`;
+  const pfUnproven = preflight(url3);
+  await tofu3.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected evidence-write failure'; END; $$`);
+  await tofu3.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected marker-write failure'; END; $$`);
+  await tofu3.query(`CREATE TRIGGER __sa4_fail_evidence BEFORE INSERT ON public.schema_migration_evidence FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_evidence()`);
+  await tofu3.query(`CREATE TRIGGER __sa4_fail_state BEFORE INSERT OR UPDATE ON public.schema_migration_target_state FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_state()`);
+  const unproven = cliRun(url3, ['--ack', pfUnproven.requiredAck]);
+  console.error(`OBSERVED[cli unproven-dirty]: status=${unproven.status}`);
+  check('SA4: marker-write failure surfaces UNPROVEN-DIRTY hard stop through the built CLI (no false DIRTY claim)',
+    unproven.status !== 0 && unproven.stderr.includes('UNPROVEN-DIRTY hard stop') && unproven.stderr.includes('no dirty state is claimed')
+    && !/marked DIRTY/.test(unproven.stderr), { status: unproven.status, stderr: unproven.stderr.slice(0, 400) });
+  check('SA4: UNPROVEN-DIRTY retains ALL failures (original + invalidation + marker) and reports the attempt-evidence failure honestly',
+    unproven.stderr.includes('original failure:') && unproven.stderr.includes('invalidation/restore failure:') && unproven.stderr.includes('marker failure:')
+    && unproven.stderr.includes('injected marker-write failure') && unproven.stderr.includes('attempt evidence write ALSO failed'), unproven.stderr.slice(0, 500));
+  const ts3 = await tofu3.query(`SELECT dirty FROM public.schema_migration_target_state`);
+  check('SA4: UNPROVEN-DIRTY persisted NO dirty marker (nothing silently recorded)', ts3.rows.length === 0 || ts3.rows[0]?.['dirty'] !== true, ts3.rows);
+  check('SA4: UNPROVEN-DIRTY run applied nothing past 0001', JSON.stringify((await tofu3.query(`SELECT version FROM public.schema_migrations ORDER BY seq`)).rows.map(x => String(x['version']))) === '["0001"]');
+  // attended recovery: operator repairs out of band; no durable marker to
+  // resolve - fresh issuance + run succeed through the built CLI.
+  await tofu3.query(`DROP TRIGGER __sa4_fail_evidence ON public.schema_migration_evidence`);
+  await tofu3.query(`DROP TRIGGER __sa4_fail_state ON public.schema_migration_target_state`);
+  await tofu3.query(`DROP FUNCTION public.__sa4_fail_evidence()`);
+  await tofu3.query(`DROP FUNCTION public.__sa4_fail_state()`);
+  const pf3 = preflight(url3);
+  const recovered = cliRun(url3, ['--ack', pf3.requiredAck]);
+  check('SA4: target not durably blocked - after attended repair the built CLI applies 0002+0003', recovered.status === 0 && recovered.stdout.includes('"0002"') && recovered.stdout.includes('"0003"'), { status: recovered.status });
+  await tofu3.end();
+  await admin.query(`DROP DATABASE contake_tofu3 WITH (FORCE)`);
+
   await tofu2.end(); await tofu.end();
   await admin.query(`DROP DATABASE contake_tofu2 WITH (FORCE)`);
   await admin.query(`DROP DATABASE contake_tofu WITH (FORCE)`);

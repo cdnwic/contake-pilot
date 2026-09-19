@@ -1,15 +1,23 @@
-/** SA3 section 2 (ruling 2026-09-19): ONE canonical operator entrypoint.
- *  Verification is ENUMERATIVE, not anecdotal: every invocation path an
- *  operator or script can reach - package scripts, documented commands,
- *  wrappers, direct invocations of shipped sources - is listed HERE and
- *  confirmed to land in the gated entrypoint (scripts/migrate.mts ->
- *  runMigrations with the issued-nonce gate). The ungated cli.ts is deleted
- *  from reach. */
+/** SA3+SA4 canonical entrypoint enumeration (rulings 2026-09-19).
+ *  SA4: the canonical gated entrypoint is the BUILT artifact
+ *  (dist/migrations/migrate-cli.js), invoked via the package script
+ *  (`migrate:release` -> `node dist/migrations/migrate-cli.js`). Verification
+ *  is ENUMERATIVE and POSITIVE: the built entrypoint must EXIST, EXECUTE and
+ *  GATE - absence-of-old-cli assertions prove nothing (SA4 section 2).
+ *  CONTROL-CARRYOVER (SA4 section 3): an explicit control-list diff -
+ *  every control of the deleted predecessor cli.ts is named and proven
+ *  present in the replacement (source AND built artifact). */
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const API_ROOT = path.resolve(__dirname, '..');
+const DIST_CLI = path.join(API_ROOT, 'dist', 'migrations', 'migrate-cli.js');
+const SRC_CLI = path.join(API_ROOT, 'src', 'migrations', 'migrate-cli.ts');
+
+const runDistCli = (args: string[], env: NodeJS.ProcessEnv = {}) =>
+  spawnSync(process.execPath, [DIST_CLI, ...args], { encoding: 'utf8', timeout: 120_000, env: { ...process.env, ...env } });
 
 const walk = (dir: string, ext: string): string[] => {
   const out: string[] = [];
@@ -22,33 +30,99 @@ const walk = (dir: string, ext: string): string[] => {
   return out;
 };
 
-describe('SA3 canonical entrypoint enumeration', () => {
-  it('package scripts: migrate:release routes to the gated scripts/migrate.mts', () => {
+/** SA4 section 3: the predecessor control inventory (deleted
+ *  src/migrations/cli.ts + the SA2/SA3 scripts/migrate.mts). Each control is
+ *  proven present in the replacement by its implementation marker. */
+const CONTROL_CARRYOVER: ReadonlyArray<readonly [string, RegExp]> = [
+  ['closed parser (unknown/duplicate/bare/missing refused)', /parseCliArgs\(process\.argv\.slice\(2\)/],
+  ['ONE deliberate URL source (flag XOR env)', /resolveDatabaseUrl\(args\['--database-url'\], process\.env\['DATABASE_URL'\]\)/],
+  ['bounded actor label', /validateActor\(/],
+  ['direct-endpoint assertion (pooled refused)', /assertDirectDatabaseUrl\(databaseUrl\)/],
+  ['operator expected tuple REQUIRED flags', /required: \['--deployment', '--expect-host', '--expect-db'\]/],
+  ['pre-connection URL tuple match (exit 2)', /TARGET TUPLE mismatch[\s\S]*?process\.exit\(2\)/],
+  ['post-connection current_database() verification before issuance', /current_database\(\) AS db[\s\S]*?is not the expected/],
+  ['pre-mutation target binding read-only', /verifyTargetPreconditions\(pool/],
+  ['deployment allowlist staging|production', /\['staging', 'production'\]\.includes\(deployment\)/],
+  ['issued-nonce preflight issuance first', /issueOperatorPreflight\(pool/],
+  ['exit 75 without --ack (nothing executed)', /process\.exit\(75\)/],
+  ['runner re-verifies/consumes the ack under lock', /runMigrations\(pool, \{\s*deployment, appliedBy, operatorAck: ack,/],
+  ['attended --resolve-dirty mode', /attendedResolveDirty\(pool, \{ note: resolveNote/],
+  ['TOFU stamp printed for out-of-band verification (not authentication)', /trust-on-first-use/],
+  ['pins threaded into BOTH issuance and run', /expectInstanceId: args\['--expect-instance-id'\], expectRegistryDigest: args\['--expect-registry-digest'\],?\s*\}\)/],
+];
+
+describe('SA4 canonical BUILT entrypoint', () => {
+  it('package scripts: migrate:release invokes the BUILT artifact (node dist); no source/tsx on the release path', () => {
     const pkg = JSON.parse(readFileSync(path.join(API_ROOT, 'package.json'), 'utf8')) as { scripts: Record<string, string> };
-    expect(pkg.scripts['migrate:release']).toBe('tsx scripts/migrate.mts');
-    // no OTHER package script can reach a migration runner path
+    expect(pkg.scripts['migrate:release']).toBe('node dist/migrations/migrate-cli.js');
     for (const [name, cmd] of Object.entries(pkg.scripts)) {
-      if (name === 'migrate:release') continue;
-      expect(cmd, `script '${name}' must not reach a migration cli`).not.toMatch(/migrations\/cli|migrate\.mts|runMigrations/);
+      expect(cmd, `script '${name}' must not invoke tsx/ts-node or a source migration entrypoint`).not.toMatch(/tsx\s+scripts|ts-node|migrations\/cli|migrate\.mts|users-phone-preflight/);
     }
   });
 
-  it('the ungated cli.ts is DELETED from reach (source and built artifact)', () => {
+  it('POSITIVE: the built gated entrypoint EXISTS (run the package build first)', () => {
+    expect(existsSync(SRC_CLI), 'src/migrations/migrate-cli.ts must exist (the build compiles it)').toBe(true);
+    expect(existsSync(DIST_CLI), 'dist/migrations/migrate-cli.js missing - run `npm run build` (the release path executes the BUILT artifact)').toBe(true);
+    expect(statSync(DIST_CLI).size).toBeGreaterThan(0);
+  });
+
+  it('POSITIVE: the built entrypoint EXECUTES and its closed parser refuses unknown/bare/duplicate/missing flags', () => {
+    const base = ['--deployment', 'staging', '--expect-host', 'localhost', '--expect-db', 'x'];
+    const unknownF = runDistCli([...base, '--bogus', 'v'], { DATABASE_URL: '' });
+    expect(unknownF.status).not.toBe(0);
+    expect(unknownF.stderr).toMatch(/unknown flag/);
+    const bare = runDistCli([...base, 'positional'], { DATABASE_URL: '' });
+    expect(bare.status).not.toBe(0);
+    expect(bare.stderr).toMatch(/bare positional/);
+    const dup = runDistCli([...base, '--expect-db', 'y'], { DATABASE_URL: '' });
+    expect(dup.status).not.toBe(0);
+    expect(dup.stderr).toMatch(/duplicate flag/);
+    const missing = runDistCli(['--deployment', 'staging'], { DATABASE_URL: '' });
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toMatch(/required flag/);
+  });
+
+  it('POSITIVE: the built entrypoint GATES - direct-endpoint + expected tuple are enforced BEFORE any connection', () => {
+    const pooled = runDistCli(['--deployment', 'staging', '--expect-host', 'h-pooler.x', '--expect-db', 'db', '--database-url', 'postgres://u:p@h-pooler.x/db']);
+    expect(pooled.status).not.toBe(0);
+    expect(pooled.stderr).toMatch(/POOLED endpoint refused/);
+    const wrongHost = runDistCli(['--deployment', 'staging', '--expect-host', 'other-host', '--expect-db', 'db', '--database-url', 'postgres://u:p@localhost/db']);
+    expect(wrongHost.status).toBe(2);
+    expect(wrongHost.stderr).toMatch(/TARGET TUPLE mismatch/);
+    const wrongDb = runDistCli(['--deployment', 'staging', '--expect-host', 'localhost', '--expect-db', 'other-db', '--database-url', 'postgres://u:p@localhost/db']);
+    expect(wrongDb.status).toBe(2);
+    expect(wrongDb.stderr).toMatch(/TARGET TUPLE mismatch/);
+    const badLabel = runDistCli(['--deployment', 'test', '--expect-host', 'h', '--expect-db', 'd', '--database-url', 'postgres://u:p@h/d']);
+    expect(badLabel.status).toBe(64);
+  });
+
+  it('CONTROL-CARRYOVER DIFF (SA4 s3): every predecessor control is present in the replacement - source AND built artifact', () => {
+    const src = readFileSync(SRC_CLI, 'utf8');
+    const dist = readFileSync(DIST_CLI, 'utf8');
+    for (const [control, marker] of CONTROL_CARRYOVER) {
+      expect(marker.test(src), `control '${control}' missing from src/migrations/migrate-cli.ts`).toBe(true);
+      expect(marker.test(dist), `control '${control}' missing from dist/migrations/migrate-cli.js (built artifact)`).toBe(true);
+    }
+  });
+
+  it('the ungated predecessor + source-invoked wrappers are DELETED from reach (source, scripts, built artifact)', () => {
     expect(existsSync(path.join(API_ROOT, 'src', 'migrations', 'cli.ts'))).toBe(false);
     expect(existsSync(path.join(API_ROOT, 'dist', 'migrations', 'cli.js'))).toBe(false);
+    expect(existsSync(path.join(API_ROOT, 'scripts', 'migrate.mts'))).toBe(false);
+    expect(existsSync(path.join(API_ROOT, 'scripts', 'users-phone-preflight.mts'))).toBe(false);
   });
 
   it('enumerative: EVERY shipped source that references runMigrations is on the gated allowlist', () => {
     const ALLOWLIST = new Set([
       path.join(API_ROOT, 'src', 'migrations', 'runner.ts'), // the definition itself
+      path.join(API_ROOT, 'src', 'migrations', 'migrate-cli.ts'), // the ONE canonical gated entrypoint
     ]);
     const offenders: string[] = [];
     for (const f of [...walk(path.join(API_ROOT, 'src'), '.ts'), ...walk(path.join(API_ROOT, 'scripts'), '.mts')]) {
       const text = readFileSync(f, 'utf8');
       if (/\brunMigrations\b/.test(text) && !ALLOWLIST.has(f)) offenders.push(f);
     }
-    // scripts/migrate.mts is the ONE canonical gated operator entrypoint:
-    expect(offenders.sort()).toEqual([path.join(API_ROOT, 'scripts', 'migrate.mts')]);
+    expect(offenders.sort()).toEqual([]);
   });
 
   it('SA3 section 3: no caller-label gate exemption exists anywhere in shipped sources', () => {
@@ -58,19 +132,23 @@ describe('SA3 canonical entrypoint enumeration', () => {
     }
   });
 
-  it('dist-discipline (R5): when dist exists, the BUILT artifact carries the gate and no exemption', () => {
+  it('dist-discipline: the BUILT runner carries the ack lifecycle and no exemption; dist CLI carries the gate', () => {
     const distRunner = path.join(API_ROOT, 'dist', 'migrations', 'runner.js');
-    if (!existsSync(distRunner)) return; // src-only lane; the evidence DIST lane asserts this too
+    expect(existsSync(distRunner), 'dist/migrations/runner.js missing - run `npm run build`').toBe(true);
     const text = readFileSync(distRunner, 'utf8');
     expect(text).toContain('schema_migration_acks'); // the issued-nonce lifecycle IS in the artifact
     expect(text).not.toContain('test-harness');
-    expect(existsSync(path.join(API_ROOT, 'dist', 'migrations', 'cli.js'))).toBe(false);
+    const distCliText = readFileSync(DIST_CLI, 'utf8');
+    expect(distCliText).toContain('issueOperatorPreflight');
+    expect(distCliText).toContain('OPERATOR GATE');
+    expect(distCliText).toContain('GATE: no ack supplied');
   });
 
-  it('documented commands resolve to the gated entrypoint', () => {
+  it('documented commands resolve to the BUILT gated entrypoint', () => {
     const doc = readFileSync(path.join(API_ROOT, '..', '..', 'docs', 'release-migrations-v1.0.md'), 'utf8');
-    expect(doc).toContain('scripts/migrate.mts');
-    // the deleted cli's flag shape must not survive on ANY migrate:release line
-    expect(doc.split('\n').filter(l => l.includes('migrate:release') && l.includes('--expect-host'))).toEqual([]);
+    expect(doc).toContain('node dist/migrations/migrate-cli.js');
+    expect(doc).not.toContain('scripts/migrate.mts');
+    expect(doc).not.toContain('users-phone-preflight.mts');
+    expect(doc).not.toContain('tsx scripts');
   });
 });

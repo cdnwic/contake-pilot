@@ -100,18 +100,29 @@ other migration path and no schema work at app startup.
   collision is a loud unique-violation failure), COMMIT; any failure rolls
   the whole step back; transactional
   DDL means partial step DDL never persists.
-- **Explicit invocation only, closed CLI.** Schema changes run as a separate
-  release job, never at web boot:
-  `pnpm --filter @contake/api migrate:release -- --database-url <direct> --deployment staging|production [--ack ack:<nonce>:<listDigest>] [--expect-instance-id <id>] [--expect-registry-digest <digest>]`
-  ONE canonical gated entrypoint (SA3): `migrate:release` routes to
-  `scripts/migrate.mts` (the ungated cli.ts is deleted; every shipped
-  invocation path resolves to the same gate). Without `--ack` the CLI runs
-  the canonical preflight ISSUANCE (minting + persisting the unique nonce
-  bound to target + deployment + plan + listDigest), prints it, and exits 75
-  without executing; with `--ack` the runner re-verifies the ack against the
-  persisted record under the step locks and consumes it atomically with the
-  gated plan (absent-record / wrong-target / plan-mismatch / stale /
-  consumed / invalidated all fail closed; any abort invalidates the ack).
+- **Explicit invocation only, closed CLI, BUILT entrypoint (SA4).** Schema
+  changes run as a separate release job, never at web boot:
+  `pnpm --filter @contake/api migrate:release -- --deployment staging|production --expect-host <host> --expect-db <db> [--database-url <direct>] [--by <actor>] [--ack ack:<nonce>:<listDigest>] [--expect-instance-id <id>] [--expect-registry-digest <digest>]`
+  ONE canonical gated entrypoint: `migrate:release` invokes the BUILT
+  artifact `node dist/migrations/migrate-cli.js` (SA4 - compiled by the
+  package build; the ungated cli.ts and the source-invoked scripts/*.mts
+  are deleted; no tsx/ts-node/source invocation remains on the release
+  path). The closed parser rejects unknown/duplicate/bare/missing flags;
+  exactly ONE URL source (`--database-url` XOR `DATABASE_URL`); the direct
+  endpoint is asserted (`-pooler` refused) and the operator's expected
+  `--expect-host`/`--expect-db` tuple must match the URL BEFORE any
+  connection AND the connected `current_database()` BEFORE any issuance.
+  Without `--ack` the CLI runs the canonical preflight ISSUANCE (minting +
+  persisting the unique nonce bound to target + deployment + plan +
+  listDigest), prints it, and exits 75 without executing; with `--ack` the
+  runner re-verifies the ack against the persisted record under the step
+  locks and consumes it atomically with the gated plan (absent-record /
+  wrong-target / plan-mismatch / stale / consumed / invalidated all fail
+  closed; any abort invalidates the ack). DIRTY/INDETERMINATE is claimed
+  ONLY after the marker write is committed AND read back verified (SA4):
+  an unverifiable marker is an UNPROVEN-DIRTY hard stop retaining all
+  failures + attempt evidence, blocking pending attended recovery.
+  `--resolve-dirty '<note>'` performs attended resolution.
 - **Pre-mutation target binding.** `verifyTargetPreconditions` (deployment
   label + optional `--expect-instance-id` pin) runs READ-ONLY before any
   write; the first-run stamp is printed as an operator-attended TOFU gate,

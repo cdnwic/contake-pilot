@@ -441,6 +441,8 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       expect(String((dirtyErr as Error).message)).toContain('original failure:');
       expect(String((dirtyErr as Error).message)).toContain('invalidation failure:');
       expect(String((dirtyErr as Error).message)).toContain('simulated evidence-write failure');
+      // SA4: the DIRTY claim is made only after verified marker persistence.
+      expect(String((dirtyErr as Error).message)).toContain('marker durably recorded and verified');
       // the target is marked DIRTY: runs AND issuance both refuse.
       const ts = await db.query(`SELECT dirty, dirty_reason FROM public.schema_migration_target_state`);
       expect(ts.rows.length).toBe(1);
@@ -461,6 +463,47 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       const pf2 = await issueOperatorPreflight(db, { deployment: STAGING });
       const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf2) });
       expect(r.appliedNow).toEqual(['0002', '0003']);
+    } finally { await raw.close(); }
+  });
+  it('SA4 section 4: marker-write failure is an UNPROVEN-DIRTY hard stop - no false DIRTY claim, ALL failures + attempt evidence retained', async () => {
+    const { raw, db } = await newDb();
+    try {
+      await seedClean(db);
+      const pf = await issueOperatorPreflight(db, { deployment: STAGING });
+      // break EVERY evidence insert AND every target_state write: the abort's
+      // invalidation event fails AND the DIRTY marker cannot be persisted.
+      await db.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected evidence-write failure'; END; $$`);
+      await db.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected marker-write failure'; END; $$`);
+      await db.query(`CREATE TRIGGER __sa4_fail_evidence BEFORE INSERT ON public.schema_migration_evidence FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_evidence()`);
+      await db.query(`CREATE TRIGGER __sa4_fail_state BEFORE INSERT OR UPDATE ON public.schema_migration_target_state FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_state()`);
+      let err: unknown;
+      try {
+        await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) });
+      } catch (e) { err = e; }
+      const msg = String((err as Error).message);
+      expect(msg).toContain('UNPROVEN-DIRTY hard stop');
+      expect(msg).toContain('no dirty state is claimed');
+      // ALL failures retained: original, invalidation, marker - and the
+      // attempt-evidence write failure reported honestly (never swallowed).
+      expect(msg).toContain('original failure:');
+      expect(msg).toContain('invalidation/restore failure:');
+      expect(msg).toContain('marker failure:');
+      expect(msg).toContain('injected marker-write failure');
+      expect(msg).toContain('attempt evidence write ALSO failed');
+      // NO durable marker was written (persistence unproven): the target is
+      // NOT silently recorded dirty.
+      const ts = await db.query(`SELECT dirty FROM public.schema_migration_target_state`);
+      expect(ts.rows.length === 0 || ts.rows[0]!['dirty'] !== true).toBe(true);
+      // attended recovery: operator repairs the target out of band (drops the
+      // sabotage); with no durable marker there is nothing to resolve, so the
+      // operator re-issues and re-runs normally.
+      await db.query(`DROP TRIGGER __sa4_fail_evidence ON public.schema_migration_evidence`);
+      await db.query(`DROP TRIGGER __sa4_fail_state ON public.schema_migration_target_state`);
+      await db.query(`DROP FUNCTION public.__sa4_fail_evidence()`);
+      await db.query(`DROP FUNCTION public.__sa4_fail_state()`);
+      const pf2 = await issueOperatorPreflight(db, { deployment: STAGING });
+      const result = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf2) });
+      expect(result.appliedNow).toEqual(['0002', '0003']);
     } finally { await raw.close(); }
   });
   it('SA3 section 3: NO caller label relaxes the gate - deployment test/test-harness are refused without an issued ack exactly like staging', async () => {

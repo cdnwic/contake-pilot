@@ -158,7 +158,13 @@ const MUTATIONS: readonly MemberMutation[] = [
 ];
 
 const srcOnly = process.env['REPO_IMPL'] === 'pglite' || process.env['REPO_IMPL'] === 'realpg' ? describe.skip : describe;
-srcOnly('SA3 constructive source-member tamper matrix', () => {
+/** SA4: with SA4_MATRIX_VIA_DIST=1 each in-place source mutation is followed
+ *  by a full package build and the child loads the BUILT artifact
+ *  (dist/migrations/runner.js) - proving digest recomputation flows through
+ *  the shipped dist entrypoint, not only the source module. Heavy (a build
+ *  per member); run once in full qualification, not in lane sweeps. */
+const VIA_DIST = process.env['SA4_MATRIX_VIA_DIST'] === '1';
+srcOnly(`SA3 constructive source-member tamper matrix${VIA_DIST ? ' (SA4: through the BUILT artifact)' : ''}`, () => {
   it('EVERY manifest member: real-location source mutation flips its member hash AND REGISTRY_DIGEST through the real code path', async () => {
     // the pinned inventory is the matrix coverage: one mutation per member.
     expect(MUTATIONS.map(m => m.member).sort()).toEqual([...EXPECTED_INVENTORY].sort());
@@ -171,7 +177,15 @@ srcOnly('SA3 constructive source-member tamper matrix', () => {
       const mutated = original.replace(mut.find, mut.replace);
       writeFileSync(file, mutated);
       try {
-        const { stdout } = await execFileP('npx', ['tsx', CHILD], { cwd: API_ROOT, maxBuffer: 8 * 1024 * 1024, timeout: 120_000 });
+        if (VIA_DIST) {
+          // SA4: recompute through the built artifact - rebuild dist from the
+          // mutated source, then the child loads dist/migrations/runner.js.
+          await execFileP('npx', ['tsc'], { cwd: API_ROOT, maxBuffer: 8 * 1024 * 1024, timeout: 300_000 });
+        }
+        const { stdout } = await execFileP('npx', ['tsx', CHILD], {
+          cwd: API_ROOT, maxBuffer: 8 * 1024 * 1024, timeout: 120_000,
+          env: { ...process.env, ...(VIA_DIST ? { SA3_MATRIX_MODULE: '../../dist/migrations/runner.js' } : {}) },
+        });
         const child = JSON.parse(stdout.trim().split('\n').pop()!) as { digest: string; members: Record<string, string>; guardSql: string };
         const memberId = mut.member.slice(mut.member.indexOf(':') + 1);
         expect(child.digest, `digest did not flip for ${mut.member}`).not.toBe(REGISTRY_DIGEST);
@@ -182,7 +196,11 @@ srcOnly('SA3 constructive source-member tamper matrix', () => {
         }
       } finally {
         writeFileSync(file, original); // restore the real source unconditionally
+        if (VIA_DIST) {
+          // restore the shipped artifact to the pristine source as well.
+          await execFileP('npx', ['tsc'], { cwd: API_ROOT, maxBuffer: 8 * 1024 * 1024, timeout: 300_000 });
+        }
       }
     }
-  }, 600_000);
+  }, VIA_DIST ? 1_800_000 : 600_000);
 });

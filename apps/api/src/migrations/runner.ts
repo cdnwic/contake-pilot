@@ -588,6 +588,60 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_target_state(
 )`;
 
 
+/** SA4 section 4: DURABLE-DIRTY claim discipline. The runner must NEVER
+ *  claim or presume the DIRTY marker persisted. A 'marked DIRTY' claim is
+ *  legal ONLY after VERIFIED persistence: the marker write is committed and
+ *  read back (dirty = true for this target) inside ONE transactional unit.
+ *  If the write or the read-back fails, the outcome is an UNPROVEN-DIRTY
+ *  hard stop: the error states the marker is NOT durably recorded, retains
+ *  the original failure + the failure that triggered marking + the marker
+ *  failure, records a best-effort 'unproven-dirty' attempt event (whose own
+ *  failure is reported, never swallowed), and hard-stops the process so the
+ *  target blocks further ack/apply pending ATTENDED recovery. */
+async function markTargetDirtyVerified(
+  client: Queryable,
+  ctx: { groupVersion: string; nonce?: string; originalFailure: string; triggerFailure: string; triggerLabel: 'invalidationFailure' | 'restoreFailure' },
+): Promise<void> {
+  const dirtyReason = JSON.stringify({ originalFailure: ctx.originalFailure, [ctx.triggerLabel]: ctx.triggerFailure, nonce: ctx.nonce });
+  let markerFailure: string;
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO public.schema_migration_target_state(target, dirty, dirty_reason, updated_at) VALUES(pg_catalog.current_database(), true, $1::jsonb, now()) ON CONFLICT (target) DO UPDATE SET dirty = true, dirty_reason = $1::jsonb, updated_at = now()`,
+      [dirtyReason],
+    );
+    // SA4: the claim requires PROOF - read the marker back inside the same
+    // transactional unit before committing.
+    const rb = await client.query(`SELECT dirty FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database()`);
+    if (rb.rows.length !== 1 || rb.rows[0]!['dirty'] !== true) {
+      throw new Error(`marker read-back verification failed (rows=${String(rb.rows.length)}, dirty=${String(rb.rows[0]?.['dirty'])})`);
+    }
+    await client.query('COMMIT');
+    return; // marker durably recorded AND verified
+  } catch (mErr) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    markerFailure = mErr instanceof Error ? mErr.message : String(mErr);
+  }
+  // UNPROVEN-DIRTY: retain best-effort attempt evidence; its own failure is
+  // reported in the hard-stop error, never swallowed.
+  let evidenceState: string;
+  try {
+    await client.query(
+      `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, $2, 'unproven-dirty', $3::jsonb, 'unproven-dirty', pg_catalog.current_database())`,
+      [randomBytes(16).toString('hex'), ctx.groupVersion, JSON.stringify({ nonce: ctx.nonce, originalFailure: ctx.originalFailure, [ctx.triggerLabel]: ctx.triggerFailure, markerFailure })],
+    );
+    evidenceState = "attempt evidence recorded as an 'unproven-dirty' append-only event";
+  } catch (evErr) {
+    evidenceState = `attempt evidence write ALSO failed: ${evErr instanceof Error ? evErr.message : String(evErr)}`;
+  }
+  throw new Error(
+    `release-migrations: UNPROVEN-DIRTY hard stop - the DIRTY marker could NOT be durably recorded and verified; ` +
+    `no dirty state is claimed. The target BLOCKS further ack issuance and migration runs pending ATTENDED recovery ` +
+    `(operator must inspect the target's actual state out-of-band before any retry). ` +
+    `original failure: ${ctx.originalFailure} | invalidation/restore failure: ${ctx.triggerFailure} | marker failure: ${markerFailure} | ${evidenceState} (fail-closed)`,
+  );
+}
+
 const buildBlueprintManifest = (): readonly BlueprintManifestEntry[] => {
   const entries: BlueprintManifestEntry[] = [];
   entries.push({ role: 'frozen-baseline', id: '0001-baseline', contentHash: manifestMemberHash('frozen-baseline', '0001-baseline', BASELINE_0001_STATEMENTS) });
@@ -1595,14 +1649,24 @@ export async function runMigrations(
           // step's aftermath unprovable - DIRTY/INDETERMINATE hard failure
           // retaining BOTH error records (original + restore).
           for (const captured of sequenceCaptures) {
+            let restoreFailure: string | undefined;
             const restored = await restoreSequenceValues(client, captured).catch((re) => {
+              restoreFailure = re instanceof Error ? re.message : String(re);
+              return undefined as unknown as string[];
+            });
+            if (restoreFailure !== undefined) {
               const original = e instanceof Error ? e.message : String(e);
-              const restoreErr = re instanceof Error ? re.message : String(re);
+              // SA4 section 4: the aftermath is unprovable - durably mark +
+              // VERIFY the marker before claiming DIRTY; marker failure is an
+              // UNPROVEN-DIRTY hard stop retaining all three failures.
+              await markTargetDirtyVerified(client, { groupVersion: group[0]!.version, nonce: ackNonceToInvalidate, originalFailure: original, triggerFailure: restoreFailure, triggerLabel: 'restoreFailure' });
               throw new Error(
                 `release-migrations: DIRTY/INDETERMINATE step group - sequence restoration could not be proven; ` +
-                `the database may hold non-transactional drift. original failure: ${original} | restore failure: ${restoreErr} (fail-closed)`,
+                `the database may hold non-transactional drift. The DIRTY marker was durably recorded and verified; ` +
+                `the target blocks all further preflight issuance and migration runs until attended resolution ` +
+                `(attendedResolveDirty). original failure: ${original} | restore failure: ${restoreFailure} (fail-closed)`,
               );
-            });
+            }
             if (restored.length > 0 && e instanceof Error) {
               e.message += ` [non-transactional sequence state actively restored: ${restored.join(', ')}]`;
             }
@@ -1639,18 +1703,14 @@ export async function runMigrations(
               );
             } catch (invErr) {
               const invalidationFailure = invErr instanceof Error ? invErr.message : String(invErr);
-              const dirtyReason = JSON.stringify({ originalFailure, invalidationFailure });
-              // Best-effort dirty MARKER on the singleton state row (the
-              // evidence trail itself may be the failed writer). This is a
-              // state marker, not an append-only event - the loud upsert
-              // never drops an event.
-              await client.query(
-                `INSERT INTO public.schema_migration_target_state(target, dirty, dirty_reason, updated_at) VALUES(pg_catalog.current_database(), true, $1::jsonb, now()) ON CONFLICT (target) DO UPDATE SET dirty = true, dirty_reason = $1::jsonb, updated_at = now()`,
-                [dirtyReason],
-              ).catch(() => undefined);
+              // SA4 section 4: durably mark + VERIFY the marker before
+              // claiming DIRTY (a swallowed marker write was B3); marker
+              // failure is an UNPROVEN-DIRTY hard stop retaining all three
+              // failures and the attempt evidence.
+              await markTargetDirtyVerified(client, { groupVersion: group[0]!.version, nonce: ackNonceToInvalidate, originalFailure, triggerFailure: invalidationFailure, triggerLabel: 'invalidationFailure' });
               throw new Error(
                 `release-migrations: DIRTY/INDETERMINATE - the abort's ack invalidation could not be persisted; the target is ` +
-                `marked DIRTY and blocks all further preflight issuance and migration runs until attended resolution ` +
+                `marked DIRTY (marker durably recorded and verified) and blocks all further preflight issuance and migration runs until attended resolution ` +
                 `(attendedResolveDirty). original failure: ${originalFailure} | invalidation failure: ${invalidationFailure} (fail-closed)`,
               );
             }
