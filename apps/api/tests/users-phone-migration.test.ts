@@ -248,7 +248,7 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       expect(ev.rows.map(x => x['version'])).toEqual(['0002', '0003']);
       expect(ev.rows[0]!['list_digest']).toMatch(/^[0-9a-f]{64}$/);
       const kinds = await db.query(`SELECT kind FROM public.schema_migration_evidence ORDER BY seq`);
-      expect(kinds.rows.map(x => x['kind'])).toEqual(['runner-bootstrap', 'ack-issued', 'ack-consumed', 'attended-tofu', 'attended-tofu']);
+      expect(kinds.rows.map(x => x['kind'])).toEqual(['runner-bootstrap', 'target-provisioned', 'ack-issued', 'ack-consumed', 'attended-tofu', 'attended-tofu']);
       // every event carries a UNIQUE event_id (append-only identity).
       const ids = await db.query(`SELECT event_id FROM public.schema_migration_evidence`);
       expect(new Set(ids.rows.map(x => String(x['event_id']))).size).toBe(ids.rows.length);
@@ -273,6 +273,7 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
   it('cross-target ack refuses: issued for another deployment matches nothing here', async () => {
     const { raw, db } = await newDb();
     try {
+      await issueOperatorPreflight(db, { deployment: STAGING }); // provisions this target under staging first
       const pfOther = await issueOperatorPreflight(db, { deployment: 'production' });
       await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pfOther) })).rejects.toThrow(/CROSS-TARGET/);
     } finally { await raw.close(); }
@@ -626,6 +627,7 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
     const { raw, db } = await newDb();
     try {
       await seedClean(db);
+      await issueOperatorPreflight(db, { deployment: STAGING }); // provisions the ELIGIBLE record
       await expect(attendedResolveDirty(db, { note: 'spurious resolution attempt', resolvedBy: 'test-operator' }))
         .rejects.toThrow(/ELIGIBLE \(not DIRTY or IN-FLIGHT; nothing to resolve\)/);
     } finally { await raw.close(); }

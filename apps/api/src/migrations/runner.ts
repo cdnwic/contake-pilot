@@ -1250,13 +1250,6 @@ async function ensureRunnerBookkeeping(client: Queryable): Promise<void> {
   for (const ddl of [RUNNER_DDL, RUNNER_EVIDENCE_DDL, RUNNER_ACK_DDL, RUNNER_TARGET_STATE_DDL]) {
     for (const stmt of ddl.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
   }
-  // SA4-C3: provision the per-target eligibility row (keyed by the verified
-  // target identity - the current_database() of the tuple-checked connection).
-  // ON CONFLICT DO NOTHING: an existing row (ELIGIBLE, IN-FLIGHT or DIRTY) is
-  // authoritative and NEVER reset by provisioning.
-  await client.query(
-    `INSERT INTO public.schema_migration_target_state(target) VALUES(pg_catalog.current_database()) ON CONFLICT (target) DO NOTHING`,
-  );
   if (!evBefore.rows[0]?.['r']) {
     // The evidence table's own bootstrap creation is recorded once
     // (post-creation self-record). Check-then-insert under the session
@@ -1331,6 +1324,44 @@ async function consumeTargetEligibility(client: Queryable, flight: { nonce?: str
   throw new Error('release-migrations: TARGET STATE refusal - admission consume transitioned zero rows (fail-closed)');
 }
 
+/** First-ever ELIGIBLE provisioning is ATTENDED and TOFU-BOUND: it happens
+ *  only inside the operator-invoked issuance/run paths, is recorded as a
+ *  unique append-only 'target-provisioned' evidence event carrying the
+ *  deployment label, and binds the row to that deployment. ON CONFLICT DO
+ *  NOTHING: an existing row (ELIGIBLE, IN-FLIGHT or DIRTY) is authoritative
+ *  and NEVER reset by provisioning. On a first-run (pre-identity-stamp)
+ *  target, a row provisioned under a DIFFERENT deployment label refuses -
+ *  provisioning cannot smuggle a second deployment onto a target. */
+async function provisionTargetEligibility(
+  client: Queryable,
+  ctx: { by: 'issueOperatorPreflight' | 'runMigrations'; deployment: string; firstRun?: boolean },
+): Promise<void> {
+  const ins = await client.query(
+    `INSERT INTO public.schema_migration_target_state(target, dirty_reason) VALUES(pg_catalog.current_database(), $1::jsonb) ON CONFLICT (target) DO NOTHING RETURNING target`,
+    [JSON.stringify({ provisioned: { deployment: ctx.deployment, by: ctx.by } })],
+  );
+  if (ins.rows.length === 1) {
+    await client.query(
+      `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, '0000', 'target-provisioned', $2::jsonb, 'target-provisioned', pg_catalog.current_database())`,
+      [randomBytes(16).toString('hex'), JSON.stringify({ deployment: ctx.deployment, by: ctx.by, eligible: true })],
+    );
+    return;
+  }
+  if (ctx.firstRun === true) {
+    // TOFU binding: a pre-existing row on a not-yet-stamped target must have
+    // been provisioned under THIS deployment label.
+    const d = await client.query(`SELECT dirty_reason FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database()`);
+    const prov = d.rows[0]?.['dirty_reason'] as { provisioned?: { deployment?: string } } | undefined;
+    if (prov?.provisioned?.deployment !== undefined && prov.provisioned.deployment !== ctx.deployment) {
+      throw new Error(
+        `release-migrations: PROVISIONING BINDING refusal - this not-yet-stamped target holds an eligibility record provisioned ` +
+        `under deployment '${prov.provisioned.deployment}' but this run claims '${ctx.deployment}' - refusing the first governed ` +
+        `run (fail-closed)`,
+      );
+    }
+  }
+}
+
 /** Clean-completion restore (SA4-C3 condition b): ONLY ever executed inside
  *  the final group transaction, atomically with the last apply and the ack
  *  consumption. No other exit writes ELIGIBLE (condition e). */
@@ -1363,6 +1394,7 @@ export async function issueOperatorPreflight(
         // pre-write guarantee runMigrations enforces).
         await verifyTargetPreconditions(client, { deployment: opts.deployment, expectInstanceId: opts.expectInstanceId, expectRegistryDigest: opts.expectRegistryDigest });
         await ensureRunnerBookkeeping(client);
+        await provisionTargetEligibility(client, { by: 'issueOperatorPreflight', deployment: opts.deployment });
         await assertTargetEligibleForIssuance(client);
         const pf = await computeUsersPhonePreflight(client, { deployment: opts.deployment, migrations: opts.migrations });
         await client.query(
@@ -1513,6 +1545,10 @@ export async function runMigrations(
         // well (the CLI also checks read-only before calling): any refusal
         // here still precedes every step write and rolls back.
         const pre = await verifyTargetPreconditions(client, { deployment: opts.deployment, expectInstanceId: opts.expectInstanceId, expectRegistryDigest: opts.expectRegistryDigest });
+        // SA4-C3: attended, TOFU-bound first provisioning (records the
+        // 'target-provisioned' event; a foreign-deployment row refuses the
+        // first governed run).
+        await provisionTargetEligibility(client, { by: 'runMigrations', deployment: opts.deployment, firstRun: pre.firstRun });
         // SA4-C3: ADMISSION. Read-only checks first; the eligibility consume
         // is the FIRST mutation decision and precedes every remaining write.
         // A pure verification run (nothing pending) never consumes.
