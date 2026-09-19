@@ -336,6 +336,9 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       await runMigrations(db, { deployment: STAGING, operatorAck: ack });
       await expect(runMigrations(db, { deployment: STAGING, migrations: [...MIGRATIONS, late], operatorAck: 'ack:' + '0'.repeat(16) + ':' + '0'.repeat(64) }))
         .rejects.toThrow('OPERATOR GATE refusal');
+      // SA4-C3: the refusal left the target IN-FLIGHT (eligibility consumed at
+      // admission; no exit restores it) - attended recovery before re-issuance.
+      await attendedResolveDirty(db, { note: 'operator reviewed the refused run', resolvedBy: 'test-operator' });
       const pfNow = await issueOperatorPreflight(db, { deployment: STAGING, migrations: [...MIGRATIONS, late] });
       const ok = await runMigrations(db, { deployment: STAGING, migrations: [...MIGRATIONS, late], operatorAck: operatorAckFor(pfNow) });
       expect(ok.appliedNow).toEqual(['0004']);
@@ -352,6 +355,8 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
         collisionGroups: pf.collisionGroups, crossRepresentationInconsistencies: pf.crossRepresentationInconsistencies, blankPhoneUsers: pf.blankPhoneUsers,
       });
       await expect(runMigrations(db, { deployment: STAGING, operatorAck: `ack:${pf.nonce}:${tamperedPlan('0002')}` })).rejects.toThrow('OPERATOR GATE refusal');
+      // SA4-C3: each refusal leaves the target IN-FLIGHT - attended recovery between presentations.
+      await attendedResolveDirty(db, { note: 'operator reviewed the refused run', resolvedBy: 'test-operator' });
       await expect(runMigrations(db, { deployment: STAGING, operatorAck: `ack:${pf.nonce}:${tamperedPlan('0003')}` })).rejects.toThrow('OPERATOR GATE refusal');
     } finally { await raw.close(); }
   });
@@ -384,9 +389,16 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       const inv = await db.query(`SELECT event_id, kind, report->>'nonce' AS nonce FROM public.schema_migration_evidence WHERE kind = 'ack-invalidated'`);
       expect(inv.rows.length).toBe(1);
       expect(inv.rows[0]!['nonce']).toBe(pf.nonce);
-      // REPLAY of the exact same ack (same plan, unchanged state): digest and
-      // plan still match, but the lifecycle state refuses it (loud conflict).
+      // SA4-C3: the abort left the target IN-FLIGHT - the replay is refused at
+      // ADMISSION (eligibility was consumed; no exit restores it) before the
+      // gate even runs.
+      await expect(runMigrations(db, { deployment: STAGING, migrations: plan, operatorAck: ack })).rejects.toThrow(/IN-FLIGHT TARGET refusal/);
+      // Attended recovery, THEN the same ack reaches the gate and dies on its
+      // lifecycle state (loud conflict, never a silent no-op).
+      await attendedResolveDirty(db, { note: 'operator reviewed the abort', resolvedBy: 'test-operator' });
       await expect(runMigrations(db, { deployment: STAGING, migrations: plan, operatorAck: ack })).rejects.toThrow(/ACK LIFECYCLE/);
+      // That refusal itself left the target IN-FLIGHT again.
+      await attendedResolveDirty(db, { note: 'operator reviewed the replay refusal', resolvedBy: 'test-operator' });
       const pf2 = await issueOperatorPreflight(db, { deployment: STAGING });
       expect(operatorAckFor(pf2)).not.toBe(ack);
       const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf2) });
@@ -400,6 +412,9 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       await db.query(`INSERT INTO public.users(user_id, phone, data) VALUES ('u3', ' +15550100001 ', '{}')`); // collision pair -> guard aborts both runs
       const pf1 = await issueOperatorPreflight(db, { deployment: STAGING });
       await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf1) })).rejects.toThrow(/ASSERTION refusal/);
+      // SA4-C3: the first abort left the target IN-FLIGHT - attended recovery
+      // (recorded, fresh TOFU cycle) before the second run can be admitted.
+      await attendedResolveDirty(db, { note: 'operator reviewed abort one', resolvedBy: 'test-operator' });
       const pf2 = await issueOperatorPreflight(db, { deployment: STAGING });
       await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf2) })).rejects.toThrow(/ASSERTION refusal/);
       const inv = await db.query(`SELECT event_id, report->>'nonce' AS nonce FROM public.schema_migration_evidence WHERE kind = 'ack-invalidated' ORDER BY seq`);
@@ -407,7 +422,9 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       expect(inv.rows.map(x => x['nonce'])).toEqual([pf1.nonce, pf2.nonce]);
       expect(inv.rows[0]!['event_id']).not.toBe(inv.rows[1]!['event_id']);
       // both acks are dead: neither replays (Q2's reuse path is closed).
+      await attendedResolveDirty(db, { note: 'operator reviewed abort two', resolvedBy: 'test-operator' });
       await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf1) })).rejects.toThrow(/ACK LIFECYCLE/);
+      await attendedResolveDirty(db, { note: 'operator reviewed replay one', resolvedBy: 'test-operator' });
       await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf2) })).rejects.toThrow(/ACK LIFECYCLE/);
     } finally { await raw.close(); }
   });
@@ -465,15 +482,16 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       expect(r.appliedNow).toEqual(['0002', '0003']);
     } finally { await raw.close(); }
   });
-  it('SA4 section 4: marker-write failure is an UNPROVEN-DIRTY hard stop - no false DIRTY claim, ALL failures + attempt evidence retained', async () => {
+  it('SA4 section 4 + SA4-C3: marker-write failure is an UNPROVEN-DIRTY hard stop - and the target stays STRUCTURALLY blocked (IN-FLIGHT) across restart', async () => {
     const { raw, db } = await newDb();
     try {
       await seedClean(db);
       const pf = await issueOperatorPreflight(db, { deployment: STAGING });
-      // break EVERY evidence insert AND every target_state write: the abort's
-      // invalidation event fails AND the DIRTY marker cannot be persisted.
+      // break EVERY evidence insert AND every DIRTY-marker write (the marker
+      // sets dirty=true); the admission consume (eligible=false, dirty stays
+      // false) must NOT be blocked - the run enters the risky window.
       await db.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected evidence-write failure'; END; $$`);
-      await db.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected marker-write failure'; END; $$`);
+      await db.query(`CREATE OR REPLACE FUNCTION public.__sa4_fail_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.dirty = true THEN RAISE EXCEPTION 'injected marker-write failure'; END IF; RETURN NEW; END; $$`);
       await db.query(`CREATE TRIGGER __sa4_fail_evidence BEFORE INSERT ON public.schema_migration_evidence FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_evidence()`);
       await db.query(`CREATE TRIGGER __sa4_fail_state BEFORE INSERT OR UPDATE ON public.schema_migration_target_state FOR EACH ROW EXECUTE FUNCTION public.__sa4_fail_state()`);
       let err: unknown;
@@ -490,20 +508,126 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       expect(msg).toContain('marker failure:');
       expect(msg).toContain('injected marker-write failure');
       expect(msg).toContain('attempt evidence write ALSO failed');
-      // NO durable marker was written (persistence unproven): the target is
-      // NOT silently recorded dirty.
-      const ts = await db.query(`SELECT dirty FROM public.schema_migration_target_state`);
-      expect(ts.rows.length === 0 || ts.rows[0]!['dirty'] !== true).toBe(true);
+      // NO durable dirty marker - but the admission-consumed IN-FLIGHT record
+      // IS durable and STRUCTURALLY blocks (SA4-C3): a restart (fresh
+      // connection here) denies BOTH issuance and apply without any
+      // failure-path write having succeeded.
+      const ts = await db.query(`SELECT eligible, dirty, in_flight FROM public.schema_migration_target_state`);
+      expect(ts.rows.length).toBe(1);
+      expect(ts.rows[0]!['dirty']).not.toBe(true);
+      expect(ts.rows[0]!['eligible']).toBe(false);
+      await expect(issueOperatorPreflight(db, { deployment: STAGING })).rejects.toThrow(/IN-FLIGHT TARGET refusal/);
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) })).rejects.toThrow(/IN-FLIGHT TARGET refusal/);
       // attended recovery: operator repairs the target out of band (drops the
-      // sabotage); with no durable marker there is nothing to resolve, so the
-      // operator re-issues and re-runs normally.
+      // sabotage); recovery is RECORDED and INVALIDATES the outstanding
+      // 'issued' ack (the rolled-back safety unit left it live).
       await db.query(`DROP TRIGGER __sa4_fail_evidence ON public.schema_migration_evidence`);
       await db.query(`DROP TRIGGER __sa4_fail_state ON public.schema_migration_target_state`);
       await db.query(`DROP FUNCTION public.__sa4_fail_evidence()`);
       await db.query(`DROP FUNCTION public.__sa4_fail_state()`);
+      await attendedResolveDirty(db, { note: 'operator inspected the target out-of-band; writers repaired', resolvedBy: 'test-operator' });
+      const ackState = await db.query(`SELECT state FROM public.schema_migration_acks WHERE nonce = $1`, [pf.nonce]);
+      expect(ackState.rows[0]!['state']).toBe('invalidated');
+      const resolved = await db.query(`SELECT report FROM public.schema_migration_evidence WHERE kind = 'dirty-resolved'`);
+      expect(resolved.rows.length).toBe(1);
+      expect(JSON.stringify(resolved.rows[0]!['report'])).toContain(pf.nonce);
+      expect(JSON.stringify(resolved.rows[0]!['report'])).toContain('IN-FLIGHT');
+      // the first post-recovery cycle is a FRESH attended TOFU: the recovered
+      // target runs green with a newly issued ack.
       const pf2 = await issueOperatorPreflight(db, { deployment: STAGING });
       const result = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf2) });
       expect(result.appliedNow).toEqual(['0002', '0003']);
+    } finally { await raw.close(); }
+  });
+  it('SA4-C3 security: killing the ADMISSION consume means the run never starts - no durable block, retry works', async () => {
+    const { raw, db } = await newDb();
+    try {
+      await seedClean(db);
+      const pf = await issueOperatorPreflight(db, { deployment: STAGING });
+      // sabotage EVERY target_state write: the admission consume itself dies.
+      await db.query(`CREATE OR REPLACE FUNCTION public.__c3_kill_consume() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected admission-write failure'; END; $$`);
+      await db.query(`CREATE TRIGGER __c3_kill_consume BEFORE INSERT OR UPDATE ON public.schema_migration_target_state FOR EACH ROW EXECUTE FUNCTION public.__c3_kill_consume()`);
+      let err: unknown;
+      try { await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) }); } catch (e) { err = e; }
+      expect(String((err as Error).message)).toContain('injected admission-write failure');
+      // the run never started: nothing past 0001, the ack was NOT consumed,
+      // and the eligibility row is UNCHANGED (the consume rolled back) - the
+      // target is NOT durably blocked by a failed admission.
+      const applied = await db.query(`SELECT version FROM public.schema_migrations ORDER BY seq`);
+      expect(applied.rows.map(x => x['version'])).toEqual([]);
+      const ackState = await db.query(`SELECT state FROM public.schema_migration_acks WHERE nonce = $1`, [pf.nonce]);
+      expect(ackState.rows[0]!['state']).toBe('issued');
+      const ts = await db.query(`SELECT eligible FROM public.schema_migration_target_state`);
+      expect(ts.rows[0]!['eligible']).toBe(true);
+      // operator repairs; the SAME issued ack then runs green.
+      await db.query(`DROP TRIGGER __c3_kill_consume ON public.schema_migration_target_state`);
+      await db.query(`DROP FUNCTION public.__c3_kill_consume()`);
+      const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) });
+      expect(r.appliedNow).toEqual(['0001', '0002', '0003']);
+    } finally { await raw.close(); }
+  });
+  it('SA4-C3 security: killing the clean-completion RESTORE leaves the target IN-FLIGHT (safe direction); ack invalidated; recovery + fresh TOFU unblocks', async () => {
+    const { raw, db } = await newDb();
+    try {
+      await seedClean(db);
+      const pf = await issueOperatorPreflight(db, { deployment: STAGING });
+      // the restore (eligible=false -> true) dies; the consume passes.
+      await db.query(`CREATE OR REPLACE FUNCTION public.__c3_kill_restore() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.eligible = true THEN RAISE EXCEPTION 'injected restore-write failure'; END IF; RETURN NEW; END; $$`);
+      await db.query(`CREATE TRIGGER __c3_kill_restore BEFORE UPDATE ON public.schema_migration_target_state FOR EACH ROW EXECUTE FUNCTION public.__c3_kill_restore()`);
+      let err: unknown;
+      try { await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) }); } catch (e) { err = e; }
+      const msg = String((err as Error).message);
+      expect(msg).toContain('injected restore-write failure');
+      expect(msg).toContain('target remains IN-FLIGHT');
+      // the whole group rolled back: nothing past 0001; the ack was
+      // invalidated by the unified path; the target stays IN-FLIGHT.
+      const applied = await db.query(`SELECT version FROM public.schema_migrations ORDER BY seq`);
+      expect(applied.rows.map(x => x['version'])).toEqual(['0001']);
+      const ackState = await db.query(`SELECT state FROM public.schema_migration_acks WHERE nonce = $1`, [pf.nonce]);
+      expect(ackState.rows[0]!['state']).toBe('invalidated');
+      const inv = await db.query(`SELECT report FROM public.schema_migration_evidence WHERE kind = 'ack-invalidated'`);
+      expect(inv.rows.length).toBe(1);
+      expect(JSON.stringify(inv.rows[0]!['report'])).toContain('eligibilityRestoreAttempted');
+      const ts = await db.query(`SELECT eligible, dirty FROM public.schema_migration_target_state`);
+      expect(ts.rows[0]!['eligible']).toBe(false);
+      expect(ts.rows[0]!['dirty']).toBe(false);
+      await expect(issueOperatorPreflight(db, { deployment: STAGING })).rejects.toThrow(/IN-FLIGHT TARGET refusal/);
+      // operator repairs + attended recovery + fresh TOFU cycle.
+      await db.query(`DROP TRIGGER __c3_kill_restore ON public.schema_migration_target_state`);
+      await db.query(`DROP FUNCTION public.__c3_kill_restore()`);
+      await attendedResolveDirty(db, { note: 'operator reviewed the restore failure', resolvedBy: 'test-operator' });
+      const pf2 = await issueOperatorPreflight(db, { deployment: STAGING });
+      const r = await runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf2) });
+      expect(r.appliedNow).toEqual(['0002', '0003']);
+    } finally { await raw.close(); }
+  });
+  it('SA4-C3 security: expiry NEVER grants - an ancient IN-FLIGHT record still denies issuance and apply (staleness is only a tripwire)', async () => {
+    const { raw, db } = await newDb();
+    try {
+      await seedClean(db);
+      const pf = await issueOperatorPreflight(db, { deployment: STAGING });
+      // leave the target IN-FLIGHT via a post-admission refusal...
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: 'ack:' + '0'.repeat(16) + ':' + '0'.repeat(64) }))
+        .rejects.toThrow('OPERATOR GATE refusal');
+      // ...then age the record 45 days: no TTL path may restore eligibility.
+      await db.query(`UPDATE public.schema_migration_target_state SET updated_at = now() - interval '45 days'`);
+      let issueErr: unknown;
+      try { await issueOperatorPreflight(db, { deployment: STAGING }); } catch (e) { issueErr = e; }
+      expect(String((issueErr as Error).message)).toMatch(/IN-FLIGHT TARGET refusal/);
+      expect(String((issueErr as Error).message)).toContain('stuck for');
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) })).rejects.toThrow(/IN-FLIGHT TARGET refusal/);
+      // attended recovery is the only way back; recovery invalidated the
+      // outstanding issued ack, so presenting it now dies at the gate.
+      await attendedResolveDirty(db, { note: 'operator reviewed the stuck target', resolvedBy: 'test-operator' });
+      await expect(runMigrations(db, { deployment: STAGING, operatorAck: operatorAckFor(pf) })).rejects.toThrow(/ACK LIFECYCLE|POST-RECOVERY/);
+    } finally { await raw.close(); }
+  });
+  it('SA4-C3: attended recovery refuses an ELIGIBLE target (nothing to resolve)', async () => {
+    const { raw, db } = await newDb();
+    try {
+      await seedClean(db);
+      await expect(attendedResolveDirty(db, { note: 'spurious resolution attempt', resolvedBy: 'test-operator' }))
+        .rejects.toThrow(/ELIGIBLE \(not DIRTY or IN-FLIGHT; nothing to resolve\)/);
     } finally { await raw.close(); }
   });
   it('SA3 section 3: NO caller label relaxes the gate - deployment test/test-harness are refused without an issued ack exactly like staging', async () => {
@@ -518,6 +642,8 @@ describe('SA2+SA3 operator gate (runner-enforced, issued-nonce lifecycle, recomp
       await expect(runMigrations(db2, { deployment: 'test-harness' })).rejects.toThrow('OPERATOR GATE refusal');
       const r2 = await db2.query(`SELECT version FROM public.schema_migrations ORDER BY seq`);
       expect(r2.rows.map(x => x['version'])).toEqual(['0001']);
+      // SA4-C3: the refusal left the target IN-FLIGHT - attended recovery first.
+      await attendedResolveDirty(db2, { note: 'operator reviewed the refusal', resolvedBy: 'test-operator' });
       // ...and with an ISSUED ack the synthetic lane runs green (real path).
       const pf = await issueOperatorPreflight(db2, { deployment: 'test-harness' });
       const r = await runMigrations(db2, { deployment: 'test-harness', operatorAck: operatorAckFor(pf) });

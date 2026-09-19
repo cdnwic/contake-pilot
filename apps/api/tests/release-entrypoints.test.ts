@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 const API_ROOT = path.resolve(__dirname, '..');
 const DIST_CLI = path.join(API_ROOT, 'dist', 'migrations', 'migrate-cli.js');
 const SRC_CLI = path.join(API_ROOT, 'src', 'migrations', 'migrate-cli.ts');
+const RUNNER = path.join(API_ROOT, 'src', 'migrations', 'runner.ts');
 
 const runDistCli = (args: string[], env: NodeJS.ProcessEnv = {}) =>
   spawnSync(process.execPath, [DIST_CLI, ...args], { encoding: 'utf8', timeout: 120_000, env: { ...process.env, ...env } });
@@ -150,5 +151,34 @@ describe('SA4 canonical BUILT entrypoint', () => {
     expect(doc).not.toContain('scripts/migrate.mts');
     expect(doc).not.toContain('users-phone-preflight.mts');
     expect(doc).not.toContain('tsx scripts');
+  });
+});
+
+/** SA4-C1 section 2 + SA4-C3 (e): EXIT-PATH ENUMERATION. Mirrors the
+ *  entrypoint enumeration: every post-admission exit must land in the ONE
+ *  unified safety path, and ELIGIBLE may be written by exactly TWO sites
+ *  (the clean-completion restore inside the final group transaction, and
+ *  attendedResolveDirty). Behavioral proof per exit lives in
+ *  users-phone-migration.test.ts (guard abort, evidence-writer failure,
+ *  marker failure, restore failure, consume kill, restore kill, replay,
+ *  expiry, recovery) and the realpg evidence. */
+describe('SA4-C3 exit-path enumeration (static)', () => {
+  it('exactly ONE unified post-abort safety path with exactly ONE call site', () => {
+    const src = readFileSync(RUNNER, 'utf8');
+    expect(src.split('async function unifiedPostAbortSafety').length - 1).toBe(1);
+    expect(src.split('await unifiedPostAbortSafety(').length - 1).toBe(1);
+    // the old split paths are gone: no direct markTargetDirtyVerified call
+    // outside the unified path.
+    expect(src.split('await markTargetDirtyVerified(').length - 1).toBe(1);
+  });
+  it('ELIGIBLE is written by exactly TWO sites (clean completion + attended recovery) - no exit restores early', () => {
+    const src = readFileSync(RUNNER, 'utf8');
+    expect(src.split('SET eligible = true').length - 1).toBe(2);
+    expect(src.split('eligible = false').length - 1).toBe(1); // the admission consume only
+  });
+  it('no expiry path grants eligibility: runner source contains no TTL-based restore', () => {
+    const src = readFileSync(RUNNER, 'utf8');
+    expect(src).not.toMatch(/eligible = true[^;]*interval/i);
+    expect(src).toContain('expiry NEVER grants');
   });
 });

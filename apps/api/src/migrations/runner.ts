@@ -582,11 +582,72 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_acks(
 const RUNNER_TARGET_STATE_DDL = `
 CREATE TABLE IF NOT EXISTS public.schema_migration_target_state(
   target text PRIMARY KEY,
+  eligible boolean NOT NULL DEFAULT true,
   dirty boolean NOT NULL DEFAULT false,
   dirty_reason jsonb,
+  in_flight jsonb,
+  recovered_at timestamptz,
   updated_at timestamptz NOT NULL DEFAULT now()
 )`;
 
+
+/** SA4-C1 section 2 + SA4-C3 (e): THE unified post-abort safety path - the
+ *  ONLY post-admission exit handler. Every pre-apply exit after ack
+ *  acceptance lands here (exactly one call site); NO exit writes ELIGIBLE -
+ *  the target stays IN-FLIGHT, the durable denial committed at admission.
+ *  Ordering: (1) the transactional safety unit - guarded ack invalidation +
+ *  the append-only ack-invalidated event in ONE transaction (any failure
+ *  aborts the unit: it consumes nothing); (2) if the unit fails OR the
+ *  sequence restore failed, the verified DIRTY marker (write + read-back in
+ *  one unit); (3) if the marker cannot be verified, markTargetDirtyVerified
+ *  throws the UNPROVEN-DIRTY hard stop - and the target stays structurally
+ *  blocked by the IN-FLIGHT record regardless. */
+async function unifiedPostAbortSafety(
+  client: Queryable,
+  ctx: { groupVersion: string; nonce?: string; originalFailure: string; restoreFailure?: string; eligibilityRestoreAttempted?: boolean },
+): Promise<void> {
+  if (ctx.nonce === undefined) {
+    // Pre-acceptance exit (gate/digest/pin refusal): the ack was never
+    // accepted, nothing to invalidate. The committed IN-FLIGHT record is the
+    // only state change; no per-exit writes (SA4-C3 condition e).
+    return;
+  }
+  let invalidationFailure: string | undefined;
+  try {
+    await client.query('BEGIN');
+    const inv = await client.query(
+      `UPDATE public.schema_migration_acks SET state = 'invalidated', transitioned_at = now() WHERE nonce = $1 AND state = 'issued'`,
+      [ctx.nonce],
+    );
+    if (inv.rowCount !== 1) {
+      throw new Error(`ack lifecycle conflict: invalidating nonce ${ctx.nonce} transitioned ${String(inv.rowCount)} rows (expected exactly 1 issued record)`);
+    }
+    await client.query(
+      `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, $2, 'ack-invalidated', $3::jsonb, 'invalidated', pg_catalog.current_database())`,
+      [randomBytes(16).toString('hex'), ctx.groupVersion, JSON.stringify({
+        nonce: ctx.nonce, reason: ctx.originalFailure,
+        ...(ctx.restoreFailure !== undefined ? { restoreFailure: ctx.restoreFailure } : {}),
+        ...(ctx.eligibilityRestoreAttempted === true ? { eligibilityRestoreAttempted: true } : {}),
+      })],
+    );
+    await client.query('COMMIT');
+  } catch (invErr) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    invalidationFailure = invErr instanceof Error ? invErr.message : String(invErr);
+  }
+  if (ctx.restoreFailure !== undefined || invalidationFailure !== undefined) {
+    await markTargetDirtyVerified(client, {
+      groupVersion: ctx.groupVersion, nonce: ctx.nonce, originalFailure: ctx.originalFailure,
+      triggerFailure: invalidationFailure ?? ctx.restoreFailure ?? '',
+      triggerLabel: invalidationFailure !== undefined ? 'invalidationFailure' : 'restoreFailure',
+    });
+    throw new Error(
+      `release-migrations: DIRTY/INDETERMINATE - ${invalidationFailure !== undefined ? "the abort's ack invalidation could not be persisted" : 'sequence restoration could not be proven; the database may hold non-transactional drift'}; the target is ` +
+      `marked DIRTY (marker durably recorded and verified) and blocks all further preflight issuance and migration runs until attended resolution ` +
+      `(attendedResolveDirty). original failure: ${ctx.originalFailure} | ${invalidationFailure !== undefined ? `invalidation failure: ${invalidationFailure}` : `restore failure: ${ctx.restoreFailure ?? ''}`} (fail-closed)`,
+    );
+  }
+}
 
 /** SA4 section 4: DURABLE-DIRTY claim discipline. The runner must NEVER
  *  claim or presume the DIRTY marker persisted. A 'marked DIRTY' claim is
@@ -636,8 +697,10 @@ async function markTargetDirtyVerified(
   }
   throw new Error(
     `release-migrations: UNPROVEN-DIRTY hard stop - the DIRTY marker could NOT be durably recorded and verified; ` +
-    `no dirty state is claimed. The target BLOCKS further ack issuance and migration runs pending ATTENDED recovery ` +
-    `(operator must inspect the target's actual state out-of-band before any retry). ` +
+    `no dirty state is claimed. The target remains STRUCTURALLY BLOCKED: eligibility was consumed at admission and the ` +
+    `committed IN-FLIGHT record denies every further ack issuance and migration run (restart-durable, independent of ` +
+    `any failure-path write) until ATTENDED recovery via attendedResolveDirty (operator must inspect the target's ` +
+    `actual state out-of-band before any retry). ` +
     `original failure: ${ctx.originalFailure} | invalidation/restore failure: ${ctx.triggerFailure} | marker failure: ${markerFailure} | ${evidenceState} (fail-closed)`,
   );
 }
@@ -1187,6 +1250,13 @@ async function ensureRunnerBookkeeping(client: Queryable): Promise<void> {
   for (const ddl of [RUNNER_DDL, RUNNER_EVIDENCE_DDL, RUNNER_ACK_DDL, RUNNER_TARGET_STATE_DDL]) {
     for (const stmt of ddl.split(';').map(s => s.trim()).filter(Boolean)) await client.query(stmt);
   }
+  // SA4-C3: provision the per-target eligibility row (keyed by the verified
+  // target identity - the current_database() of the tuple-checked connection).
+  // ON CONFLICT DO NOTHING: an existing row (ELIGIBLE, IN-FLIGHT or DIRTY) is
+  // authoritative and NEVER reset by provisioning.
+  await client.query(
+    `INSERT INTO public.schema_migration_target_state(target) VALUES(pg_catalog.current_database()) ON CONFLICT (target) DO NOTHING`,
+  );
   if (!evBefore.rows[0]?.['r']) {
     // The evidence table's own bootstrap creation is recorded once
     // (post-creation self-record). Check-then-insert under the session
@@ -1202,17 +1272,72 @@ async function ensureRunnerBookkeeping(client: Queryable): Promise<void> {
   }
 }
 
-/** SA3 section 5: a DIRTY/INDETERMINATE target blocks all ack issuance and
- *  all migration runs until attended resolution (attendedResolveDirty). */
-async function assertTargetNotDirty(client: Queryable): Promise<void> {
-  const d = await client.query(`SELECT dirty, dirty_reason FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database()`);
-  if (d.rows[0]?.['dirty'] === true) {
+/** SA4-C3: pre-committed eligibility protocol (the SA4 section 4 durable
+ *  block). The runner consumes the target's ELIGIBLE state to a durable
+ *  IN-FLIGHT marker at ADMISSION - committed BEFORE the risky window - so
+ *  NO failure-path write is ever safety-critical: every post-admission exit
+ *  (abort, refusal, crash, kill) leaves the committed IN-FLIGHT row, which
+ *  denies at both issuance and apply on any restart. Clean completion
+ *  restores ELIGIBLE inside the SAME transaction as the final apply/commit
+ *  and ack consumption; the ONLY other way back is attendedResolveDirty.
+ *  Absence and staleness deny; expiry NEVER grants. */
+
+/** Issuance-side eligibility check (the apply side CONSUMES - see
+ *  consumeTargetEligibility). Runs under the runner advisory lock, which
+ *  serializes it against any in-flight run. */
+async function assertTargetEligibleForIssuance(client: Queryable): Promise<void> {
+  const d = await client.query(
+    `SELECT eligible, dirty, dirty_reason, in_flight, updated_at, pg_catalog.now() - updated_at AS stuck_for FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database()`,
+  );
+  const row = d.rows[0];
+  if (row === undefined) {
+    throw new Error(
+      `release-migrations: TARGET STATE refusal - no eligibility record for this database (absence denies): the target was never ` +
+      `provisioned or its record was removed; attended recovery via attendedResolveDirty is required (fail-closed)`,
+    );
+  }
+  if (row['dirty'] === true) {
     throw new Error(
       `release-migrations: DIRTY TARGET refusal - this database is marked DIRTY/INDETERMINATE ` +
-      `(reason: ${JSON.stringify(d.rows[0]['dirty_reason'])}); attended resolution via attendedResolveDirty is required ` +
+      `(reason: ${JSON.stringify(row['dirty_reason'])}); attended resolution via attendedResolveDirty is required ` +
       `before any further preflight issuance or migration run (fail-closed)`,
     );
   }
+  if (row['eligible'] !== true) {
+    throw new Error(
+      `release-migrations: IN-FLIGHT TARGET refusal - this database has a run IN-FLIGHT since ${String(row['updated_at'])} ` +
+      `(stuck for ${String(row['stuck_for'])}): either a run is executing now or a run exited without clean completion ` +
+      `(crash, kill, or abort). Eligibility NEVER restores itself and expiry NEVER grants - attended recovery via ` +
+      `attendedResolveDirty is required (fail-closed). in_flight: ${JSON.stringify(row['in_flight'])}`,
+    );
+  }
+}
+
+/** The ADMISSION TICKET (SA4-C3 condition a): ONE atomic conditional write
+ *  per target - no read-then-write TOCTOU. A failed or contended consume
+ *  means the run does not start. Callers run this inside the bootstrap
+ *  transaction AFTER read-only precondition checks and BEFORE every other
+ *  mutation; a later bootstrap refusal rolls the consume back with the
+ *  transaction, so pre-admission refusals never block the target. */
+async function consumeTargetEligibility(client: Queryable, flight: { nonce?: string; firstVersion: string }): Promise<void> {
+  const c = await client.query(
+    `UPDATE public.schema_migration_target_state SET eligible = false, in_flight = $1::jsonb, updated_at = now() ` +
+    `WHERE target = pg_catalog.current_database() AND eligible = true AND dirty = false RETURNING target`,
+    [JSON.stringify({ ...flight, consumedAt: 'db-clock:updated_at' })],
+  );
+  if (c.rows.length === 1) return; // admitted: the conditional write IS the ticket
+  // Admission refused - distinguish the durable state for the operator.
+  await assertTargetEligibleForIssuance(client); // throws DIRTY / IN-FLIGHT / absent with specifics
+  throw new Error('release-migrations: TARGET STATE refusal - admission consume transitioned zero rows (fail-closed)');
+}
+
+/** Clean-completion restore (SA4-C3 condition b): ONLY ever executed inside
+ *  the final group transaction, atomically with the last apply and the ack
+ *  consumption. No other exit writes ELIGIBLE (condition e). */
+async function restoreTargetEligibility(client: Queryable): Promise<void> {
+  await client.query(
+    `UPDATE public.schema_migration_target_state SET eligible = true, in_flight = NULL, updated_at = now() WHERE target = pg_catalog.current_database()`,
+  );
 }
 
 /** SA3 section 4: preflight ISSUANCE - the ONLY way an ack comes into
@@ -1238,7 +1363,7 @@ export async function issueOperatorPreflight(
         // pre-write guarantee runMigrations enforces).
         await verifyTargetPreconditions(client, { deployment: opts.deployment, expectInstanceId: opts.expectInstanceId, expectRegistryDigest: opts.expectRegistryDigest });
         await ensureRunnerBookkeeping(client);
-        await assertTargetNotDirty(client);
+        await assertTargetEligibleForIssuance(client);
         const pf = await computeUsersPhonePreflight(client, { deployment: opts.deployment, migrations: opts.migrations });
         await client.query(
           `INSERT INTO public.schema_migration_acks(nonce, target, deployment_label, plan_digest, list_digest, state) VALUES($1, $2, $3, $4, $5, 'issued')`,
@@ -1266,9 +1391,14 @@ export async function issueOperatorPreflight(
   }
 }
 
-/** SA3 section 5: ATTENDED resolution of a DIRTY/INDETERMINATE target.
- *  Requires an operator note; records a unique append-only 'dirty-resolved'
- *  evidence event retaining the prior dirty reason, then clears the marker. */
+/** SA3 section 5 + SA4-C3 (d): ATTENDED recovery of a blocked target
+ *  (DIRTY, IN-FLIGHT, or a missing eligibility record). Requires an operator
+ *  note; INVALIDATES every outstanding 'issued' ack for the target (an
+ *  unrecorded abort may have left one live); records a unique append-only
+ *  'dirty-resolved' evidence event retaining the prior state; restores
+ *  ELIGIBLE with a recovered_at stamp. The first cycle after recovery
+ *  requires a FRESH attended TOFU: the apply gate refuses any ack minted
+ *  at/before recovered_at. */
 export async function attendedResolveDirty(conn: Connectable, opts: { note: string; resolvedBy?: string }): Promise<void> {
   if (typeof opts.note !== 'string' || opts.note.trim().length < 8) {
     throw new Error('release-migrations: attended DIRTY resolution requires an operator note (>= 8 chars) - refusing (fail-closed)');
@@ -1280,18 +1410,40 @@ export async function attendedResolveDirty(conn: Connectable, opts: { note: stri
     try {
       await client.query('BEGIN');
       try {
-        const d = await client.query(`SELECT dirty, dirty_reason FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database() FOR UPDATE`);
-        if (d.rows.length === 0 || d.rows[0]!['dirty'] !== true) {
-          throw new Error('release-migrations: attended DIRTY resolution refused - this target is NOT dirty (nothing to resolve)');
+        // Recovery must work even when the eligibility record is MISSING
+        // (the absent-row UNPROVEN path): provision the bookkeeping first.
+        await ensureRunnerBookkeeping(client);
+        const d = await client.query(`SELECT eligible, dirty, dirty_reason, in_flight FROM public.schema_migration_target_state WHERE target = pg_catalog.current_database() FOR UPDATE`);
+        const row = d.rows[0];
+        if (row !== undefined && row['eligible'] === true && row['dirty'] !== true) {
+          throw new Error('release-migrations: attended DIRTY resolution refused - this target is ELIGIBLE (not DIRTY or IN-FLIGHT; nothing to resolve)');
         }
+        // SA4-C3 (d): recovery INVALIDATES every outstanding 'issued' ack -
+        // an unrecorded abort may have left one live.
+        const invalidated = await client.query(
+          `UPDATE public.schema_migration_acks SET state = 'invalidated', transitioned_at = now() WHERE target = pg_catalog.current_database() AND state = 'issued' RETURNING nonce`,
+        );
         await client.query(
           `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, '0000', 'dirty-resolved', $2::jsonb, 'dirty-resolved', pg_catalog.current_database())`,
-          [randomBytes(16).toString('hex'), JSON.stringify({ priorDirtyReason: d.rows[0]!['dirty_reason'], resolutionNote: opts.note, resolvedBy: opts.resolvedBy ?? 'operator' })],
+          [randomBytes(16).toString('hex'), JSON.stringify({
+            priorState: row === undefined ? 'absent' : row['dirty'] === true ? 'DIRTY' : 'IN-FLIGHT',
+            priorDirtyReason: row?.['dirty_reason'] ?? null,
+            priorInFlight: row?.['in_flight'] ?? null,
+            invalidatedNonces: invalidated.rows.map(x => String(x['nonce'])),
+            resolutionNote: opts.note, resolvedBy: opts.resolvedBy ?? 'operator',
+          })],
         );
-        await client.query(
-          `UPDATE public.schema_migration_target_state SET dirty = false, dirty_reason = $1::jsonb, updated_at = now() WHERE target = pg_catalog.current_database()`,
-          [JSON.stringify({ resolved: true, note: opts.note })],
-        );
+        if (row === undefined) {
+          await client.query(
+            `INSERT INTO public.schema_migration_target_state(target, eligible, dirty, dirty_reason, recovered_at, updated_at) VALUES(pg_catalog.current_database(), true, false, $1::jsonb, now(), now())`,
+            [JSON.stringify({ resolved: true, note: opts.note })],
+          );
+        } else {
+          await client.query(
+            `UPDATE public.schema_migration_target_state SET eligible = true, dirty = false, dirty_reason = $1::jsonb, in_flight = NULL, recovered_at = now(), updated_at = now() WHERE target = pg_catalog.current_database()`,
+            [JSON.stringify({ resolved: true, note: opts.note })],
+          );
+        }
         await client.query('COMMIT');
       } catch (e) {
         await client.query('ROLLBACK').catch(() => undefined);
@@ -1361,6 +1513,15 @@ export async function runMigrations(
         // well (the CLI also checks read-only before calling): any refusal
         // here still precedes every step write and rolls back.
         const pre = await verifyTargetPreconditions(client, { deployment: opts.deployment, expectInstanceId: opts.expectInstanceId, expectRegistryDigest: opts.expectRegistryDigest });
+        // SA4-C3: ADMISSION. Read-only checks first; the eligibility consume
+        // is the FIRST mutation decision and precedes every remaining write.
+        // A pure verification run (nothing pending) never consumes.
+        applied = await readAppliedRows(client);
+        verifyHistoryPrefix(applied, migrations);
+        if (migrations.length > applied.length) {
+          const ackNonce = /^ack:([0-9a-f]{16}):[0-9a-f]{64}$/.exec(opts.operatorAck ?? '')?.[1];
+          await consumeTargetEligibility(client, { ...(ackNonce !== undefined ? { nonce: ackNonce } : {}), firstVersion: migrations[applied.length]!.version });
+        }
         if (pre.firstRun) {
           identity = { deploymentLabel: opts.deployment, instanceId: randomBytes(8).toString('hex') };
           stampedNow = true;
@@ -1438,10 +1599,6 @@ export async function runMigrations(
         // boot gate asserts this default-privilege state on every boot.
         await client.query(`ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`);
         await client.query(`UPDATE public.contake_db_identity SET migration_role = CURRENT_USER WHERE id = 1`);
-        applied = await readAppliedRows(client);
-        verifyHistoryPrefix(applied, migrations);
-        // SA3 section 5: a DIRTY/INDETERMINATE target blocks every run.
-        await assertTargetNotDirty(client);
         await client.query('COMMIT');
       } catch (e) {
         await client.query('ROLLBACK').catch(() => undefined);
@@ -1459,6 +1616,7 @@ export async function runMigrations(
       // between them; an abort rolls back the whole plan and invalidates
       // the ack.
       const pending = migrations.slice(applied.length);
+      let eligibilityRestoreAttempted = false;
       for (let gi = 0; gi < pending.length;) {
         const group: MigrationStep[] = [pending[gi]!];
         if (pending[gi]!.requiresOperatorAck === true) {
@@ -1467,6 +1625,7 @@ export async function runMigrations(
           }
         }
         gi += group.length;
+        const isLastGroup = gi >= pending.length;
         await client.query('BEGIN');
         // Captured inside the steps; hoisted so the catch path can actively
         // restore non-transactional sequence state after ROLLBACK.
@@ -1547,6 +1706,20 @@ export async function runMigrations(
                     `release-migrations: OPERATOR GATE refusal - ACK LIFECYCLE: ack nonce ${nonce} is already '${String(r0['state'])}'. ` +
                     `Consumed and invalidated acks are dead; a second transition is a loud conflict, never a silent no-op. ` +
                     `Mint a fresh ack from a fresh issuance (fail-closed, rolling back).`,
+                  );
+                }
+                // SA4-C3 (d): the first cycle after attended recovery demands
+                // a FRESH attended TOFU - an ack minted at/before recovered_at
+                // is dead even if still 'issued' (DB-clock comparison).
+                const postRec = await client.query(
+                  `SELECT (a.issued_at <= ts.recovered_at) AS pre_recovery FROM public.schema_migration_acks a, public.schema_migration_target_state ts WHERE a.nonce = $1 AND ts.target = pg_catalog.current_database() AND ts.recovered_at IS NOT NULL`,
+                  [nonce],
+                );
+                if (postRec.rows[0]?.['pre_recovery'] === true) {
+                  throw new Error(
+                    `release-migrations: OPERATOR GATE refusal - POST-RECOVERY ack: nonce ${nonce} was minted at/before the last ` +
+                    `attended recovery (recovered_at). The first cycle after recovery requires a FRESH attended TOFU issuance ` +
+                    `(fail-closed, rolling back).`,
                   );
                 }
                 // The ack is ACCEPTED from here: ANY later failure in this
@@ -1639,81 +1812,40 @@ export async function runMigrations(
               );
             }
           }
+          if (isLastGroup) {
+            // SA4-C3 condition (b): ELIGIBLE is restored ONLY on clean
+            // completion, inside the SAME transaction as the final apply and
+            // the ack consumption. A restore failure aborts the whole group;
+            // the target stays IN-FLIGHT (the safe direction).
+            eligibilityRestoreAttempted = true;
+            await restoreTargetEligibility(client);
+          }
           await client.query('COMMIT');
           for (const m of group) appliedNow.push(m.version);
         } catch (e) {
           await client.query('ROLLBACK').catch(() => undefined);
-          // Condition 6: rollback cannot restore sequence state - do it
-          // actively, then hard-fail with the original error retained.
-          // ERR-PROPAGATE with DIRTY labeling: a restore FAILURE makes the
-          // step's aftermath unprovable - DIRTY/INDETERMINATE hard failure
-          // retaining BOTH error records (original + restore).
+          // SA4-C1 section 2 + SA4-C3 (e): EVERY post-admission exit routes
+          // through ONE unified path; NO exit writes ELIGIBLE - the target
+          // stays IN-FLIGHT (the durable denial committed at admission).
+          // Sequence restore is best-effort-captured, never thrown past.
+          const originalFailure = e instanceof Error ? e.message : String(e);
+          let restoreFailure: string | undefined;
+          const restoredAll: string[] = [];
           for (const captured of sequenceCaptures) {
-            let restoreFailure: string | undefined;
             const restored = await restoreSequenceValues(client, captured).catch((re) => {
               restoreFailure = re instanceof Error ? re.message : String(re);
               return undefined as unknown as string[];
             });
-            if (restoreFailure !== undefined) {
-              const original = e instanceof Error ? e.message : String(e);
-              // SA4 section 4: the aftermath is unprovable - durably mark +
-              // VERIFY the marker before claiming DIRTY; marker failure is an
-              // UNPROVEN-DIRTY hard stop retaining all three failures.
-              await markTargetDirtyVerified(client, { groupVersion: group[0]!.version, nonce: ackNonceToInvalidate, originalFailure: original, triggerFailure: restoreFailure, triggerLabel: 'restoreFailure' });
-              throw new Error(
-                `release-migrations: DIRTY/INDETERMINATE step group - sequence restoration could not be proven; ` +
-                `the database may hold non-transactional drift. The DIRTY marker was durably recorded and verified; ` +
-                `the target blocks all further preflight issuance and migration runs until attended resolution ` +
-                `(attendedResolveDirty). original failure: ${original} | restore failure: ${restoreFailure} (fail-closed)`,
-              );
-            }
-            if (restored.length > 0 && e instanceof Error) {
-              e.message += ` [non-transactional sequence state actively restored: ${restored.join(', ')}]`;
-            }
+            if (restored !== undefined && restored.length > 0) restoredAll.push(...restored);
           }
-          // SA2-A section 2(c): any failure between steps aborts the run and
-          // INVALIDATES the ack - recorded in the evidence trail (append-only)
-          // in a fresh transaction so the record survives the rollback;
-          // later runs require a fresh ack (replay refusal). AFTER the
-          // sequence restore: the record's seq value must survive above the
-          // restored baseline (rewinding beneath a persisted row would
-          // collide on the next insert).
-          if (ackNonceToInvalidate !== undefined) {
-            // SA3 sections 4+5: the abort INVALIDATES the issued ack
-            // (guarded single-row transition + unique append-only event).
-            // NO catch-and-continue: if either write fails the aftermath is
-            // unprovable - mark the target DIRTY/INDETERMINATE (retaining
-            // BOTH error records) and block all further issuance and runs
-            // until attended resolution. Runs AFTER the sequence restore
-            // above: the event's seq value must survive above the restored
-            // baseline (rewinding beneath a persisted row would collide on
-            // the next insert).
-            const originalFailure = e instanceof Error ? e.message : String(e);
-            try {
-              const inv = await client.query(
-                `UPDATE public.schema_migration_acks SET state = 'invalidated', transitioned_at = now() WHERE nonce = $1 AND state = 'issued'`,
-                [ackNonceToInvalidate],
-              );
-              if (inv.rowCount !== 1) {
-                throw new Error(`ack lifecycle conflict: invalidating nonce ${ackNonceToInvalidate} transitioned ${String(inv.rowCount)} rows (expected exactly 1 issued record)`);
-              }
-              await client.query(
-                `INSERT INTO public.schema_migration_evidence(event_id, version, kind, report, list_digest, target) VALUES($1, $2, 'ack-invalidated', $3::jsonb, 'invalidated', pg_catalog.current_database())`,
-                [randomBytes(16).toString('hex'), group[0]!.version, JSON.stringify({ nonce: ackNonceToInvalidate, reason: originalFailure })],
-              );
-            } catch (invErr) {
-              const invalidationFailure = invErr instanceof Error ? invErr.message : String(invErr);
-              // SA4 section 4: durably mark + VERIFY the marker before
-              // claiming DIRTY (a swallowed marker write was B3); marker
-              // failure is an UNPROVEN-DIRTY hard stop retaining all three
-              // failures and the attempt evidence.
-              await markTargetDirtyVerified(client, { groupVersion: group[0]!.version, nonce: ackNonceToInvalidate, originalFailure, triggerFailure: invalidationFailure, triggerLabel: 'invalidationFailure' });
-              throw new Error(
-                `release-migrations: DIRTY/INDETERMINATE - the abort's ack invalidation could not be persisted; the target is ` +
-                `marked DIRTY (marker durably recorded and verified) and blocks all further preflight issuance and migration runs until attended resolution ` +
-                `(attendedResolveDirty). original failure: ${originalFailure} | invalidation failure: ${invalidationFailure} (fail-closed)`,
-              );
-            }
+          await unifiedPostAbortSafety(client, {
+            groupVersion: group[0]!.version, nonce: ackNonceToInvalidate, originalFailure, restoreFailure, eligibilityRestoreAttempted,
+          });
+          if (restoredAll.length > 0 && e instanceof Error) {
+            e.message += ` [non-transactional sequence state actively restored: ${restoredAll.join(', ')}]`;
+          }
+          if (e instanceof Error) {
+            e.message += ` [target remains IN-FLIGHT: eligibility was consumed at admission and never restores itself - attended recovery via attendedResolveDirty is required (SA4-C3)]`;
           }
           throw e;
         }
